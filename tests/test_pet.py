@@ -1048,6 +1048,8 @@ class QtTest(unittest.TestCase):
             pet._tick()
             seen["fly"] = pet.timer.interval()
             seen["complained"] = pet.complained
+            from PySide6.QtWidgets import QApplication
+            seen["name"] = (QApplication.instance().applicationName(), QApplication.instance().applicationDisplayName())
             pet.quit()
         a = P.build_parser().parse_args(["--url", f"http://127.0.0.1:{srv.server_port}", "--token-file",
                                          "/nonexistent/token"])
@@ -1065,6 +1067,18 @@ class QtTest(unittest.TestCase):
         self.assertEqual(seen["kick"], 0)
         self.assertEqual(seen["fly"], int(1000 / 30))
         self.assertFalse(seen["complained"])
+        self.assertEqual(seen["name"], ("moth", "moth"))   # set_app_name: the Dock / menus say moth, not Python
+
+    def test_app_name_helpers_never_raise(self):
+        from PySide6.QtWidgets import QApplication
+        app = QApplication.instance() or QApplication([])
+        got = P.macos_bundle_name("moth")   # the CFBundleName trick through ctypes; not macOS: does nothing
+        self.assertIsInstance(got, bool)
+        if sys.platform != "darwin":
+            self.assertFalse(got)
+        P.set_app_name(app, "moth")
+        self.assertEqual((app.applicationName(), app.applicationDisplayName()), ("moth", "moth"))
+        P.set_app_name(object())   # not a Qt app at all: silently nothing
 
     def test_windows_run_offscreen(self):
         """The real windows against a stub moth: a new line shows in the bubble and the moth gets excited."""
@@ -1674,6 +1688,26 @@ class PetSkinTrayUpdateTest(unittest.TestCase):
         self.assertEqual(seen["calls_after"], 1)
         self.assertIn("i'm the newest me already", seen["texts"])
         self.assertTrue(any("offline" in t for t in seen["texts"]), seen["texts"])
+
+    def test_a_finished_pet_never_acts_again(self):
+        """Regression (test_update_bubble, flaky on Windows): a pet's QTimer outlived app.exec(), so an earlier test's
+        pet kept ticking in later tests' event loops, and its own first daily check (30 s after it started) wrote
+        last_update_check into the running test's config: that test's pet then saw no check due."""
+        from unittest import mock
+        pets = []
+
+        def script(pet, seen):
+            pets.append(pet)
+            yield
+        self.run_pet(script)
+        old = pets[0]
+        self.assertFalse(old.timer.isActive())
+        self.write_cfg({"update_check": True, "last_update_check": 0})
+        old.next_update_eval = 0.0
+        with mock.patch.object(P, "check_for_update", side_effect=AssertionError("an old pet checked")) as chk:
+            old.tick()
+        chk.assert_not_called()
+        self.assertEqual(self.read_cfg(), {"update_check": True, "last_update_check": 0})
 
     def test_no_check_when_off_or_offline(self):
         from unittest import mock

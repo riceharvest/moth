@@ -1137,6 +1137,55 @@ def update_line(hint: str) -> str:
 
 
 # --- platform -------------------------------------------------------------------------------------------------
+APP_NAME = "moth"
+
+
+def macos_bundle_name(name: str = APP_NAME) -> bool:
+    """macOS: the Dock, the menu bar and the app switcher take the app's name from the main bundle's CFBundleName,
+    which for a pet started by `python -m moth.pet` is Python.app's ("Python"). Overwrite it in the main bundle's
+    info dictionary (in memory only) before QApplication starts Cocoa: the CFBundleName trick, done through the
+    Objective-C runtime with ctypes, so no PyObjC needed. Returns whether it was set; never raises (not macOS, no
+    bundle, a dictionary that can't be changed: nothing happens)."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        import ctypes
+        import ctypes.util
+        objc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc") or "/usr/lib/libobjc.A.dylib")
+        ctypes.cdll.LoadLibrary(ctypes.util.find_library("Foundation")
+                                or "/System/Library/Frameworks/Foundation.framework/Foundation")
+        vp = ctypes.c_void_p
+        objc.objc_getClass.restype, objc.objc_getClass.argtypes = vp, [ctypes.c_char_p]
+        objc.sel_registerName.restype, objc.sel_registerName.argtypes = vp, [ctypes.c_char_p]
+        send = ctypes.cast(objc.objc_msgSend, vp).value   # one prototype per call shape (arm64 needs exact ones)
+        call0 = ctypes.CFUNCTYPE(vp, vp, vp)(send)
+        call_str = ctypes.CFUNCTYPE(vp, vp, vp, ctypes.c_char_p)(send)
+        call_bool = ctypes.CFUNCTYPE(ctypes.c_bool, vp, vp, vp)(send)
+        call_set = ctypes.CFUNCTYPE(None, vp, vp, vp, vp)(send)
+        sel = objc.sel_registerName
+        bundle = call0(objc.objc_getClass(b"NSBundle"), sel(b"mainBundle"))
+        info = call0(bundle, sel(b"infoDictionary")) if bundle else None
+        setter = sel(b"setObject:forKey:")
+        if not info or not call_bool(info, sel(b"respondsToSelector:"), setter):   # immutable: an exception, so ask
+            return False
+        ns = objc.objc_getClass(b"NSString")
+        utf8 = sel(b"stringWithUTF8String:")
+        for key in (b"CFBundleName", b"CFBundleDisplayName"):
+            call_set(info, setter, call_str(ns, utf8, name.encode()), call_str(ns, utf8, key))
+        return True
+    except Exception:  # noqa: BLE001  a name is a nicety
+        return False
+
+
+def set_app_name(app, name: str = APP_NAME) -> None:
+    """Qt's own name for the app (menus, notifications, window titles where shown): "moth". Never raises."""
+    for setter in ("setApplicationName", "setApplicationDisplayName"):
+        try:
+            getattr(app, setter)(name)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def choose_platform(env=None, platform: str | None = None) -> str:
     """Before QApplication: on a Wayland session ask for XWayland first (a Wayland client can't place its own
     windows). Respects an explicit QT_QPA_PLATFORM. Returns what was decided: "set", "xwayland", "wayland", "native"."""
@@ -1170,14 +1219,20 @@ def run(a, on_ready=None) -> int:
         print("the desktop pet needs PySide6 (moth itself doesn't):  pip install PySide6", file=sys.stderr)
         return 2
 
-    # Ctrl+C, kill, the terminal closing: quit and stop a server the pet started. Before the windows exist that is
-    # an exception through the finally below; after, Pet.quit (the Qt timer lets Python run the handler).
+    # Ctrl+C, kill, the terminal closing: quit and stop a server the pet started. Before Qt starts that is an
+    # exception through the finally below; once the windows exist, Pet.quit (the Qt timer lets Python run the
+    # handler). In between (QApplication and the windows being built) an exception would unwind through
+    # half-made Qt objects, and PySide6 can abort at exit over those (exit -6, seen on macOS): so a signal there is
+    # only noted (quit_now holds "qt" / "pending") and the pet quits through Qt as soon as it exists (_run).
     import signal
     quit_now: list = []
 
     def on_signal(_sig, _frame):
-        if quit_now:
-            quit_now[0]()
+        if quit_now and callable(quit_now[-1]):
+            quit_now[-1]()
+        elif "qt" in quit_now:
+            if "pending" not in quit_now:
+                quit_now.append("pending")
         else:
             raise KeyboardInterrupt
     old = {}
@@ -1235,10 +1290,14 @@ def _run(a, on_ready, boot, decided: str, quit_now: list) -> int:
     )
     from PySide6.QtWidgets import QApplication, QLineEdit, QMenu, QSystemTrayIcon, QVBoxLayout, QWidget
 
+    if QApplication.instance() is None:
+        macos_bundle_name()   # before Cocoa starts: the Dock and menu bar say "moth", not "Python"
+    quit_now.append("qt")   # from here a signal is noted, not raised (run()), until Pet.quit takes over
     app = QApplication.instance() or QApplication(sys.argv[:1])
     if not isinstance(app, QApplication):   # a QGuiApplication made elsewhere: widgets would abort the process
         print("moth pet: needs a QApplication, found a QGuiApplication", file=sys.stderr)
         return 1
+    set_app_name(app)
     app.setQuitOnLastWindowClosed(False)
     plat = QGuiApplication.platformName()
     native_wayland = plat.startswith("wayland")
@@ -1680,6 +1739,8 @@ def _run(a, on_ready, boot, decided: str, quit_now: list) -> int:
         cursor_at = -1e9   # when the cursor was last read
 
         def tick(self):
+            if self.stop.is_set():   # quit: a pet that's done never acts again (its timer may outlive app.exec())
+                return
             try:
                 self._tick()
             except Exception as e:  # noqa: BLE001  a pet never crashes; say it once and keep going
@@ -1951,12 +2012,18 @@ def _run(a, on_ready, boot, decided: str, quit_now: list) -> int:
     if boot.server:
         app.aboutToQuit.connect(boot.server.stop)   # menu quit, Ctrl-C, SIGTERM/SIGHUP, window closed
     quit_now.append(pet.quit)   # signals from here on quit through Qt
+    if "pending" in quit_now:   # a signal came while the windows were being built: quit once the loop runs
+        QTimer.singleShot(0, pet.quit)
     if on_ready:
         on_ready(pet)
     try:
         return app.exec()
     finally:
+        # The QTimer outlives exec() (Qt signal connections keep the Pet alive), and a later event loop in this
+        # process would tick a finished pet: with tests running pets one after another, an old pet's daily update
+        # check wrote last_update_check into the next test's config, so that pet saw no check due (seen on Windows).
         pet.stop.set()
+        pet.timer.stop()
 
 
 def build_parser() -> argparse.ArgumentParser:
