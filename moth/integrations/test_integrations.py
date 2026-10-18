@@ -412,15 +412,28 @@ class JsAdapters(Base):
     SOURCE = {"pi": "pi", "opencode": "opencode", "dsh": "dsh"}
     META = {"pi": ("pi-sess-1", "pi-proj"), "opencode": ("s1", "oc-proj"), "dsh": ("s1", Path.cwd().name)}
 
+    # node's own start for the baseline: the builtins the adapters load (node:http / node:https; Response loads
+    # fetch's undici), no network. A fresh Windows runner spends ~2 s loading them the first time (measured: Pi's
+    # import took 2.2 s once, 33 ms after), which a harness that is already running never pays.
+    NODE_START = 'import "node:http"; import "node:https"; await new Response("x").text();\n'
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        with tempfile.TemporaryDirectory() as d:   # pay the first-load cost once, outside every timed run
+            (Path(d) / "warm.mjs").write_text(cls.NODE_START, encoding="utf-8")
+            subprocess.run(["node", str(Path(d) / "warm.mjs")], capture_output=True, timeout=30)
+
     def drive(self, harness, url):
-        """(process, seconds the adapter took): the run's time minus a bare node start right before it, so the
-        GIVE_UP bound is about the adapter giving up, not node's cold start (3.5 s once on a busy Windows runner)."""
+        """(process, seconds the adapter took): the run's time minus a node start loading the same builtins right
+        before it, so the GIVE_UP bound is about the adapter giving up, not node's cold start (3.5 s once on a busy
+        Windows runner)."""
         src, driver, _ = self.CASES[harness]
         with tempfile.TemporaryDirectory() as d:
             shutil.copy(src, Path(d) / "adapter.mjs")   # .ts / .js are plain ESM JS; .mjs makes node load them as ESM
             (Path(d) / "driver.mjs").write_text(driver, encoding="utf-8")
-            (Path(d) / "empty.mjs").write_text("", encoding="utf-8")
-            _, base = run(["node", str(Path(d) / "empty.mjs")], url)
+            (Path(d) / "start.mjs").write_text(self.NODE_START, encoding="utf-8")
+            _, base = run(["node", str(Path(d) / "start.mjs")], url)
             p, took = run(["node", str(Path(d) / "driver.mjs")], url)
             return p, took - base
 
