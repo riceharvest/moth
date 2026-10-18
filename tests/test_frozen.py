@@ -86,7 +86,8 @@ class Frozen(unittest.TestCase):
         """APPIMAGE inherited from another AppImage (an editor's terminal): the tarball's moth-hook still."""
         other = {"APPIMAGE": str(self.tmp / "Editor.AppImage"), "APPDIR": str(self.tmp / ".mount_Editor")}
         with mock.patch.dict(os.environ, other):
-            self.assertEqual(hooks.hook_argv("claude_code.py")[0], str(self.app / "moth-hook"))
+            runner = "moth-hook.exe" if hooks._WIN else "moth-hook"
+            self.assertEqual(hooks.hook_argv("claude_code.py")[0], str(self.app / runner))
             self.assertEqual(hooks._where("integrations/claude_code.py", "claude_code.py"), "missing")
             with mock.patch.object(autostart, "FROZEN", True):
                 self.assertEqual(autostart.pet_python("linux"), str(self.app / "moth"))

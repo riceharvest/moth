@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 import test_cli_tools as T  # noqa: E402  (TempHome, fake_bin, FAKE_HERMES, the real-files guard)
+from moth import autostart  # noqa: E402
 from moth import setup as S  # noqa: E402
 
 BEFORE = T._fingerprint()
@@ -135,7 +136,7 @@ class Base(T.TempHome):
                 for p in sorted(self.home.rglob("*"))}
 
     def autostart_file(self) -> Path:
-        return self.home / ".config" / "autostart" / "moth-pet.desktop"
+        return Path(autostart.entry_path())   # this OS's entry (LaunchAgent, Startup .bat, XDG .desktop)
 
 
 class DryRun(Base):
