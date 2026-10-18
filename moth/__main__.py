@@ -2,8 +2,10 @@
 
 All moth.serve options work here too (python -m moth --help). The chat page is served at the printed URL but only
 opened in the browser with --open (or --browser); --no-browser is accepted and does nothing (the old opt-out).
+  python -m moth setup [--yes] [--dry-run]       start here: install to a running moth, step by step (moth/setup.py)
   python -m moth config [KEY VALUE]              moth's settings in ~/.moth/config.json: show_in_harness, pet_skin,
-                                                 update_check (moth/config.py)
+                                                 update_check, hide_in_fullscreen, chirp, muted_sources, pet_screen,
+                                                 quiet_hours, model (moth/config.py)
   python -m moth update [--check | --rollback]   update this Hugging Face download in place (moth/update.py)
   python -m moth --version                       version and Hub revision
   python -m moth hooks | hook | unhook           see / install / remove the coding-agent hooks (moth/hooks.py)
@@ -76,11 +78,22 @@ USAGE = """usage: python -m moth [serve options] [--open]
                                         wake moth up (the default): start the local server on 127.0.0.1:4747
                                         and print the agent hook snippets; --open (or --browser) also opens
                                         the chat page in your browser
+       python -m moth setup [--yes] [--dry-run] [--url URL]
+                                        start here: from install to a running moth (packages, weights, hooks,
+                                        autostart, the pet); asks first, safe to run again
        python -m moth config [show_in_harness on|off | pet_skin <id|folder|moth> | update_check on|off]
                                         print or change moth's settings (~/.moth/config.json); show_in_harness
                                         shows moth's replies inside Pi / OpenCode (default off), pet_skin is
                                         the desktop pet's look (a Petdex pet id, default moth), update_check
                                         is the pet's daily "new moth out" bubble (default on)
+       python -m moth config [hide_in_fullscreen on|off | chirp on|off | muted_sources codex,pi|none |
+                              pet_screen <name>|any | quiet_hours 23:00-08:00|off]
+                                        the pet: hide while an app is fullscreen (default on), a soft sound when
+                                        an agent is done (default off), harnesses that pop no bubble (default
+                                        none), stay on one screen (default any), quiet hours (default off)
+       python -m moth config model <folder | HF repo id | openai:URL#model | default>
+                                        the model behind moth (default: its own); see
+                                        moth/docs/MODEL_BACKENDS.md. --model beats it for one run
        python -m moth update [--check | --rollback] [--yes] [--repo ID] [--revision REV]
                                         update this Hugging Face download in place (python -m moth update --help)
        python -m moth hooks             which coding agents are on this machine and whether moth is hooked in
@@ -115,7 +128,7 @@ def main(argv=None):
     if argv[:1] in (["hooks"], ["hook"], ["unhook"]):   # before --help / --version: `moth hook --help` is hook's
         from moth import hooks
         sys.exit(hooks.main(argv[0], argv[1:]))
-    if argv[:1] in (["doctor"], ["autostart"], ["forget"]):
+    if argv[:1] in (["setup"], ["doctor"], ["autostart"], ["forget"]):
         import importlib
         sys.exit(importlib.import_module(f"moth.{argv[0]}").main(argv[1:]))
     if "--version" in argv:
