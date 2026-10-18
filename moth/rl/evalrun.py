@@ -8,6 +8,7 @@ Headline (per reply unless noted):
                    claims nothing else (gist.follows_card); per probe
   assistant %      reward component assistant == -1
   repeat %         reward component repeat == -1 (exact or near repeat of an earlier reply)
+  invented %       reward component invented == -1, over the replies of chats the judge saw the home for
   reward           mean episode score
 Plus the same split by scenario and by card group (held-out template / held-out phrasing / moth / blank), and
 moth.metrics' deterministic table on the same records. results.json uses moth.eval's record shape, so
@@ -22,10 +23,10 @@ import json
 import os
 import re
 
-from moth.rl.env import run_episodes, to_eval_record
+from moth.rl.env import as_policy, run_episodes, to_eval_record, uses_tools
 from moth.rl.judge import Judge, mock_on
 from moth.rl.llm import CostMeter, read_json, write_json, write_text
-from moth.rl.registry import POOL_DIR, load_eval
+from moth.rl.registry import POOL_DIR, home_pool, load_eval
 from moth.rl.sim import Simulator
 
 
@@ -51,6 +52,8 @@ def summarize(eps: list[dict]) -> dict:
                 "follows_card": _pct(sum(bool(x) for x in fc), len(fc)), "card_probes": len(fc),
                 "assistant": _pct(sum(r["vec"]["assistant"] == -1 for r in reps), len(reps)),
                 "repeat": _pct(sum(r["vec"]["repeat"] == -1 for r in reps), len(reps)),
+                "invented": _pct(sum(r["vec"]["invented"] == -1 for r in reps if r["vec"]["invented"] is not None),
+                                 sum(r["vec"]["invented"] is not None for r in reps)),
                 "reward": round(sum(rw) / len(rw), 4) if rw else None,
                 "judge_failed": sum(e["labels"] is None for e in es)}
     by_s, by_c = collections.defaultdict(list), collections.defaultdict(list)
@@ -62,7 +65,8 @@ def summarize(eps: list[dict]) -> dict:
             "by_card": {k: block(v) for k, v in sorted(by_c.items())}}
 
 
-KEYS = ("episodes", "replies", "on_gist", "self", "follows_card", "assistant", "repeat", "reward", "judge_failed")
+KEYS = ("episodes", "replies", "on_gist", "self", "follows_card", "assistant", "repeat", "invented", "reward",
+        "judge_failed")
 
 
 def report_md(s: dict, title: str) -> str:
@@ -94,6 +98,17 @@ def mock_pair_ask(prompt: str) -> str:
     return json.dumps({"reason": f"mock {a} vs {b}", "winner": w})
 
 
+def with_home(spec: dict) -> dict:
+    """eval_v1 predates frozen homes: its chat specs get the home moth.serve.Home draws for the seed (derived from
+    moth/file_pool.json at run time, so not frozen); eval_v2+ carry their own."""
+    if "home" in spec or spec["scenario"] in ("agent", "script"):
+        return spec
+    import random
+
+    from moth.home import sample_home
+    return {**spec, "home": sample_home(random.Random(spec["seed"]), home_pool(), spec["card"])}
+
+
 def settings(sim: Simulator, judge: Judge) -> dict:
     """What has to match for two eval runs to be comparable (besides the frozen set's sha256)."""
     from moth.rl import judge as J
@@ -104,14 +119,20 @@ def settings(sim: Simulator, judge: Judge) -> dict:
 
 def run_eval(version: str, policy_factory, sim: Simulator, judge: Judge, out: str, ref: str | None = None,
              pair_ask=None, workers: int = 1, root: str = POOL_DIR, limit: int | None = None,
-             label: str = "policy") -> dict:
+             label: str = "policy", include_home: bool | None = None) -> dict:
+    """include_home: run the home specs (default: only for a policy that runs home tools, uses_tools)."""
     doc = load_eval(version, root)
     specs = doc["specs"][:limit] if limit else doc["specs"]
+    if include_home is None:
+        include_home = uses_tools(as_policy(policy_factory()))
+    skipped = sum(s["scenario"] == "home" for s in specs) if not include_home else 0
+    specs = [with_home(s) for s in specs if include_home or s["scenario"] != "home"]
     meter = CostMeter()
     eps = run_episodes(specs, policy_factory, sim, judge, workers, total=meter)
     recs = [to_eval_record(e) for e in eps]
     s = summarize(eps)
     s.update({"version": version, "sha256": doc["sha256"], "label": label, "n_specs": len(specs),
+              "skipped_home_specs": skipped,
               "settings": settings(sim, judge), "cost_per_episode": meter.per_episode()})
     os.makedirs(out, exist_ok=True)
     write_json(os.path.join(out, "results.json"), recs)

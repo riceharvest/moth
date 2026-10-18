@@ -310,6 +310,117 @@ def test_group_rollout_shares_the_first_message_and_advantages():
     assert env.group_advantages(g, "utterance")[0][0] is None
 
 
+# --- concurrency ----------------------------------------------------------------------------------------------------
+def test_groups_run_concurrently_and_deterministically():
+    import threading
+    sim, judge = mock_parts()
+    reg = tmp_reg()
+    specs = [registry.sample_spec(reg, random.Random(i)) for i in range(3)]
+    seq = env.run_groups(specs, 3, sim, judge, policy_factory=lambda: env.MockPolicy(), workers=1)
+    par = env.run_groups(specs, 3, sim, judge, policy_factory=lambda: env.MockPolicy(), workers=6)
+    strip = [[[t["user"] for t in ep["turns"]] for ep in g] for g in seq]
+    assert strip == [[[t["user"] for t in ep["turns"]] for ep in g] for g in par]
+    assert [[ep["reward"] for ep in g] for g in seq] == [[ep["reward"] for ep in g] for g in par]
+    for g, spec in zip(par, specs):
+        if spec["scenario"] != "agent":
+            assert len({ep["turns"][0]["user"] for ep in g}) == 1
+    live, peak, lock = [0], [0], threading.Lock()
+
+    def slow(msgs):   # a batching engine behind generate() sees parallel requests
+        with lock:
+            live[0] += 1
+            peak[0] = max(peak[0], live[0])
+        time.sleep(0.02)
+        with lock:
+            live[0] -= 1
+        return "oh! tell me more?"
+    env.rollout_group(spec_of("talk", seed=2), slow, 4, sim, judge, workers=4)
+    assert peak[0] > 1
+    with pytest.raises(ValueError):
+        env.rollout_group(spec_of("talk"), env.MockPolicy(), 2, sim, judge, workers=2)   # stateful, shared
+
+
+# --- home -----------------------------------------------------------------------------------------------------------
+def test_home_judged_and_invented_files():
+    sim, judge = mock_parts()
+    spec = spec_of("home", seed=4)
+    assert spec["home"] and all("/" in p for p in spec["home"])
+    good = env.run_episode(spec, env.MockPolicy(), sim, judge)
+    bad = env.run_episode(spec, env.MockPolicy("inventor"), sim, judge)
+    assert good["home_judged"] and bad["home_judged"]
+    assert all(r["vec"]["invented"] == 0.0 for r in good["replies"])
+    assert any(r["vec"]["invented"] == -1.0 for r in bad["replies"]) and bad["reward"] < good["reward"]
+    talk = env.run_episode(spec_of("talk", seed=4), env.FnPolicy(lambda m: "oh! tell me more?"), sim, judge)
+    assert not talk["home_judged"] and all(r["vec"]["invented"] is None for r in talk["replies"])
+    # a file name the friend said first is not an invention
+    from moth.rl import reward
+    assert reward.invented_files("i put it in notes_for_bo.txt", set(), "please save notes_for_bo.txt") == []
+    assert reward.invented_files("my secret.txt says hi", {"tuesday.txt"}, "") == ["secret.txt"]
+
+
+def test_home_label_prompt_and_parse():
+    from moth.rl import judge as J
+    turns = [{"user": "what's in your diary?", "events": [{"tool": "bash", "args": {"command": "ls diary"},
+                                                           "result": "tuesday.txt"}, {"say": "just tuesday.txt."}]}]
+    home = {"diary/tuesday.txt": "it rained.\n", "saved/.keep": ""}
+    seen = {}
+
+    class AskJudge(J.Judge):
+        def _ask(self, prompt, n, meter, card, turns, attempt, home=None):
+            seen["p"] = prompt
+            return '{"labels": [{"n": 1, "why": "ok", "on": true, "self": false, "invented": false}]}'
+    labs = AskJudge().label(C.MOTH_CARD, turns, home=home)
+    assert labs == [{"on": True, "self": False, "why": "ok", "invented": False}]
+    assert "diary/tuesday.txt: it rained." in seen["p"] and "saved/ (empty)" in seen["p"] and '"invented"' in seen["p"]
+    with pytest.raises(ValueError):
+        J.parse_home_labels('{"labels": [{"n": 1, "on": true, "self": false}]}', 1)   # invented is required
+    assert '"invented"' not in J.label_prompt("x", 1)   # plain chats keep gist.LABEL_PROMPT as is
+
+
+def test_endpoint_policies_skip_home():
+    sim, judge = mock_parts()
+    assert "home" not in registry.mix_for(False) and "home" in registry.mix_for(True)
+    groups = adapters.grpo_rollouts(lambda m: "yay!", 12, 2, sim, judge, tmp_reg(), rng=random.Random(1),
+                                    drop_flat=False)
+    assert all(g[0]["scenario"] != "home" for g in groups)
+    reg = tmp_reg()
+    registry.freeze("h", reg, reg.root, per_card=4)
+    out = tempfile.mkdtemp()
+    s = evalrun.run_eval("h", lambda: env.FnPolicy(lambda m: "yay!"), sim, judge, out, root=reg.root, limit=40)
+    assert s["skipped_home_specs"] > 0 and "home" not in s["by_scenario"]
+    s2 = evalrun.run_eval("h", lambda: env.MockPolicy(), sim, judge, tempfile.mkdtemp(), root=reg.root, limit=40)
+    assert s2["skipped_home_specs"] == 0 and "home" in s2["by_scenario"]
+
+
+def test_eval_sim_temperature_defaults():
+    import argparse
+
+    from moth.rl.__main__ import components
+    for cmd, want in (("eval", 0.0), ("run", 1.0)):
+        a = argparse.Namespace(cmd=cmd, out=None, sim_url="http://127.0.0.1:9/v1", sim_model="m", judge_url="x",
+                               judge_model="j", sim_temperature=None)
+        assert components(a, False)[0].temperature == want
+
+
+def test_moth_policy_gets_the_spec_home():
+    class FakeHome:
+        def __init__(self, root, seed, pool, card=None):
+            self.root = root
+
+    class FakeMoth:
+        def __init__(self):
+            self.a, self.system = None, None
+
+        def reset(self):
+            pass
+
+    root = os.path.join(tempfile.mkdtemp(), "home")
+    spec = spec_of("home", seed=8)
+    env.MothPolicy(FakeMoth(), home_root=root, home_cls=FakeHome).start(spec)
+    for rel, content in spec["home"].items():
+        assert open(os.path.join(root, rel), encoding="utf-8").read() == content
+
+
 # --- adapters -------------------------------------------------------------------------------------------------------
 def test_verifiers_shaped_env_loop():
     sim, judge = mock_parts()
@@ -452,6 +563,23 @@ def test_cli_mock_run():
               "--tps", "judge=10000:1000", "--price", "1.0"])
     o = out.getvalue()
     assert "per episode" in o and "mean reward" in o and '"total_box_hours"' in o
+
+
+# --- tiny-agent GRPO (real TinyAgentLM, random init, CPU) ------------------------------------------------------------
+TA_REPO = os.environ.get("TA_REPO", "/mnt/ssd/dev workspace/tiny-agent")
+TA_PY = os.environ.get("TA_PY", "/mnt/ssd/b70-venv/bin/python")
+
+
+def test_tiny_agent_grpo_group():
+    """tests/rl_tiny_agent_check.py in tiny-agent's Python (needs torch + the tiny-agent repo; skipped without them).
+    The GPU is hidden (ONEAPI_DEVICE_SELECTOR=opencl:cpu), so this never touches the desktop GPU."""
+    if not (os.path.isdir(os.path.join(TA_REPO, "tiny_agent")) and os.path.exists(TA_PY)
+            and os.path.exists(os.path.join(ROOT, "data", "tiny-agent-112m", "tokenizer.json"))):
+        pytest.skip("tiny-agent repo, its Python or the tokenizer is not here")
+    e = {**os.environ, "ONEAPI_DEVICE_SELECTOR": "opencl:cpu", "PYTHONPATH": ""}
+    r = subprocess.run([TA_PY, os.path.join(ROOT, "tests", "rl_tiny_agent_check.py"), TA_REPO], env=e,
+                       capture_output=True, text=True, timeout=600)
+    assert r.returncode == 0 and "\nOK " in "\n" + r.stdout, r.stdout[-2000:] + r.stderr[-3000:]
 
 
 if __name__ == "__main__":

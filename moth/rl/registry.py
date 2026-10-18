@@ -40,6 +40,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from moth import cards as C  # noqa: E402
 from moth.agent import AGENT_SCENARIOS, AGENT_USER_PERSONAS, clean_agent_message  # noqa: E402
+from moth.home import load_pool, sample_home  # noqa: E402
 from moth.persona import HOME_SCENARIOS, TALK_SCENARIOS, TOPICS, USER_PERSONAS  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -304,6 +305,14 @@ MOCK_AGENT_MSGS = [   # tiny built-in stand-ins for the training pool (mock runs
 
 
 _WARNED: list = []
+POOL_FILE = os.path.join(ROOT, "moth", "file_pool.json")
+_HOME_POOL: list = []
+
+
+def home_pool() -> dict:
+    if not _HOME_POOL:
+        _HOME_POOL.append(load_pool(POOL_FILE))
+    return _HOME_POOL[0]
 
 
 def make_spec(card: dict, scenario: str, rng: random.Random, seed: int, agent_msgs: list[str] | None = None,
@@ -326,6 +335,9 @@ def make_spec(card: dict, scenario: str, rng: random.Random, seed: int, agent_ms
     else:
         spec["persona"] = rng.choice(USER_PERSONAS)
         spec["goal"] = rng.choice(HOME_SCENARIOS if scenario == "home" else TALK_SCENARIOS)
+    if scenario != "agent":   # its home folder (= moth.serve.Home's draw for this seed): MothPolicy gets exactly
+        # these files, the judge is shown them when the chat is about the home
+        spec["home"] = sample_home(random.Random(seed), home_pool(), card)
     if scenario == "recall":
         fact, short = rng.choice(RECALL_FACTS)
         share = rng.choice([1, 2])
@@ -341,6 +353,14 @@ def script_spec(card: dict, name: str, lines: list[str], check, seed: int) -> di
             "card_id": card["id"], "system": C.student_system(card), "script": list(lines),
             "check": list(check) if isinstance(check, tuple) else check, "turns": len(lines), "agent_msgs": [],
             "recall": None, "persona": "", "goal": "", "topic": ""}
+
+
+def mix_for(tools: bool, mix: dict | None = None) -> dict:
+    """The scenario mix; without tools (an endpoint policy) home scenarios are dropped: it could only make files up."""
+    mix = dict(mix or SCENARIO_MIX)
+    if not tools:
+        mix.pop("home", None)
+    return mix
 
 
 def sample_spec(reg: Registry, rng: random.Random, split: str = "train", mix: dict | None = None,

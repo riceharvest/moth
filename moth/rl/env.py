@@ -21,8 +21,10 @@ and "cost" (this episode's calls/tokens per role).
 """
 from __future__ import annotations
 
+import os
 import re
 import statistics
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from moth.agent import AGENT_TAG
@@ -34,9 +36,25 @@ from moth.rl.judge import Judge
 from moth.rl.llm import CostMeter, OAIClient
 from moth.rl.sim import Simulator
 
-
 # --- policies ---------------------------------------------------------------------------------------------------
+_CTX = threading.local()
+
+
+def current_meter() -> CostMeter | None:
+    """The meter of the episode running on this thread (run_episode sets it), so one policy object can be shared by
+    many threads and still bill each call to the right episode."""
+    return getattr(_CTX, "meter", None)
+
+
+def uses_tools(policy) -> bool:
+    """Policies that run home tools themselves (MothPolicy, MockPolicy) set uses_tools = True; endpoint policies
+    don't, and home scenarios are skipped for them by default (they can only make files up)."""
+    return bool(getattr(policy, "uses_tools", False))
+
+
 class FnPolicy:
+    uses_tools = False
+
     def __init__(self, fn):
         self.fn = fn
 
@@ -49,22 +67,25 @@ def as_policy(p):
 
 
 class OpenAIPolicy:
-    """A checkpoint served behind an OpenAI-compatible endpoint (vLLM / SGLang): plain text turns, no tools."""
+    """A checkpoint served behind an OpenAI-compatible endpoint (vLLM / SGLang): plain text turns, no tools.
+    Stateless and thread-safe: share one between threads."""
+    uses_tools = False
 
     def __init__(self, client: OAIClient, temperature: float = 0.7, top_p: float = 0.95, max_tokens: int = 120,
                  meter_role: str = "policy"):
         self.client, self.role = client, meter_role
         self.kw = {"temperature": temperature, "top_p": top_p, "max_tokens": max_tokens}
-        self.meter: CostMeter | None = None
 
     def generate(self, messages):
-        r = self.client.chat(messages, meter=self.meter, role=self.role, **self.kw)
+        r = self.client.chat(messages, meter=current_meter(), role=self.role, **self.kw)
         return {"text": r["text"].strip(), "raw": r["text"].strip(), "usage": r["usage"]}
 
 
 class MothPolicy:
     """moth's own chat engine (moth.serve.Moth: its Decoder, sampler, phrase memory and real home tools).
-    Moth lowercases its replies, so the format reward's uppercase check is constant through this policy."""
+    Moth lowercases its replies, so the format reward's uppercase check is constant through this policy.
+    Stateful (one chat at a time): give each worker thread its own (a policy factory)."""
+    uses_tools = True
 
     def __init__(self, moth, home_root: str | None = None, home_cls=None):
         self.moth, self.home_root, self.home_cls = moth, home_root, home_cls
@@ -78,6 +99,8 @@ class MothPolicy:
             else:
                 home_cls = self.home_cls
             shutil.rmtree(self.home_root, ignore_errors=True)
+            if spec.get("home") is not None:   # exactly the files the judge is shown (Home keeps an existing dir)
+                write_home(self.home_root, spec["home"])
             self.moth.home = home_cls(self.home_root, spec["seed"], getattr(self.moth.a, "pool_file", None),
                                       card=spec["card"])
         self.moth.reset()
@@ -95,15 +118,34 @@ AGENT_REACT = [(r"\b(fail|broke|error|crash|couldn'?t|out of memory)", "oh no, i
                (r"\b(fixed|done|pass|green|implemented)\b", "it fixed it! high five. do you believe it this time?")]
 
 
+def write_home(root: str, files: dict[str, str]):
+    """A home dir with these files plus moth.serve's marker (so moth's "new home" may delete it)."""
+    os.makedirs(root, exist_ok=True)
+    try:
+        from moth.serve import MARKER
+        with open(os.path.join(root, MARKER), "w", encoding="utf-8", newline="\n") as f:
+            f.write("moth made this folder. its \"new home\" button may delete it.\n")
+    except ImportError:   # pragma: no cover - serve needs torch
+        pass
+    for rel, content in files.items():
+        p = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8", newline="\n") as f:
+            f.write(content)
+
+
 class MockPolicy:
     """Deterministic replies for tests and mock runs. mode: good (answers the gist, follows the card when asked,
-    recalls), selfy (talks about its identity), assistant (assistant-speak), parrot (the same line every turn)."""
+    recalls, names only files that are in its home), selfy (talks about its identity), assistant (assistant-speak),
+    parrot (the same line every turn), inventor (good, but makes up files on home questions). Stateful: one per
+    thread (pass a factory)."""
+    uses_tools = True
 
     def __init__(self, mode: str = "good"):
-        self.mode, self.card, self.k = mode, None, 0
+        self.mode, self.card, self.k, self.home = mode, None, 0, {}
 
     def start(self, spec):
-        self.card, self.k = spec["card"], 0
+        self.card, self.k, self.home = spec["card"], 0, spec.get("home") or {}
 
     def generate(self, messages):
         self.k += 1
@@ -117,6 +159,12 @@ class MockPolicy:
             refs = sorted({r.rstrip("*") for r in card.get("refs") or []} - GENERIC_REFS)
             noun = (card.get("kind") or "buddy").split()[-1]
             return f"i'm just a little {noun}. i love my {refs[0] if refs else 'home'}. do you?"
+        if re.search(r"\b(home|folder|diary|friends|files?|save)\b", u, re.I) and not u.startswith(AGENT_TAG):
+            if self.mode == "inventor":
+                return "i have a file called secret_cheese_plans.txt. it says the moon is mine."
+            names = sorted(p.split("/")[-1] for p in self.home if not p.endswith(".keep"))
+            if names:
+                return f"i looked. there's {names[self.k % len(names)]} in there. want me to read it?"
         if u.startswith(AGENT_TAG):
             for pat, line in AGENT_REACT:
                 if re.search(pat, u, re.I | re.M):
@@ -179,55 +227,71 @@ def run_episode(spec: dict, policy, sim: Simulator, judge: Judge, meter: CostMet
                 weights: dict | None = None, first_user: str | None = None, score_mode: str = "mean") -> dict:
     meter = meter if meter is not None else CostMeter()
     policy = as_policy(policy)
-    if hasattr(policy, "start"):
-        policy.start(spec)
-    if hasattr(policy, "meter"):
-        policy.meter = meter
-    chat = [{"role": "system", "content": spec["system"]}]
-    turns = []
-    i = 0   # human (non-agent) message index, 1-based
-    for kind, text in _plan(spec):
-        if kind == "agent":
-            u = f"{AGENT_TAG}\n{text}"
-        else:
-            i += 1
-            if kind == "script":
-                u = text
-            elif i == 1 and first_user is not None:
-                u = first_user
+    prev, _CTX.meter = getattr(_CTX, "meter", None), meter
+    try:
+        if hasattr(policy, "start"):
+            policy.start(spec)
+        chat = [{"role": "system", "content": spec["system"]}]
+        turns = []
+        i = 0   # human (non-agent) message index, 1-based
+        for kind, text in _plan(spec):
+            if kind == "agent":
+                u = f"{AGENT_TAG}\n{text}"
             else:
-                u = sim.next_user(spec, turns, i, meter)
-                if u is None:
-                    break
-        out = policy.generate(chat + [{"role": "user", "content": u}])
-        out = {"text": out} if isinstance(out, str) else dict(out)
-        text_out = (out.pop("text", "") or "").strip()
-        events = [dict(e) for e in (out.pop("events", None) or [{"say": text_out}])]
-        raw = out.pop("raw", None)
-        says = [e for e in events if "tool" not in e]
-        if raw is not None and len(says) == 1:
-            says[0]["raw"] = raw
-        chat += [{"role": "user", "content": u}, {"role": "assistant", "content": " ".join(e["say"] for e in says)}]
-        turns.append({"user": u, "events": events, "extra": out})
-    return score_episode(spec, turns, judge, meter, weights, score_mode)
+                i += 1
+                if kind == "script":
+                    u = text
+                elif i == 1 and first_user is not None:
+                    u = first_user
+                else:
+                    u = sim.next_user(spec, turns, i, meter)
+                    if u is None:
+                        break
+            out = policy.generate(chat + [{"role": "user", "content": u}])
+            out = {"text": out} if isinstance(out, str) else dict(out)
+            text_out = (out.pop("text", "") or "").strip()
+            events = [dict(e) for e in (out.pop("events", None) or [{"say": text_out}])]
+            raw = out.pop("raw", None)
+            says = [e for e in events if "tool" not in e]
+            if raw is not None and len(says) == 1:
+                says[0]["raw"] = raw
+            chat += [{"role": "user", "content": u}, {"role": "assistant", "content": " ".join(e["say"] for e in says)}]
+            turns.append({"user": u, "events": events, "extra": out})
+        return score_episode(spec, turns, judge, meter, weights, score_mode)
+    finally:
+        _CTX.meter = prev
 
 
 def replies_from_turns(spec: dict, turns: list[dict]) -> list[dict]:
-    """One entry per reply ({"say"} event) with its user message, turn index and the recall flags."""
+    """One entry per reply ({"say"} event) with its user message, turn index, the recall flags and "seen" (what the
+    friend, the agent and its tools said so far: file names from there are not inventions)."""
     rec = spec.get("recall") or {}
-    replies, said, i = [], None, 0
+    replies, said, i, seen = [], None, 0, ""
     for ti, t in enumerate(turns):
         u = t["user"]
+        seen += "\n" + u
         human = not u.startswith(AGENT_TAG)
         if human:
             i += 1
             if rec and i == rec.get("share_turn"):
                 said = u
         for e in t["events"]:
-            if "tool" not in e:
+            if "tool" in e:
+                seen += "\n" + str(e.get("result", "")) + "\n" + str(e.get("args", ""))
+            else:
                 replies.append({"turn": ti, "text": e["say"], "raw": e.get("raw", e["say"]), "user": u,
-                                "recall_ask": bool(rec) and human and i == rec.get("ask_turn"), "recall_said": said})
+                                "recall_ask": bool(rec) and human and i == rec.get("ask_turn"), "recall_said": said,
+                                "seen": seen})
     return replies
+
+
+def home_mode(spec: dict, turns: list[dict]) -> bool:
+    """Show the judge the home (and ask for "invented") when the chat is about it: a home scenario, a tool call, or a
+    reply naming a file."""
+    if spec.get("home") is None:
+        return False
+    return (spec["scenario"] == "home" or any("tool" in e for t in turns for e in t["events"])
+            or any(R.FILE_RE.search(e.get("say", "").lower()) for t in turns for e in t["events"]))
 
 
 def score_episode(spec: dict, turns: list[dict], judge: Judge, meter: CostMeter | None = None,
@@ -236,27 +300,45 @@ def score_episode(spec: dict, turns: list[dict], judge: Judge, meter: CostMeter 
     meter = meter if meter is not None else CostMeter()
     rec = spec.get("recall") or {}
     replies = replies_from_turns(spec, turns)
-    labels = judge.label(spec["card"], [{"user": t["user"], "events": t["events"]} for t in turns], meter)
-    scored = R.score_replies(replies, spec["card"], labels, rec or None, weights)
+    home = spec["home"] if home_mode(spec, turns) else None
+    labels = judge.label(spec["card"], [{"user": t["user"], "events": t["events"]} for t in turns], meter, home=home)
+    invented = None
+    if home is not None:
+        names = {p.split("/")[-1].lower() for p in home}
+        invented = [bool(R.invented_files(r["text"], names, r["seen"])) or bool((labels or [{}] * len(replies))[k]
+                                                                                 .get("invented"))
+                    for k, r in enumerate(replies)]
+    scored = R.score_replies(replies, spec["card"], labels, rec or None, weights, invented)
     msgs, where = _canonical(turns)
     for r, s, a in zip(replies, scored, where):
         r.update(s)
         r["assistant_index"] = a
         r.pop("recall_said", None)
+        r.pop("seen", None)
     meter.episodes = max(meter.episodes, 1)
     ep = {"spec_id": spec["id"], "seed": spec["seed"], "scenario": spec["scenario"], "card_id": spec["card_id"],
           "card": spec["card"], "system": spec["system"], "name": spec.get("name") or spec["id"],
           "check": spec.get("check"), "turns": turns, "messages": msgs, "replies": replies, "labels": labels,
-          "judge_ok": labels is not None, "reward": R.episode_score(scored, score_mode),
-          "components": R.component_means(scored), "cost": meter.summary()}
+          "judge_ok": labels is not None, "home_judged": home is not None,
+          "reward": R.episode_score(scored, score_mode), "components": R.component_means(scored),
+          "cost": meter.summary()}
     return ep
+
+
+def _map(fn, items: list, workers: int) -> list:
+    """Ordered map, in a thread pool when workers > 1 (a batching engine behind generate() then sees parallel
+    requests)."""
+    if workers <= 1 or len(items) <= 1:
+        return [fn(x) for x in items]
+    with ThreadPoolExecutor(min(workers, len(items))) as ex:
+        return list(ex.map(fn, items))
 
 
 def run_episodes(specs: list[dict], policy_factory, sim: Simulator, judge: Judge, workers: int = 1,
                  total: CostMeter | None = None, **kw) -> list[dict]:
-    """Many episodes. policy_factory() -> a fresh policy per worker thread (a stateful policy, e.g. MothPolicy or
-    MockPolicy, must not be shared between threads); pass a lambda returning one shared object for a stateless one."""
-    import threading
+    """Many episodes, `workers` at a time. policy_factory() -> a policy; called once per worker thread (a stateful
+    policy, e.g. MothPolicy or MockPolicy, must not be shared between threads); return one shared object from it
+    for a stateless one (OpenAIPolicy)."""
     local = threading.local()
 
     def one(spec):
@@ -267,29 +349,47 @@ def run_episodes(specs: list[dict], policy_factory, sim: Simulator, judge: Judge
         if total is not None:
             total.merge(m)
         return ep
-    if workers <= 1:
-        return [one(s) for s in specs]
-    with ThreadPoolExecutor(workers) as ex:
-        return list(ex.map(one, specs))
+    return _map(one, specs, workers)
 
 
 # --- groups (GRPO) ----------------------------------------------------------------------------------------------
-def rollout_group(spec: dict, policy, G: int, sim: Simulator, judge: Judge, meter: CostMeter | None = None,
-                  **kw) -> list[dict]:
-    """G episodes of one spec. The first simulated human message is asked once and shared, so all G rollouts start
-    from the same context (one sim call instead of G; reply 1 is then a clean GRPO comparison)."""
-    first = None
-    if not spec.get("script") and spec["scenario"] != "agent":
-        first = sim.next_user(spec, [], 1, meter)
-    out = []
-    for g in range(G):
+def first_message(spec: dict, sim: Simulator, meter: CostMeter | None = None) -> str | None:
+    """The shared opening human message of a group (deterministic: the sim call is seeded by the spec)."""
+    if spec.get("script") or spec["scenario"] == "agent":
+        return None
+    return sim.next_user(spec, [], 1, meter)
+
+
+def run_groups(specs: list[dict], G: int, sim: Simulator, judge: Judge, policy=None, policy_factory=None,
+               workers: int = 1, meter: CostMeter | None = None, **kw) -> list[list[dict]]:
+    """G rollouts for each spec, all of them `workers` at a time (across groups too). Each group's first simulated
+    message is asked once, before the fan-out, and shared by its G rollouts. policy_factory() (called per rollout)
+    gives each rollout its own policy state; a shared `policy` must be thread-safe when workers > 1."""
+    if policy_factory is None:
+        if policy is None:
+            raise ValueError("pass policy or policy_factory")
+        if workers > 1 and hasattr(as_policy(policy), "start"):
+            raise ValueError("a stateful policy (it has start()) can't be shared by threads: pass policy_factory")
+        policy_factory = lambda: policy  # noqa: E731
+    firsts = _map(lambda s: first_message(s, sim, meter), specs, workers)
+    jobs = [(si, g) for si in range(len(specs)) for g in range(G)]
+
+    def one(job):
+        si, g = job
         m = CostMeter()
-        ep = run_episode(spec, policy, sim, judge, m, first_user=first, **kw)
+        ep = run_episode(specs[si], policy_factory(), sim, judge, m, first_user=firsts[si], **kw)
         ep["group_index"] = g
         if meter is not None:
             meter.merge(m)
-        out.append(ep)
-    return out
+        return ep
+    eps = _map(one, jobs, workers)
+    return [eps[si * G:(si + 1) * G] for si in range(len(specs))]
+
+
+def rollout_group(spec: dict, policy, G: int, sim: Simulator, judge: Judge, meter: CostMeter | None = None,
+                  workers: int = 1, policy_factory=None, **kw) -> list[dict]:
+    """G episodes of one spec (run_groups for a single spec)."""
+    return run_groups([spec], G, sim, judge, policy, policy_factory, workers, meter, **kw)[0]
 
 
 def group_advantages(group: list[dict], level: str = "utterance", normalize: bool = True) -> list[list[float | None]]:

@@ -18,10 +18,10 @@ import random
 
 from moth.agent import AGENT_TAG
 from moth.rl import reward as R
-from moth.rl.env import _plan, group_advantages, rollout_group, score_episode
+from moth.rl.env import _plan, as_policy, group_advantages, run_groups, score_episode, uses_tools
 from moth.rl.judge import Judge
 from moth.rl.llm import CostMeter
-from moth.rl.registry import Registry, sample_spec
+from moth.rl.registry import Registry, mix_for, sample_spec
 from moth.rl.sim import Simulator
 
 
@@ -49,9 +49,11 @@ def _turns_from_messages(messages: list[dict]) -> list[dict]:
 
 class MothMultiTurnEnv:
     def __init__(self, sim: Simulator, judge: Judge, registry: Registry | None = None, split: str = "train",
-                 weights: dict | None = None, agent_msgs: list[str] | None = None, mix: dict | None = None):
+                 weights: dict | None = None, agent_msgs: list[str] | None = None, mix: dict | None = None,
+                 tools: bool = False):
+        """tools=False (an endpoint policy through a framework has no home tools): no home scenarios."""
         self.sim, self.judge, self.reg = sim, judge, registry or Registry()
-        self.split, self.weights, self.agent_msgs, self.mix = split, weights, agent_msgs, mix
+        self.split, self.weights, self.agent_msgs, self.mix = split, weights, agent_msgs, mix_for(tools, mix)
         self.meter = CostMeter()
         names = ["reward"] + list(R.COMPONENTS)
         self.rubric = RubricShape([self._func(n) for n in names], [1.0] + [0.0] * len(R.COMPONENTS))
@@ -157,15 +159,23 @@ def make_verifiers_env(core: MothMultiTurnEnv, n: int, seed: int = 0, max_turns:
 def grpo_rollouts(policy, n_groups: int, G: int, sim: Simulator, judge: Judge, registry: Registry | None = None,
                   split: str = "train", rng: random.Random | None = None, level: str = "utterance",
                   agent_msgs: list[str] | None = None, mix: dict | None = None, meter: CostMeter | None = None,
-                  drop_flat: bool = True, **kw) -> list[list[dict]]:
-    """n_groups groups of G scored episodes with reply["advantage"] filled (group_advantages). drop_flat skips groups
-    whose advantages are all zero/None (no signal), like tiny-agent's has_signal()."""
+                  drop_flat: bool = True, workers: int = 1, policy_factory=None, tools: bool | None = None,
+                  **kw) -> list[list[dict]]:
+    """n_groups groups of G scored episodes with reply["advantage"] filled (group_advantages).
+
+    Specs are sampled first (deterministic for rng), then all n_groups * G rollouts run `workers` at a time
+    (env.run_groups: each group's first sim message is asked once and shared). policy_factory() gives every rollout
+    its own policy state (needed for stateful policies when workers > 1); else `policy` is shared. tools: whether the
+    policy runs home tools (default: its uses_tools flag); without tools no home scenarios are sampled.
+    drop_flat skips groups whose advantages are all zero/None (no signal), like tiny-agent's has_signal()."""
     reg = registry or Registry()
     rng = rng or random.Random(0)
+    if tools is None:
+        tools = uses_tools(as_policy(policy if policy is not None else policy_factory()))
+    mx = mix_for(tools, mix)
+    specs = [sample_spec(reg, rng, split, mx, agent_msgs) for _ in range(n_groups)]
     groups = []
-    for _ in range(n_groups):
-        spec = sample_spec(reg, rng, split, mix, agent_msgs)
-        g = rollout_group(spec, policy, G, sim, judge, meter, **kw)
+    for g in run_groups(specs, G, sim, judge, policy, policy_factory, workers, meter, **kw):
         adv = group_advantages(g, level)
         if drop_flat and not any(a for row in adv for a in row if a is not None):
             continue

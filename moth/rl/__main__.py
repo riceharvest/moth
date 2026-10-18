@@ -3,7 +3,7 @@
   python -m moth.rl mock --episodes 3 [--policy good|selfy|assistant|parrot] [--json out.json]
   python -m moth.rl run  --sim-url URL --judge-url URL (--policy-url URL | --moth-model PATH) --episodes 20 --out DIR
                          [--agent-pool ~/moth/moth/agent_pool.json]   (read-only; the eval's agent messages are skipped)
-  python -m moth.rl eval --version v1 (--mock | --policy-url URL | --moth-model PATH) [--sim-url --judge-url]
+  python -m moth.rl eval --version v2 (--mock | --policy-url URL | --moth-model PATH) [--sim-url --judge-url]
                          [--ref OTHER/results.json] --out DIR
   python -m moth.rl cost --meter DIR/meter.json --episodes 100000 --tps sim=20000:2500 --tps judge=15000:1500
                          [--box rtx59-7-24-800-ig.1 | --price 0.65]
@@ -22,10 +22,10 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from moth.rl.env import MockPolicy, MothPolicy, OpenAIPolicy, run_episodes  # noqa: E402
+from moth.rl.env import MockPolicy, MothPolicy, OpenAIPolicy, as_policy, run_episodes, uses_tools  # noqa: E402
 from moth.rl.judge import JUDGE_MODEL, JudgeCache, LLMJudge, MockJudge  # noqa: E402
 from moth.rl.llm import CostMeter, OAIClient, box_hours, read_json, write_json  # noqa: E402
-from moth.rl.registry import Registry, sample_spec, train_agent_msgs  # noqa: E402
+from moth.rl.registry import Registry, mix_for, sample_spec, train_agent_msgs  # noqa: E402
 from moth.rl.sim import SIM_MODEL, LLMSimulator, MockSimulator  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -66,7 +66,9 @@ def components(a, mock: bool):
     cache = JudgeCache(os.path.join(a.out, "judge_cache.jsonl") if a.out else None)
     if mock:
         return MockSimulator(), MockJudge(cache)
-    return LLMSimulator(OAIClient(a.sim_url, a.sim_model)), LLMJudge(OAIClient(a.judge_url, a.judge_model), cache)
+    temp = a.sim_temperature if a.sim_temperature is not None else (0.0 if a.cmd == "eval" else 1.0)
+    return (LLMSimulator(OAIClient(a.sim_url, a.sim_model), temperature=temp),
+            LLMJudge(OAIClient(a.judge_url, a.judge_model), cache))
 
 
 def policy_factory(a):
@@ -93,6 +95,8 @@ def main(argv=None):
         if endpoints:
             p.add_argument("--sim-url", default="http://127.0.0.1:8001/v1")
             p.add_argument("--sim-model", default=None, help=f"served name (plan: {SIM_MODEL}); default /v1/models")
+            p.add_argument("--sim-temperature", type=float, default=None,
+                           help="default 0 for eval (pairs line up better), 1.0 for run")
             p.add_argument("--judge-url", default="http://127.0.0.1:8000/v1")
             p.add_argument("--judge-model", default=None, help=f"served name (plan: {JUDGE_MODEL})")
             p.add_argument("--policy-url", default=None)
@@ -104,7 +108,7 @@ def main(argv=None):
     m = sub.add_parser("mock")
     common(m, endpoints=False)
     m.add_argument("--episodes", type=int, default=3)
-    m.add_argument("--policy", default="good", choices=["good", "selfy", "assistant", "parrot"])
+    m.add_argument("--policy", default="good", choices=["good", "selfy", "assistant", "parrot", "inventor"])
     m.add_argument("--split", default="train", choices=["train", "heldout"])
     m.add_argument("--json", default=None)
     r = sub.add_parser("run")
@@ -114,7 +118,9 @@ def main(argv=None):
     r.add_argument("--mock", action="store_true")
     e = sub.add_parser("eval")
     common(e)
-    e.add_argument("--version", default="v1")
+    e.add_argument("--version", default="v2")
+    e.add_argument("--home", choices=["auto", "on", "off"], default="auto",
+                   help="home specs: auto = only for a policy that runs tools (moth), not an endpoint")
     e.add_argument("--mock", action="store_true")
     e.add_argument("--ref", default=None)
     e.add_argument("--limit", type=int, default=None)
@@ -148,7 +154,7 @@ def main(argv=None):
             pair_ask = lambda p: cl.chat([{"role": "user", "content": p}], temperature=0, max_tokens=300,  # noqa: E731
                                          chat_template_kwargs={"enable_thinking": False})["text"]
         s = run_eval(a.version, policy_factory(a), sim, judge, a.out, a.ref, pair_ask, a.workers, limit=a.limit,
-                     label=label)
+                     label=label, include_home={"auto": None, "on": True, "off": False}[a.home])
         with open(os.path.join(a.out, "report.md"), encoding="utf-8") as f:
             print(f.read())
         write_json(os.path.join(a.out, "meter.json"), {"per_episode": s["cost_per_episode"]}, indent=1)
@@ -161,12 +167,14 @@ def main(argv=None):
     if agent is None and not mock:
         print(f"WARNING: no agent message pool at {a.agent_pool}: agent episodes use the 8 built-in stand-ins. "
               "Pass --agent-pool (e.g. the main tree's moth/agent_pool.json, read-only).", file=sys.stderr, flush=True)
-    specs = [sample_spec(reg, rng, a.split, agent_msgs=agent) for _ in range(a.episodes)]
+    pf = policy_factory(a)
+    mix = mix_for(uses_tools(as_policy(pf())))   # endpoint policies: no home scenarios
+    specs = [sample_spec(reg, rng, a.split, mix, agent_msgs=agent) for _ in range(a.episodes)]
     if a.out:
         os.makedirs(a.out, exist_ok=True)
     sim, judge = components(a, mock)
     total = CostMeter()
-    eps = run_episodes(specs, policy_factory(a), sim, judge, a.workers, total=total)
+    eps = run_episodes(specs, pf, sim, judge, a.workers, total=total)
     for ep in eps:
         print(show(ep), flush=True)
     per = total.per_episode()
