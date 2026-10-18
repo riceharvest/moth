@@ -138,6 +138,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: python -m pytest -q -rs -p no:cacheprovider tests/test_eval_probes.py
 
+      - name: test_rl_env
+        if: ${{ !cancelled() }}
+        run: python -m pytest -q -rs -p no:cacheprovider tests/test_rl_env.py
+
       - name: test_cli_tools
         if: ${{ !cancelled() && hashFiles('tests/test_cli_tools.py') != '' }}
         run: python -m pytest -q -rs -p no:cacheprovider tests/test_cli_tools.py

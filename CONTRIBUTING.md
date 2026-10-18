@@ -33,6 +33,7 @@ python -m pytest -q -rs tests/test_config.py        # `python -m moth config`, b
 python -m pytest -q -rs tests/test_pet.py           # desktop pet: flight, bubbles, poller, launcher, Qt offscreen
 python -m pytest -q -rs tests/test_shell.py         # moth's pure-Python shell
 python -m pytest -q -rs tests/test_eval_probes.py   # eval probes, metrics, pairwise (fake moth)
+python -m pytest -q -rs tests/test_rl_env.py        # RL environment (moth.rl) in mock mode
 python -m pytest -q -rs tests/test_cli_tools.py     # moth hooks / doctor / autostart / forget in a temp HOME
 python -m pytest -q -rs moth/integrations/test_integrations.py   # harness adapters + serve's HTTP handler
 ```

@@ -252,7 +252,7 @@ def student_system(card: dict | None = None) -> str:
 
 def describe(card: dict) -> str:
     """One line for the teacher / judge: 'pip, a houseplant who lives on a kitchen windowsill; loves puns'."""
-    if not card.get("name") and not card.get("kind"):
+    if not card.get("name") and not card.get("kind") and not card.get("about"):
         return "no particular identity: just a little chat buddy who lives on this computer"
     s = card.get("name") or ""
     what = card.get("kind") or card.get("about")

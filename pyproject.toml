@@ -58,6 +58,7 @@ exclude = [
     "moth/judge_mcp.py",
     "moth/pairwise.py",
     "moth/rejudge.py",
+    "moth/rl",
 ]
 
 [tool.hatch.build.targets.wheel]

@@ -1,0 +1,4 @@
+# append-only: one JSON object per line; never edit or delete a line (ids and the train/heldout hash split depend on it). Add with: python -m moth.rl.registry add-phrasing "..."
+{"added": "2026-10-19", "id": "p3b954204df", "source": "manual", "tmpl": "you go by {name}; you're {kind}."}
+{"added": "2026-10-19", "id": "pcae144eec8", "source": "manual", "tmpl": "character: {kind}, called {name}."}
+{"added": "2026-10-19", "id": "pece77283ff", "source": "manual", "tmpl": "ok so you're {kind}. name's {name}. you live {home}."}
