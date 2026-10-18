@@ -73,7 +73,10 @@ def main() -> int:
 
         def say(self, text: str = ""):
             bridge.log.emit(text)
-            print(text, flush=True)   # ~/.moth/app.log when opened from the Start menu / Finder
+            try:
+                print(text, flush=True)   # ~/.moth/app.log when opened from the Start menu / Finder
+            except (OSError, ValueError):
+                pass
 
         def line(self, mark: str, text: str):
             if mark == "✗":
@@ -184,7 +187,7 @@ def main() -> int:
 
     log = QPlainTextEdit()
     log.setReadOnly(True)
-    log.setMinimumHeight(150)
+    log.setMinimumHeight(110)
     log.setPlaceholderText("what moth setup does shows up here")
     root.addWidget(log)
 
@@ -288,11 +291,10 @@ def main() -> int:
                 bar.setValue(100)
             else:
                 bar.hide()
-                why = s.errors[-1] if s.errors else ""
                 log.appendPlainText(NOT_PUBLISHED)
                 refresh()
-                wstatus.setText(f"<span style='color:#b3261e'>✗ {NOT_PUBLISHED}</span>"
-                                + (f"<br><small>({why})</small>" if why else ""))
+                wstatus.setText(f"<span style='color:#b3261e'>✗ {NOT_PUBLISHED}</span>")
+                w.adjustSize()   # the longer text: grow instead of clipping it (macOS)
                 return
         refresh()
         if job == "start" and (s.started or "moth running" in s.had):

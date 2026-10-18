@@ -134,7 +134,15 @@ def run_module(mod: str, args: list) -> None:
 
 
 def _quiet_streams():
-    """The windowed exe (Windows), or an app opened from Finder: no stdout. Log to ~/.moth/app.log instead of None."""
+    """The windowed exe (Windows), or an app opened from Finder: no stdout. Log to ~/.moth/app.log instead of None.
+    A log file or pipe gets UTF-8 (a frozen app ignores PYTHONIOENCODING, and Windows would write cp1252, which has
+    no ✓); a console keeps its encoding, never failing on a character it lacks."""
+    for s in (sys.stdout, sys.stderr):
+        try:
+            if s is not None:
+                s.reconfigure(errors="replace") if s.isatty() else s.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
     if sys.stdout is not None and sys.stderr is not None:
         return
     try:
