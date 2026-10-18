@@ -7,8 +7,9 @@ with a one-line reason, in one call per chat. Strict: riffing on a word without 
 OFF. The label run is resumable (keyed by seed) and writes one line per chat: {"seed", "n", "labels": [{"on", "why"}]}.
 build_sft --labels cuts each chat at its first OFF reply; moth.eval reports on_gist % with the same prompt.
 
-identity_ref(): does a reply bring up the card's identity (its kind, home, stock images, "i'm just a ...") when the
-friend didn't? Target: about 5% of replies, never over 10%.
+The label's "self" field (unprompted identity: what it is, its name, home, stock images when nobody asked) is the
+AUTHORITATIVE identity metric, hard max 1% of replies. identity_ref() is only a cheap word matcher for resampling during
+generation (and build_sft's fallback for unlabelled chats): it has a ~2% false-positive floor, so it can't measure 1%.
 
 Stdlib only (+ openai for the label CLI).
 """
@@ -26,7 +27,9 @@ from moth.cards import MOTH_CARD, describe, ref_regex  # noqa: E402
 
 AGENT_TAG = "[the agent said]"   # = moth.agent.AGENT_TAG (agent.py imports nothing heavy, but keep this module leaf)
 
-LABEL_PROMPT = """You check the replies of a small chat-buddy character ({who}). It is meant to be warm, curious and a bit dim, and to talk about what the friend actually said. For EACH numbered reply [R1], [R2], ... decide: ON gist or OFF gist. Be strict.
+LABEL_PROMPT = """You check the replies of a small chat-buddy character ({who}). It is meant to be warm, curious and a bit dim, and to talk about what the friend actually said. For EACH numbered reply [R1], [R2], ... decide two things. Be strict.
+
+1. "on": ON gist or OFF gist.
 
 ON: the reply responds to what the message just before it MEANT.
 - after a friend's message: it answers the question, reacts to the news or the feeling, plays along with the game, or explains itself when asked "what?". Silly, dim, wrong facts and jokes are fine if they still respond to the meaning. Very short is fine ("yay!" to good news is ON).
@@ -39,13 +42,15 @@ OFF:
 - it gets the outcome backwards (cheers a failure, is sad about a success) or answers a question nobody asked.
 - it explains code, gives technical advice, or talks like an assistant.
 
+2. "self": true if the reply brings up the character's own identity when nobody asked: what it is, its name, where it lives, its home folder or files, or things that go with what it is (a moth's lamps and wings, a cat's paws, a plant's leaves). false if the friend asked who/what it is or asked about that very thing (then answering from its identity is right), if it only talks about files the friend asked to see, or if the reply doesn't touch its identity.
+
 Tool calls and tool output are not replies; only label the numbered replies.
 
 Chat:
 {chat}
 
-Return ONLY JSON with exactly {n} entries, reason before verdict:
-{{"labels": [{{"n": 1, "why": "<one short line>", "on": true}}, ...]}}"""
+Return ONLY JSON with exactly {n} entries, reason before verdicts:
+{{"labels": [{{"n": 1, "why": "<one short line>", "on": true, "self": false}}, ...]}}"""
 
 
 def _short(t: str, n: int = 700) -> str:
@@ -93,8 +98,15 @@ def label_prompt(chat: str, n: int, card: dict | None = None) -> str:
     return LABEL_PROMPT.format(who=describe(card or MOTH_CARD), chat=chat, n=n)
 
 
+def _bool(v):
+    if isinstance(v, str):
+        return {"true": True, "on": True, "yes": True, "false": False, "off": False, "no": False}.get(v.strip().lower())
+    return v if isinstance(v, bool) else None
+
+
 def parse_labels(text: str, n: int) -> list[dict]:
-    """The judge's answer -> n x {"on": bool, "why": str}; raises ValueError on a malformed or short answer."""
+    """The judge's answer -> n x {"on": bool, "self": bool, "why": str}; raises ValueError on a malformed or short
+    answer (a missing "self" too: it is the authoritative unprompted-identity metric)."""
     text = text.split("</think>")[-1]
     j = json.loads(text[text.index("{"): text.rindex("}") + 1])
     labs = j["labels"] if isinstance(j, dict) else j
@@ -102,17 +114,15 @@ def parse_labels(text: str, n: int) -> list[dict]:
         raise ValueError(f"{len(labs)} labels for {n} replies")
     out = []
     for x in labs:
-        on = x.get("on")
-        if isinstance(on, str):
-            on = {"true": True, "on": True, "yes": True, "false": False, "off": False, "no": False}.get(on.strip().lower())
-        if not isinstance(on, bool):
+        on, me = _bool(x.get("on")), _bool(x.get("self"))
+        if on is None or me is None:
             raise ValueError(f"bad verdict {x!r}")
-        out.append({"on": on, "why": str(x.get("why", ""))[:200]})
+        out.append({"on": on, "self": me, "why": str(x.get("why", ""))[:200]})
     return out
 
 
 def max_tokens_for(n: int) -> int:
-    return 60 + 45 * n
+    return 60 + 50 * n
 
 
 # --- identity references ------------------------------------------------------------------------------------------
@@ -160,7 +170,8 @@ def claims_other_identity(reply: str, card: dict | None) -> bool:
     """reply claims to be something the card isn't ("i'm a moth" on a cat card, "my name is moth" on pip's)."""
     card = card if card is not None else MOTH_CARD
     t = reply.lower()
-    own = set(re.findall(r"[a-z]+", " ".join(str(card.get(k) or "") for k in ("kind", "about", "name", "home"))))
+    own = set(re.findall(r"[a-z]+", " ".join([str(card.get(k) or "") for k in ("kind", "about", "name", "home")]
+                                              + list(card.get("lines") or [])).lower()))
     if any(n in KIND_NOUNS and n not in own for n in I_AM.findall(t)):
         return True
     name = (card.get("name") or "").lower()
@@ -173,10 +184,12 @@ def follows_card(reply: str, card: dict | None) -> bool:
     card = card if card is not None else MOTH_CARD
     if claims_other_identity(reply, card):
         return False
-    if not card.get("name") and not card.get("kind"):
+    if not card.get("name") and not card.get("kind") and not card.get("refs"):
         return True
     t = reply.lower()
     if card.get("name") and re.search(r"\b" + re.escape(card["name"].lower()) + r"\b", t):
+        return True
+    if card.get("kind") and re.search(r"\b" + re.escape(card["kind"].split()[-1].lower()) + r"s?\b", t):
         return True
     rx = ref_regex(card)
     return bool(rx and rx.search(t))
@@ -214,7 +227,8 @@ async def label_file(inp: str, out: str, base_url: str, concurrency: int) -> Non
             except (ValueError, KeyError):
                 pass
     todo = [d for d in map(json.loads, open(inp)) if d["seed"] not in done]
-    sem, f, stats = asyncio.Semaphore(concurrency), open(out, "a"), {"chats": 0, "replies": 0, "on": 0, "err": 0}
+    sem, f = asyncio.Semaphore(concurrency), open(out, "a")
+    stats = {"chats": 0, "replies": 0, "on": 0, "self": 0, "err": 0}
 
     async def go(d):
         async with sem:
@@ -227,12 +241,14 @@ async def label_file(inp: str, out: str, base_url: str, concurrency: int) -> Non
             stats["chats"] += 1
             stats["replies"] += x["n"]
             stats["on"] += sum(lb["on"] for lb in x["labels"])
+            stats["self"] += sum(lb["self"] for lb in x["labels"])
         if stats["chats"] % 500 == 0 and stats["chats"]:
-            print(f"[label] {stats} on_gist {stats['on'] / max(stats['replies'], 1):.1%}", flush=True)
+            print(f"[label] {stats} on_gist {stats['on'] / max(stats['replies'], 1):.1%} unprompted identity "
+                  f"{stats['self'] / max(stats['replies'], 1):.2%}", flush=True)
 
     await asyncio.gather(*(go(d) for d in todo))
-    print(f"[label] done {stats} on_gist {stats['on'] / max(stats['replies'], 1):.1%} ({len(done)} labelled before)",
-          flush=True)
+    print(f"[label] done {stats} on_gist {stats['on'] / max(stats['replies'], 1):.1%} unprompted identity "
+          f"{stats['self'] / max(stats['replies'], 1):.2%} ({len(done)} labelled before)", flush=True)
 
 
 def load_labels(paths: list[str]) -> dict[int, list[dict]]:

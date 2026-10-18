@@ -113,7 +113,10 @@ EXPLAINS = re.compile(r"\bmeans\b|\bmeasures?\b|\bbasically\b|\bin other words\b
 DODGE = re.compile(r"\bcan(?:'t|not) (?:understand|read|follow)\b|\bdon'?t (?:understand|get it)\b")
 BUG = re.compile(r"\bbugs?\b|\bgrand ?ma\b")   # the grandma lore belongs to messages that say "bug"
 MAX_AGENT_WORDS = 25
-MAX_IDENTITY_REFS = 1   # unprompted mentions of what it is / where it lives per chat (target ~5% of replies overall)
+# unprompted identity talk (what it is, its name, where it lives, its home, its stock images) is capped at 1% of
+# replies: a chat with one goes entirely. Authoritative: the label pass's "self" flag (--labels). Unlabelled chats (and
+# gen_dialogs' mid-chat check, which only resamples) fall back to the word matcher gist.identity_ref.
+DROP_REASONS = {"identity_ref", "identity_label"}
 MIN_REPEAT_WORDS = 2   # a human saying "ok" or "what" twice is fine
 MAX_SAME_REPLY = 15
 
@@ -202,10 +205,8 @@ def reply_problem(t: str, ctx: dict) -> str | None:
         if ctx["identity"] >= MAX_IDENTITY:
             return "identity"
         ctx["identity"] += 1
-    if identity_ref(t, ctx["card"], user + " " + ctx["tool_text"]):
-        if ctx["id_refs"] >= MAX_IDENTITY_REFS:
-            return "identity_heavy"
-        ctx["id_refs"] += 1
+    if ctx["use_matcher"] and identity_ref(t, ctx["card"], user + " " + ctx["tool_text"]):
+        return "identity_ref"
     # a motif word the friend (or a file moth just read, or the chat's topic) brought up is on topic:
     # "what glow?" -> "the glow is ...", a chat about streetlights
     here = user + " " + ctx["tool_text"] + " " + ctx["topic"]
@@ -232,10 +233,15 @@ def keep(d: dict, why: collections.Counter, labels: list[dict] | None = None) ->
     seen_text = ""
     ctx = {"is_agent": chat_type(d) == "agent", "user": "", "agent_msg": "", "after_agent": False, "bug_said": False,
            "tool_text": "", "topic": str(d.get("topic") or ""), "n_replies": 0, "identity": 0,
-           "motif": collections.Counter(), "motif_replies": 0, "card": d.get("card") or MOTH_CARD, "id_refs": 0}
+           "motif": collections.Counter(), "motif_replies": 0, "card": d.get("card") or MOTH_CARD, "use_matcher": True}
     if labels is not None and len(labels) != sum(bool(m.get("content")) for m in msgs if m["role"] == "assistant"):
         why["labels_mismatch"] += 1
         labels = None
+    if labels is not None:
+        ctx["use_matcher"] = False
+        if any(lb.get("self") for lb in labels):
+            why["identity_label:drop"] += 1   # unprompted identity talk anywhere: the whole chat goes
+            return None
     orig_j = -1         # index of the current reply among the chat's original replies (= the label index)
     prev_reply = None   # moth's last reply, for "what X"
     start = 0           # index in out of the user turn that opened the current exchange
@@ -297,6 +303,9 @@ def keep(d: dict, why: collections.Counter, labels: list[dict] | None = None) ->
                 ctx["n_replies"] += 1
                 m["content"] = prev_reply = t
         out.append(m)
+    if reason in DROP_REASONS:
+        why[f"{reason}:drop"] += 1
+        return None
     if reason:
         out = out[:start]
     n_replies = sum(bool(m.get("content")) for m in out if m["role"] == "assistant")
@@ -497,6 +506,7 @@ def filter_chats(paths: list[str], why: collections.Counter, cutoff: dict | None
                 if lab is not None:
                     why["labelled_replies"] += len(lab)
                     why["on_gist_replies"] += sum(x["on"] for x in lab)
+                    why["self_replies"] += sum(bool(x.get("self")) for x in lab)
             msgs = keep(d, why, lab)
             if msgs is None:
                 continue
@@ -615,9 +625,12 @@ def main():
           f"tokens, from {sum(stitchable(k) for k in kept[nv:])} stitchable talk chats)")
     if labels is not None:
         print(f"  gist labels: {why['labelled_chats']}/{n_in} chats labelled; ON {why['on_gist_replies']}/"
-              f"{why['labelled_replies']} replies ({why['on_gist_replies'] / max(why['labelled_replies'], 1):.1%})")
-    print(f"  cards {rep['cards']}; unprompted identity refs {rep['identity_ref_rate']:.1%} of kept replies "
-          f"({', '.join(f'{k} {v:.1%}' for k, v in rep['identity_ref_by_type'].items())}; target ~5%, max 10%)")
+              f"{why['labelled_replies']} replies ({why['on_gist_replies'] / max(why['labelled_replies'], 1):.1%}); "
+              f"unprompted identity (label 'self') {why['self_replies'] / max(why['labelled_replies'], 1):.2%} of "
+              f"replies in, 0 kept (hard max 1%)")
+    print(f"  cards {rep['cards']}; word-matcher identity refs {rep['identity_ref_rate']:.1%} of kept replies "
+          f"({', '.join(f'{k} {v:.1%}' for k, v in rep['identity_ref_by_type'].items())}; ~2% false-positive floor, "
+          f"the labels are the real check)")
     print(f"  moth replies {rep['replies']} ({rep['replies_per_chat']}/chat): identity {rep['identity_rate']:.1%}, "
           f"question back {rep['question_back_rate']:.1%}, any motif {rep['motif_any_rate']:.1%} "
           f"({', '.join(f'{k} {v:.1%}' for k, v in rep['motif_rates'].items())}); "

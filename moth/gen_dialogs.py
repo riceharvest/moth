@@ -92,11 +92,11 @@ LONG_SHARE = {"p": 0.15}     # --long-share: talk chats with 16-24 user turns
 SIM_NO_REPEAT = "\n\nYou already sent: {prev}. Write something new, not any of these."
 NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
 # teacher view only (appended to each human turn, never in the training text). TALK_REMIND_ID when the friend asked
-# who/what it is or used one of the card's own words, else TALK_REMIND: identity talk stays rare (~5%)
+# who/what it is, else TALK_REMIND: unprompted identity talk is capped at 1% of replies (label pass "self")
 TALK_REMIND = ("\n\n(answer what they just said or meant first, in one short lowercase line, usually under 15 words. "
-               "no talk about what you are, where you live or your home folder unless they bring it up. files only if "
-               "they ask about your home or want something saved: one tiny command.)")
-TALK_REMIND_ID = ("\n\n(answer what they just said first, one short lowercase line. they brought up who or what you are: "
+               "no talk about what you are, your name, where you live or your home folder: they didn't ask. files only "
+               "if they ask about your home or want something saved: one tiny command.)")
+TALK_REMIND_ID = ("\n\n(answer what they just said first, one short lowercase line. they asked who or what you are: "
                   "answer from WHO YOU ARE in a few plain words, then back to them. files only if they ask about your "
                   "home or want something saved: one tiny command.)")
 MOTH_REMIND = TALK_REMIND   # old name

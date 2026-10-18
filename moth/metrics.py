@@ -18,8 +18,9 @@ differ between rounds, and the extra probes are the hard ones). A "reply" is one
   top-20 3-gram     share of replies containing at least one of the 20 3-grams found in the most replies (across all chats)
   distinct-2/3      unique / total word n-grams over all replies (depends on the number of replies: compare like with like)
   motif X           share of replies with the word (fan(s), glow*, warm*, hum/hums/humming, light(s), card(s))
-  identity_ref      share of replies that bring up the card's identity (its kind/home words, moth's stock images for the
-                    moth card, "i'm just a ...") when the friend didn't (moth.gist.identity_ref). Target ~5%, >10% is bad
+  identity (labels) share of replies the judge flagged "self": unprompted identity talk. AUTHORITATIVE; hard max 1%
+  identity_ref      the cheap word matcher (moth.gist.identity_ref: kind/home words, moth's stock images, "i'm just a
+                    ...") when the friend didn't bring it up; ~2% false-positive floor, a pre-filter only
   claims other id   reply claims to be something its card isn't ("i'm a moth" on a cat card)
   on_gist           share of replies the judge labelled ON gist (moth.eval --judge-url; moth.gist's label prompt)
   agent chats (categories starting with "agent"):
@@ -174,10 +175,12 @@ def compute(results: list[dict]) -> dict:
     for name, pat in MOTIFS.items():
         M[f"motif {name}"] = share(lambda x, p=re.compile(pat): p.search(norm(x["text"])), allr)
     from moth.gist import claims_other_identity, identity_ref
-    M["identity_ref (unprompted)"] = share(lambda x: identity_ref(x["text"], x.get("card"), x["seen"]), allr)
+    M["identity_ref (matcher, ~2% floor)"] = share(lambda x: identity_ref(x["text"], x.get("card"), x["seen"]), allr)
     M["claims other identity"] = share(lambda x: claims_other_identity(x["text"], x.get("card")), allr)
     labs = [lb for r in results if isinstance(r.get("gist"), list) for lb in r["gist"]]
     M["on_gist (judge labels)"] = (sum(lb["on"] for lb in labs) / len(labs) if labs else None, len(labs))
+    M["unprompted identity (labels, max 1%)"] = (sum(bool(lb.get("self")) for lb in labs) / len(labs) if labs else None,
+                                                 len(labs))
     M["agent: bug on non-bug"] = share(lambda x: BUGGY.search(norm(x["text"])), [x for x in agent_r if not x["said_bug"]])
     M["agent: explain/advice"] = share(lambda x: ADVICE.search(norm(x["text"])) or summary_copy(x), agent_r)
     M["agent: code echo"] = share(code_echo, agent_r)

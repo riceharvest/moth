@@ -1,7 +1,8 @@
 """Test moth like a user would: scripted multi-turn probes through the real chat engine (moth.serve.Moth).
 
   python -m moth.eval --model runs/sft1/model --samples 3 --device cuda [--judge-url http://127.0.0.1:8000/v1] [--out DIR]
-      [--cards moth,heldout:0,heldout:4,heldout:8]   (default: moth + a hedgehog, a cardboard box and a human)
+      [--cards moth,heldout:0,heldout_free:4,text:"you are a cat named bo"]
+      (default: moth + held-out identities, in the template and in held-out free-form phrasings)
 
 Probes live in moth/probes.py (scripted chats, "what X" follow-ups built from moth's own reply, recall at 5/10/20
 turns, the user's own typing style, held-out real agent final messages). Every (probe, sample) gets a seed from a
@@ -10,8 +11,9 @@ python -m moth.pairwise A/results.json B/results.json).
 
 Per reply: automatic flags (style, invented files, leaked format tokens, tool errors, repeats) and the deterministic
 metrics of moth/metrics.py (identity crutch, bible copy, dodge, agent misreadings, repeats, diversity, motifs).
-Per probe: the write/recall/what-X/follows-card checks. --cards runs the probes once per identity card (the moth card
-and held-out cards that never appear in training; moth-only probes are skipped for the others).
+Per probe: the write/recall/what-X/follows-card checks. --cards runs the probes once per identity card: the moth card,
+held-out identities that never appear in training (heldout:<i>), the same in held-out free-form phrasings
+(heldout_free:<i>), or any one-liner (text:...). Moth-only probes are skipped for the others.
 With --judge-url: the headline is per reply, on_gist % (moth.gist's label prompt, the same one build_sft filters with);
 the teacher also scores each chat 1-5 (JUDGE below), which counts for less.
 Writes <out>/report.md (tables), <out>/transcripts.md (every chat, for reading by eye) and <out>/results.json.
@@ -256,27 +258,32 @@ def gist_all(results, url=None, think=None, ask=None):
     with ThreadPoolExecutor(16) as ex:
         list(ex.map(one, results))
     ok = [x for r in results if isinstance(r.get("gist"), list) for x in r["gist"]]
-    print(f"gist labels: {len(ok)} replies, on_gist {sum(x['on'] for x in ok) / max(len(ok), 1):.1%}", flush=True)
+    print(f"gist labels: {len(ok)} replies, on_gist {sum(x['on'] for x in ok) / max(len(ok), 1):.1%}, unprompted "
+          f"identity {sum(bool(x.get('self')) for x in ok) / max(len(ok), 1):.2%}", flush=True)
 
 
 def on_gist_rows(results) -> list[str]:
     """Markdown rows: on_gist % per category (+ per card when several) and ALL."""
     def rate(rs):
         xs = [x for r in rs if isinstance(r.get("gist"), list) for x in r["gist"]]
-        return (f"{sum(x['on'] for x in xs) / len(xs):.1%}", len(xs)) if xs else ("n/a", 0)
+        if not xs:
+            return "n/a", "n/a", 0
+        return (f"{sum(x['on'] for x in xs) / len(xs):.1%}", f"{sum(bool(x.get('self')) for x in xs) / len(xs):.2%}",
+                len(xs))
     by = collections.defaultdict(list)
     for r in results:
         by[r["cat"]].append(r)
-    L = ["| category | on_gist | replies |", "|---|---|---|"]
+    head = "| on_gist | unprompted identity (target <= 1%) | replies |"
+    L = ["| category " + head, "|---|---|---|---|"]
     for cat, rs in sorted(by.items()) + [("**ALL**", results)]:
-        v, n = rate(rs)
-        L.append(f"| {cat} | {v} | {n} |")
+        v, me, n = rate(rs)
+        L.append(f"| {cat} | {v} | {me} | {n} |")
     cards = sorted({r.get("card_id") or "moth" for r in results})
     if len(cards) > 1:
-        L += ["", "| card | on_gist | replies |", "|---|---|---|"]
+        L += ["", "| card " + head, "|---|---|---|---|"]
         for c in cards:
-            v, n = rate([r for r in results if (r.get("card_id") or "moth") == c])
-            L.append(f"| {c} | {v} | {n} |")
+            v, me, n = rate([r for r in results if (r.get("card_id") or "moth") == c])
+            L.append(f"| {c} | {v} | {me} | {n} |")
     return L
 
 
@@ -300,7 +307,7 @@ def report(results, out, label):
     L += [f"probe set {probe_hash(names)}: {len(names)} probes ("
           + ", ".join(f"{c} {len({r['name'] for r in rs})}" for c, rs in by.items()) + ")", ""]
     if any(isinstance(r.get("gist"), list) for r in results):
-        L += ["## Per reply: on_gist (headline; moth.gist label prompt)", ""] + on_gist_rows(results) + [""]
+        L += ["## Per reply (headline; moth.gist label prompt): on_gist, unprompted identity", ""] + on_gist_rows(results) + [""]
     cards = sorted({r.get("card_id") or "moth" for r in results})
     L += ["## Deterministic metrics (no judge)", "", table({"all": results} | (
         {f"card {c}": [r for r in results if (r.get("card_id") or "moth") == c] for c in cards} if len(cards) > 1 else {}) | (
@@ -339,7 +346,8 @@ def report(results, out, label):
         j = r.get("judge", {})
         wx = f" what_x={[(w['word'], w['on']) for w in r['what_x']]}" if r.get("what_x") else ""
         g = r.get("gist")
-        gl = ("\ngist: " + " | ".join(f"R{i + 1} {'ON' if x['on'] else 'OFF'}: {x['why']}" for i, x in enumerate(g))
+        gl = ("\ngist: " + " | ".join(f"R{i + 1} {'ON' if x['on'] else 'OFF'}{' SELF' if x.get('self') else ''}: "
+                                       f"{x['why']}" for i, x in enumerate(g))
               if isinstance(g, list) and g else "")
         T += [f"## {r['cat']}/{r['name']} card={r.get('card_id', 'moth')} (sample {r.get('sample', '?')}, seed {r['seed']}) "
               f"flags={r['flags']} check={r['check']}{wx} judge={j}{gl}", "```", chat_text(r), "```", ""]
@@ -366,7 +374,7 @@ def main():
     ap.add_argument("--judge-think", choices=["auto", "on", "off"], default="auto",
                     help="judge reasons first (LFM2.5) or not (Qwen); auto = from /v1/models")
     ap.add_argument("--only", default=None, help="comma-separated categories")
-    ap.add_argument("--cards", default="moth,heldout:0,heldout:4,heldout:8",
+    ap.add_argument("--cards", default="moth,heldout:0,heldout:8,heldout_free:2,heldout_free:4,heldout_free:9",
                     help="comma-separated identity cards to run the probes with: moth, blank, heldout:<i>, a card "
                          "JSON file (held-out cards never appear in training)")
     ap.add_argument("--no-gist", action="store_true", help="with --judge-url: skip the per-reply on_gist labels")

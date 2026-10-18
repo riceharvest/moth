@@ -49,11 +49,12 @@ def merge(dirs: list[str]) -> tuple[list[dict], dict[int, dict], list[dict], lis
             ranges.append((lo, hi, d))
         replies = sum(x["n"] for x in lab.values())
         on = sum(sum(lb["on"] for lb in x["labels"]) for x in lab.values())
+        me = sum(sum(bool(lb.get("self")) for lb in x["labels"]) for x in lab.values())
         cards = collections.Counter(("moth" if (x.get("card") or {}).get("id") == "moth" else
                                      "blank" if (x.get("card") or {}).get("id") == "blank" else
                                      "pool" if x.get("card") else "none") for x in ds)
         boxes.append({"dir": d, "chats": len(ds), "dup": dup, "seeds": (lo, hi), "labelled": len(lab),
-                      "on_gist": on / replies if replies else None,
+                      "on_gist": on / replies if replies else None, "self": me / replies if replies else None,
                       "types": dict(collections.Counter(x.get("type", "?") for x in ds)), "cards": dict(cards)})
         if dup:
             warn.append(f"{d}: {dup} seeds already merged from an earlier box (dropped)")
@@ -81,8 +82,9 @@ def main():
             f.write(json.dumps(labels[s], ensure_ascii=False) + "\n")
     for b in boxes:
         og = f"{b['on_gist']:.1%}" if b["on_gist"] is not None else "n/a"
+        me = f"{b['self']:.2%}" if b["self"] is not None else "n/a"
         print(f"{b['dir']}: {b['chats']} chats, seeds {b['seeds'][0]}..{b['seeds'][1]}, labelled {b['labelled']}, "
-              f"on_gist {og}, types {b['types']}, cards {b['cards']}")
+              f"on_gist {og}, unprompted identity {me}, types {b['types']}, cards {b['cards']}")
     rep = sum(x["n"] for x in labels.values())
     on = sum(sum(lb["on"] for lb in x["labels"]) for x in labels.values())
     print(f"merged {len(dialogs)} chats ({len(labels)} labelled, on_gist {on / max(rep, 1):.1%}) -> {a.out}")

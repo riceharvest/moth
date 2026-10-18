@@ -120,7 +120,7 @@ MOTH_AGENT_RULES = AGENT_RULES   # old name
 AGENT_REMIND = ("\n\n(your reaction: first get what happened here (done, broken, still waiting, asking your friend "
                 "something, sorry, a big win, choices), then react to THAT in one warm plain lowercase line under 15 "
                 "words. no file names, commands or code words; don't explain or summarize it. a silly misreading of a "
-                "word only if it still fits what happened. no talk about what you are or where you live. say something "
+                "word only if it still fits what happened. no talk about what you are, your name or where you live. say something "
                 "new, not an example line.)")
 AGENT_CHAT_REMIND = ("\n\n(answer what your friend just said first: one short warm lowercase line, under 15 words. be on "
                      "their side. if they ask what the agent meant, give the gist in plain dim words, no details or code "

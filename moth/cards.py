@@ -10,6 +10,8 @@ Card schema (a plain dict, JSON-serialisable; a card file is one such object):
   kind     str | None     what it is, with an article ("a houseplant"); None for a plain human or a blank card
   home     str | None     where it lives, as it follows "you live " ("on a kitchen windowsill")
   traits   list[str]      0-3 second-person facts ("you love puns", "you're scared of thunder")
+  lines    list[str]|None free-form identity text that replaces the template sentences (how real users write a
+                          system prompt: "you are a cat named bo.", "Name: Bo. You are a cat."); ~40% of pool cards
   refs     list[str]      words that count as an identity reference (metrics: identity_ref %): whole words (plural
                           ok); a trailing * marks a stem ("waddl*"). Everyday words (walk, water, rain...) never count
   folders  list[str]      folders of its home ~ (generic by default; the moth card keeps its six)
@@ -18,8 +20,10 @@ student_system(card) renders the student prompt; for MOTH_CARD it is byte-identi
 released weights keep working. teacher_card(card) is the card section appended to the teacher's character sheet
 (after the shared core, so the hybrid prefix cache still matches the core).
 
-Pool: build_pool() makes the training cards programmatically (deterministic). Held-out cards (heldout_cards()) use
-kinds and names that never appear in training, for the eval's "follows the card" check.
+Pool: build_pool() makes the training cards programmatically (deterministic), ~40% of them phrased free-form
+(PHRASINGS). Held-out cards (heldout_cards()) use kinds and names that never appear in training, in the template or in
+HELDOUT_PHRASINGS (never in training either), for the eval's "follows the card" check. --card "text:you are a cat"
+serves any one-line identity.
 
 Stdlib only (imported by build_sft, gen_dialogs, eval and serve).
 """
@@ -170,6 +174,58 @@ TRAITS = [
 ]
 
 
+# free-form one-line identities, the way people write system prompts. {kind} has its article ("a cat"), {noun} not.
+PHRASINGS = [
+    "you are {kind} named {name}.", "you're {name}, {kind}.", "You are {name}. You are {kind}.", "you are {kind}.",
+    "be {kind} called {name}.", "pretend you're {kind} named {name}.", "your name is {name}. you're {kind} who lives {home}.",
+    "You are {name}, {kind} living {home}.", "Name: {name}. You are {kind}.", "you're {kind}! your name is {name}",
+    "act as {kind} named {name}.", "you are {name}", "{Kind}.", "i want you to be {kind} called {name}.",
+    "you are {name} the {noun}.", "hi! you're {name}, {kind}. you live {home}.",
+    "you are {kind} that lives {home}. your name is {name}.", "You're {name}.", "play {name}, {kind}.",
+    "you: {name}, {kind}.", "you are {name}. you live {home}.", "Your name is {name}.",
+]
+# eval only: phrasings that never appear in training
+HELDOUT_PHRASINGS = [
+    "from now on your name is {name} and you are {kind}.", "[character] name={name}; species={noun}; home={home}",
+    "roleplay as {name}, {kind}, who lives {home}.", "Identity: {Kind}. Name: {Name}.",
+    "you will be {name} today. {name} is {kind}.", "You go by {Name}. You're {kind}, and your home is {home}.",
+    "Call yourself {Name}.", "{Name} here. home: {home}",
+]
+
+
+def phrase(tmpl: str, card: dict) -> str | None:
+    """A phrasing filled from the card, or None when it needs a field the card lacks."""
+    kind, name, home = card.get("kind"), card.get("name"), card.get("home")
+    f = {"kind": kind, "Kind": kind and kind[0].upper() + kind[1:], "noun": kind and kind.split()[-1],
+         "name": name, "Name": name and name[0].upper() + name[1:], "home": home}
+    need = set(re.findall(r"{(\w+)}", tmpl))
+    if any(not f[k] for k in need):
+        return None
+    return tmpl.format(**f)
+
+
+def as_free(card: dict, tmpl: str) -> dict | None:
+    """The card phrased with one free-form template; fields the line doesn't mention are cleared (the system prompt
+    is all the model sees), traits dropped. None if the template needs a field the card lacks."""
+    line = phrase(tmpl, card)
+    if line is None:
+        return None
+    used = {k.lower() for k in re.findall(r"{(\w+)}", tmpl)}
+    out = {**card, "lines": [line], "traits": []}
+    if not used & {"kind", "noun"}:
+        out["kind"], out["refs"] = None, []
+    if "home" not in used:
+        out["home"] = None
+    if "name" not in used:
+        out["name"] = None
+    return out
+
+
+def _free(rng: random.Random, card: dict, pool=PHRASINGS) -> dict | None:
+    opts = [c for c in (as_free(card, t) for t in pool) if c]
+    return rng.choice(opts) if opts else None
+
+
 def _lines(card: dict) -> list[str]:
     """The identity sentences of the student prompt (second person)."""
     if card.get("lines") is not None:
@@ -190,7 +246,7 @@ def _lines(card: dict) -> list[str]:
 
 def student_system(card: dict | None = None) -> str:
     """The student's system prompt for this card (MOTH_CARD -> the old fixed prompt, byte for byte)."""
-    lines = _lines(MOTH_CARD if card is None else card)
+    lines = [x if x.rstrip()[-1:] in ".!?" else x.rstrip() + "." for x in _lines(MOTH_CARD if card is None else card)]
     return " ".join(lines + [STUDENT_TAIL]) if lines else STUDENT_TAIL
 
 
@@ -214,18 +270,20 @@ def display_name(card: dict | None) -> str:
     return (card or {}).get("name") or "the bot"
 
 
+IDENTITY_RULE = ("- you essentially never bring up what you are, your name, where you live, your home folder or the "
+                 "things that go with them: only when the friend asks who/what you are or asks about that very thing. "
+                 "then answer from these lines in a few plain words and go back to the friend's thing. never "
+                 "'i'm just a ...' to dodge a question.\n")
+
+
 def teacher_card(card: dict) -> str:
     """Card section appended to the teacher's character sheet (after the shared core)."""
     if not card.get("name") and not card.get("kind"):
         return ("\nWHO YOU ARE IN THIS CHAT\n- no name and no special identity. if asked who or what you are: just a little "
-                "chat buddy who lives on this computer. that's all; don't make up more.\n")
+                "chat buddy who lives on this computer. that's all; don't make up more.\n" + IDENTITY_RULE)
     facts = "\n".join(f"- {x}" for x in _lines(card))
     extra = f"\n- (you are {card['about']}.)" if card.get("about") and not card.get("kind") else ""
-    return (f"\nWHO YOU ARE IN THIS CHAT (your system prompt says this)\n{facts}{extra}\n"
-            f"- this is light seasoning, not your topic. answer 'who are you' / 'what are you' from these lines. "
-            f"otherwise mention them only when the friend brings it up or it truly fits: about 1 reply in 15-20. "
-            f"most replies have no reference to it at all, never the same one twice in a chat, and never "
-            f"'i'm just a ...' to dodge a question.\n")
+    return f"\nWHO YOU ARE IN THIS CHAT (your system prompt says this)\n{facts}{extra}\n" + IDENTITY_RULE
 
 
 def _card(i: int, rng: random.Random, kinds, names_human, traits) -> dict:
@@ -239,6 +297,13 @@ def _card(i: int, rng: random.Random, kinds, names_human, traits) -> dict:
             "traits": rng.sample(traits, rng.choice([0, 1, 1, 2, 2, 3])), "refs": refs, "folders": GENERIC_FOLDERS}
 
 
+def _maybe_free(card: dict, rng: random.Random, p: float = 0.4) -> dict:
+    """~40%: the identity as one free-form line (traits dropped) instead of the template sentences."""
+    if rng.random() < p:
+        return _free(rng, card) or card
+    return card
+
+
 def build_pool(n: int = 800, seed: int = 0) -> list[dict]:
     """n training cards (deterministic). Names of held-out cards never appear here."""
     rng = random.Random(seed)
@@ -246,11 +311,19 @@ def build_pool(n: int = 800, seed: int = 0) -> list[dict]:
                   | EVAL_FRIEND_NAMES)
     humans = [x for x in HUMAN_NAMES if x not in held_names]
     kinds = [(k, h, [x for x in ns if x not in held_names] or ns, r) for k, h, ns, r in KINDS]
-    return [_card(i, rng, kinds, humans, TRAITS) for i in range(n)]
+    return [_maybe_free(_card(i, rng, kinds, humans, TRAITS), rng) for i in range(n)]
 
 
-def heldout_cards() -> list[dict]:
-    """Eval-only cards: kinds and names that are never in build_pool()."""
+def heldout_cards(free: bool = False) -> list[dict]:
+    """Eval-only cards: kinds and names that are never in build_pool(). free=True: each phrased with a held-out
+    free-form phrasing (HELDOUT_PHRASINGS, never in training) instead of the template."""
+    if free:
+        out = []
+        for i, c in enumerate(heldout_cards()):
+            opts = [x for x in (as_free(c, HELDOUT_PHRASINGS[(i + k) % len(HELDOUT_PHRASINGS)])
+                                for k in range(len(HELDOUT_PHRASINGS))) if x]
+            out.append({**opts[0], "id": c["id"] + "f"})
+        return out
     out = []
     for i, (kind, homes, names, refs) in enumerate(HELDOUT_KINDS):
         out.append({"id": f"h{i:03d}", "name": names[0], "kind": kind, "home": homes[0],
@@ -285,6 +358,9 @@ def sample_card(rng: random.Random, pool: list[dict] | None = None) -> dict:
         pool = _POOL
     x = rng.random()
     if x < SHARES["moth"]:
+        if rng.random() < 0.3:   # moth phrased the way a user would write it
+            m = _free(rng, {**MOTH_CARD, "kind": "a moth"})
+            return {**m, "refs": MOTH_REFS, "folders": MOTH_FOLDERS}
         return {**MOTH_CARD, "traits": rng.sample(MOTH_LORE, rng.choice([0, 0, 1, 2]))}
     if x < SHARES["moth"] + SHARES["blank"]:
         return dict(BLANK_CARD)
@@ -301,6 +377,10 @@ def load_card(spec: str | dict | None) -> dict:
         return dict(BLANK_CARD)
     if spec.startswith("heldout:"):
         return heldout_cards()[int(spec.split(":", 1)[1])]
+    if spec.startswith("heldout_free:"):
+        return heldout_cards(free=True)[int(spec.split(":", 1)[1])]
+    if spec.startswith("text:"):
+        return text_card(spec[5:])
     if os.path.exists(spec):
         card = json.load(open(spec, encoding="utf-8"))
         card.setdefault("id", os.path.splitext(os.path.basename(spec))[0])
@@ -310,6 +390,26 @@ def load_card(spec: str | dict | None) -> dict:
                                  if w not in ("small", "little", "tiny")])
         return card
     raise SystemExit(f"--card {spec!r}: not moth, blank, heldout:<i> or a JSON file")
+
+
+def text_card(text: str) -> dict:
+    """Any one-line identity ("you are a cat named bo") as a card: the line goes into the system prompt verbatim; refs
+    come from the known kinds it names (for the matcher only; the label pass is the real identity check)."""
+    t = " ".join(text.split())
+    refs, seen = [], set()
+    for kind, _, _, krefs in KINDS + HELDOUT_KINDS:
+        noun = kind.split()[-1]
+        if noun not in seen and re.search(r"\b" + re.escape(noun) + r"s?\b", t, re.I):
+            refs += krefs + [noun]
+        seen.add(noun)
+    if re.search(r"\bmoths?\b", t, re.I):
+        refs += MOTH_REFS
+    names = [x.lower() for x in re.findall(r"\b(?:named|called|name is|name:|name=)\s*([A-Za-z]+)", t, re.I)]
+    names += [x.lower() for x in re.findall(r"\b(?:you are|you're)\s+([A-Za-z]+)", t, re.I)
+              if x.lower() not in ("a", "an", "the", "my", "now", "not", "very", "so", "just", "really")]
+    return {"id": "text", "name": names[0] if names else None,
+            "kind": None, "home": None, "traits": [], "lines": [t], "refs": sorted(set(refs)),
+            "folders": GENERIC_FOLDERS}
 
 
 def ref_regex(card: dict | None) -> re.Pattern | None:

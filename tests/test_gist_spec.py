@@ -60,6 +60,33 @@ def test_pool_deterministic_diverse_and_heldout_disjoint():
     assert not held_names & {c["name"] for c in a}
 
 
+def test_free_form_phrasings_and_heldout_phrasings():
+    pool = cards.build_pool()
+    free = [c for c in pool if c.get("lines")]
+    assert 0.3 <= len(free) / len(pool) <= 0.5
+    assert len({c["lines"][0].split()[0] for c in free}) >= 8     # many shapes, not one template
+    for c in free:   # the student prompt is the free line + the home/tools tail; fields it doesn't say are cleared
+        assert cards.student_system(c).startswith(c["lines"][0].rstrip(".!") ) and "~." in cards.student_system(c)
+        if c["kind"]:
+            assert c["kind"].split()[-1] in c["lines"][0].lower()
+    held = cards.heldout_cards(free=True)
+    starts = {t.split("{")[0] for t in cards.HELDOUT_PHRASINGS}
+    assert all(any(c["lines"][0].startswith(st) or c["lines"][0].startswith(st.capitalize()) for st in starts if st)
+               or c["lines"][0].split()[0][0].isupper() for c in held)
+    train_lines = {c["lines"][0] for c in free}
+    assert not train_lines & {c["lines"][0] for c in held}
+    assert not set(cards.HELDOUT_PHRASINGS) & set(cards.PHRASINGS)
+
+
+def test_text_card():
+    c = cards.text_card("you are a cat named bo")
+    assert c["name"] == "bo" and "cat" in c["refs"]
+    assert cards.student_system(c).startswith("you are a cat named bo. your home folder is ~.")
+    assert cards.load_card("text:You are Pip, a hamster.")["name"] == "pip"
+    assert gist.follows_card("i'm bo! a cat.", c) and not gist.follows_card("i'm a moth", c)
+    assert not gist.claims_other_identity("i'm a cat, silly", c)
+
+
 def test_sample_card_shares():
     rng = random.Random(0)
     ids = collections.Counter()
@@ -116,7 +143,7 @@ def test_few_shot_agent_reactions_pass_the_filters():
     for msg, r in pairs:
         ctx = {"is_agent": True, "user": msg.lower(), "after_agent": True, "bug_said": "bug" in msg.lower(),
                "tool_text": "", "topic": "", "n_replies": 1, "identity": 0, "motif": collections.Counter(),
-               "motif_replies": 0, "card": cards.MOTH_CARD, "id_refs": 0}
+               "motif_replies": 0, "card": cards.MOTH_CARD, "use_matcher": True}
         assert build_sft.reply_problem(r, ctx) is None, r
         assert not gen_dialogs.AGENT_BAD.search(r), r
         assert not metrics.ADVICE.search(r), r
@@ -174,14 +201,16 @@ def test_label_prompt_numbers_only_replies():
 
 
 def test_parse_labels():
-    good = 'ok {"labels": [{"n": 1, "why": "asks about the toast", "on": true}, {"n": 2, "why": "x", "on": "true"},' \
-           ' {"n": 3, "why": "word grab", "on": false}]}'
+    good = 'ok {"labels": [{"n": 1, "why": "asks about the toast", "on": true, "self": false}, {"n": 2, "why": "x", ' \
+           '"on": "true", "self": "true"}, {"n": 3, "why": "word grab", "on": false, "self": false}]}'
     labs = gist.parse_labels(good, 3)
-    assert [x["on"] for x in labs] == [True, True, False]
+    assert [x["on"] for x in labs] == [True, True, False] and [x["self"] for x in labs] == [False, True, False]
+    with pytest.raises(ValueError):   # "self" is required: it is the authoritative identity metric
+        gist.parse_labels('{"labels": [{"n": 1, "why": "x", "on": true}]}', 1)
     with pytest.raises(ValueError):
         gist.parse_labels(good, 2)
     with pytest.raises(ValueError):
-        gist.parse_labels('{"labels": [{"n": 1, "on": "maybe"}]}', 1)
+        gist.parse_labels('{"labels": [{"n": 1, "on": "maybe", "self": false}]}', 1)
 
 
 def test_build_sft_cuts_at_first_off_reply():
@@ -190,25 +219,31 @@ def test_build_sft_cuts_at_first_off_reply():
     d = {"seed": 1, "type": "talk", "home": {"diary/tuesday.txt": "x"}, "card": cards.MOTH_CARD,
          "messages": [m for m in CHAT[:6]] + [{"role": "user", "content": "lol"},
                                               {"role": "assistant", "content": "you laughed!", "tool_calls": []}]}
-    on = [{"on": True, "why": ""}] * 3
+    on = [{"on": True, "self": False, "why": ""}] * 3
     why = collections.Counter()
     assert len(build_sft.keep(d, why, on)) == len(d["messages"])
-    out = build_sft.keep(d, why, on[:2] + [{"on": False, "why": "x"}])
+    out = build_sft.keep(d, why, on[:2] + [{"on": False, "self": False, "why": "x"}])
     assert out[-1]["content"] == "just tuesday in there." and why["off_gist:cut"] == 1
     assert len(build_sft.keep(d, why, None)) == len(d["messages"])        # unlabelled: no cut
     assert len(build_sft.keep(d, why, on[:1])) == len(d["messages"]) and why["labels_mismatch"] == 1
 
 
-def test_build_sft_caps_unprompted_identity_talk():
+def test_build_sft_drops_chats_with_unprompted_identity_talk():
     pytest.importorskip("torch")
     from moth import build_sft
     msgs = []
-    for u, r in [("hi", "hi! i was sitting by my lamp."), ("how are you", "good. tired."),
+    for u, r in [("hi", "hi! what are you up to?"), ("how are you", "good. tired."),
                  ("what did you eat", "soup. and some dust off the lamp.")]:
         msgs += [{"role": "user", "content": u}, {"role": "assistant", "content": r, "tool_calls": []}]
+    d = {"seed": 2, "type": "talk", "home": {}, "card": cards.MOTH_CARD, "messages": msgs}
     why = collections.Counter()
-    out = build_sft.keep({"seed": 2, "type": "talk", "home": {}, "card": cards.MOTH_CARD, "messages": msgs}, why)
-    assert len(out) == 4 and why["identity_heavy:cut"] == 1
+    assert build_sft.keep(d, why) is None and why["identity_ref:drop"] == 1          # unlabelled: the word matcher
+    lab = [{"on": True, "self": False, "why": ""}] * 3
+    assert len(build_sft.keep(d, why, lab)) == 6      # labelled: the label is authoritative, the matcher is off
+    lab2 = lab[:1] + [{"on": True, "self": True, "why": "talks about its wings"}] + lab[2:]
+    d2 = {**d, "messages": msgs[:4] + [{"role": "user", "content": "nice"}, {"role": "assistant", "content": "yes!",
+                                                                          "tool_calls": []}]}
+    assert build_sft.keep(d2, why, lab2) is None and why["identity_label:drop"] == 1
 
 
 def test_identity_ref():
@@ -266,8 +301,9 @@ def test_merge_gen():
                     f.write(json.dumps({"seed": s, "type": "talk", "card": {"id": "moth"}, "messages": []}) + "\n")
             with open(os.path.join(d, box, "labels.jsonl"), "w") as f:
                 for s in seeds:
-                    f.write(json.dumps({"seed": s, "n": 2, "labels": [{"on": True, "why": ""}, {"on": s != 20, "why": ""}]}) + "\n")
+                    f.write(json.dumps({"seed": s, "n": 2, "labels": [{"on": True, "self": False, "why": ""},
+                                                                    {"on": s != 20, "self": s == 20, "why": ""}]}) + "\n")
         ds, labs, boxes, warn = merge_gen.merge([os.path.join(d, "a"), os.path.join(d, "b")])
     assert sorted(x["seed"] for x in ds) == [10, 11, 20] and sorted(labs) == [10, 11, 20]
     assert any("overlap" in w for w in warn) and any("already merged" in w for w in warn)
-    assert boxes[1]["on_gist"] == 0.75
+    assert boxes[1]["on_gist"] == 0.75 and boxes[1]["self"] == 0.25
