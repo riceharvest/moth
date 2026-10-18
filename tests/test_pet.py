@@ -414,11 +414,12 @@ class LaunchBase(unittest.TestCase):
         self.model = fake_weights(os.path.join(self.tmp, "weights"))
         self.env_before = {k: os.environ.get(k) for k in
                            ("MOTH_SERVE_CMD", "MOTH_SERVE_LOG", "FAKE_SERVE_INFO", "FAKE_SERVE_DELAY", "FAKE_SERVE_EXIT",
-                            "MOTH_CACHE")}
+                            "FAKE_SERVE_GATE", "MOTH_CACHE")}
         os.environ["MOTH_CACHE"] = os.path.join(self.tmp, "cache")   # a pip install's weights: never ~/.cache
         os.environ.update(MOTH_SERVE_CMD=shlex.join([sys.executable, FAKE]), FAKE_SERVE_INFO=self.info,
                           MOTH_SERVE_LOG=os.path.join(self.tmp, "serve.log"), FAKE_SERVE_DELAY="0")
         os.environ.pop("FAKE_SERVE_EXIT", None)
+        os.environ.pop("FAKE_SERVE_GATE", None)
         self.port = free_port()
         self.url = f"http://127.0.0.1:{self.port}"
         self.procs: list[subprocess.Popen] = []
@@ -616,10 +617,12 @@ class LaunchTest(LaunchBase):
                 self.assertIsNotNone(proc.rc)
 
     def test_autostart_then_stop_leaves_no_orphan(self):
-        os.environ["FAKE_SERVE_DELAY"] = "0.6"
+        gate = os.path.join(self.tmp, "loaded")   # the fake server "loads" until this file exists (a 0.6 s delay
+        os.environ["FAKE_SERVE_GATE"] = gate      # was outlasted by prepare + probe on a busy Windows runner)
         boot = L.prepare(self.url, model=self.model, extra=["--react-every", "0"], mem=lambda: 32.0)
         self.assertEqual(boot.state, "starting", boot)
         self.assertEqual(L.probe(self.url, timeout=0.3)[0], "none")   # still "loading" (Windows: connect times out)
+        open(gate, "w").close()
         ok, why = boot.server.wait_ready(timeout=20)
         self.assertTrue(ok, f"{why}: {self.serve_log()!r}")
         argv = self.fake_info()["argv"]
@@ -776,10 +779,13 @@ class PetStartsServerTest(LaunchBase):
         return seen
 
     def test_wakes_a_server_and_stops_it_on_quit(self):
-        os.environ["FAKE_SERVE_DELAY"] = "1.0"
+        gate = os.path.join(self.tmp, "loaded")   # the server "loads" until the pet has been seen booting
+        os.environ["FAKE_SERVE_GATE"] = gate      # (not a fixed delay a slow runner's Qt start-up can outlast)
 
         def check(pet, seen):
             seen.setdefault("first", (pet.booting, pet.w.asleep, list(seen["texts"])))
+            if not os.path.exists(gate):
+                open(gate, "w").close()
             return not pet.booting and pet.poller.up and not pet.server_down
         seen = self.run_pet(check, ["--server-arg=--quiet-after", "--server-arg=0", "--", "--react-every", "0"])
         self.assertFalse(seen["timed_out"], (seen["texts"], self.serve_log()))

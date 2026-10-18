@@ -4,6 +4,8 @@ Takes moth.serve's flags (only --port and --exit-with-parent matter; the rest is
 (the model loading), starts a grandchild in its own process group (so the tests can see the whole group stopped),
 writes {"pid", "child", "argv"} to FAKE_SERVE_INFO, then answers /api/health, /api/says and /api/log like moth.
 FAKE_SERVE_EXIT=N: exit with N instead of listening (a server that dies while waking up).
+FAKE_SERVE_GATE=FILE: also wait (up to 30 s) until FILE exists before listening: a "still loading" window the test
+ends itself, instead of a delay a slow runner can outlast.
 """
 import json
 import os
@@ -28,6 +30,9 @@ def main():
             json.dump({"pid": os.getpid(), "child": child.pid, "argv": argv}, f)
         os.replace(info + ".tmp", info)
     time.sleep(float(os.environ.get("FAKE_SERVE_DELAY", "0")))
+    gate, end = os.environ.get("FAKE_SERVE_GATE"), time.monotonic() + 30
+    while gate and not os.path.exists(gate) and time.monotonic() < end:
+        time.sleep(0.02)
     if os.environ.get("FAKE_SERVE_EXIT"):   # the grandchild stays: whoever stops the group must get it too
         sys.exit(int(os.environ["FAKE_SERVE_EXIT"]))
 
