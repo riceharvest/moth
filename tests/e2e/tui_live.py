@@ -1,9 +1,13 @@
-"""Live check of the Claude Code band (moth/integrations/claude_code_mod) in the real interactive `claude` TUI, local.
+"""Live checks in the real interactive TUIs, local: the Claude Code band, and Codex's hook approval.
 
-  python tests/e2e/band_live.py start --out DIR     scratch home, fake model, fake moth, Stop hook installed, and
-                                                    `claude --plugin-dir <copy>/claude_code_mod` in a detached tmux
-                                                    session on its own socket (-L moth-band-e2e); prints DIR/state.json
-  python tests/e2e/band_live.py stop --out DIR      kill that tmux server and the two fakes
+  python tests/e2e/tui_live.py start --out DIR [--tui claude|codex]
+        scratch home, fake model, fake moth, the Stop hook installed, and in a detached tmux session on its own socket
+        (-L moth-band-e2e, window "band"): `claude --plugin-dir <copy>/claude_code_mod` (default), or `codex` (its
+        startup hook review, to approve moth's hook the way a person does); prints DIR/state.json
+  python tests/e2e/tui_live.py stop --out DIR      kill that tmux server and the two fakes
+
+Codex: after approving in the TUI, `python tests/e2e/tui_live.py exec --out DIR` runs `codex exec` (no bypass flag)
+in the same scratch home and prints what moth received.
 
 In between, drive it with tmux (`tmux -L moth-band-e2e send-keys -t band ...`, `capture-pane -p`). What to check:
 the band's GETs in DIR/moth_record.jsonl.access carry `session=<id>`, the Stop hook's POST in DIR/moth_record.jsonl
@@ -16,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -28,12 +33,14 @@ import run_e2e  # noqa: E402
 SOCK, NAME = "moth-band-e2e", "band"
 
 
-def start(out: Path):
+def start(out: Path, tui: str):
     a = types.SimpleNamespace(work=str(out), out=str(out), spaced_python=False, keep=True)
     r = run_e2e.Runner(a)
     r.setup()
     e = r.e
-    if not r.install(["claude-code"]):
+    harness = "claude-code" if tui == "claude" else "codex"
+    r.configure([harness])
+    if not r.install([harness]):
         raise SystemExit("hook install failed")
     key = "sk-ant-moth-e2e-dummy-key-000000000000"
     (e.home / ".claude").mkdir(parents=True, exist_ok=True)
@@ -54,13 +61,27 @@ def start(out: Path):
               "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_AUTOUPDATER", "DISABLE_TELEMETRY",
               "DISABLE_ERROR_REPORTING", "TERM"):
         cmd += ["-e", f"{k}={env[k]}"]
-    cmd += ["claude", "--plugin-dir", str(mod)]
+    cmd += ["-e", "MOTH_E2E_KEY=dummy", "-e", f"CODEX_HOME={env['CODEX_HOME']}"]
+    cmd += ["claude", "--plugin-dir", str(mod)] if tui == "claude" else [shutil.which("codex")]
     subprocess.run(cmd, env=env, check=True)
-    state = {"pids": [p.pid for p in e.procs], "moth_url": e.moth_url, "llm": r.llm, "home": str(e.home),
+    state = {"tui": tui, "llm_port": r.llm.rsplit(":", 1)[1], "pids": [p.pid for p in e.procs], "moth_url": e.moth_url, "llm": r.llm, "home": str(e.home),
              "proj": str(e.proj), "record": str(r.record), "token": (e.home / ".moth" / "token").read_text().strip(),
              "tmux": f"tmux -L {SOCK}", "target": NAME}
     (out / "state.json").write_text(json.dumps(state, indent=2))
     print(json.dumps(state, indent=2))
+
+
+def codex_exec(out: Path):
+    st = json.loads((out / "state.json").read_text())
+    home, proj = Path(st["home"]), Path(st["proj"])
+    env = {k: v for k, v in os.environ.items() if k not in run_e2e.SCRUB}
+    env.update(HOME=str(home), CODEX_HOME=str(home / ".codex"), MOTH_URL=st["moth_url"], MOTH_E2E_KEY="dummy",
+               PWD=str(proj))
+    before = len(run_e2e.records(Path(st["record"])))
+    p = subprocess.run([shutil.which("codex"), "exec", "--json", "--skip-git-repo-check", "hi"], env=env, cwd=proj,
+                       capture_output=True, text=True, timeout=120)
+    print("exit", p.returncode, [l for l in p.stdout.splitlines() if "thread.started" in l])
+    print("moth got:", run_e2e.records(Path(st["record"]))[before:])
 
 
 def stop(out: Path):
@@ -74,12 +95,16 @@ def stop(out: Path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("what", choices=("start", "stop"))
+    ap.add_argument("what", choices=("start", "stop", "exec"))
+    ap.add_argument("--tui", choices=("claude", "codex"), default="claude")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     out = Path(a.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    (start if a.what == "start" else stop)(out)
+    if a.what == "start":
+        start(out, a.tui)
+    else:
+        (stop if a.what == "stop" else codex_exec)(out)
 
 
 if __name__ == "__main__":

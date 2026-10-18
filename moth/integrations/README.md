@@ -390,6 +390,11 @@ Untrusted or modified user hooks are silently skipped, including in `codex exec`
 - **No `"async": true`**, as for Claude Code: `codex exec` drops a background hook when it exits, before it posts (seen
   live on 0.163.0; the interactive TUI posted either way). `moth hook codex` rewrites an older `async: true` entry;
   approve it again afterwards.
+- **Windows:** Codex runs hook commands through PowerShell (`powershell -NoProfile -Command <command>`, the session's
+  shell: `core/src/session/mod.rs` `build_hooks_config`). There a command that starts with a quoted path is a string,
+  not a call, so a Python path with a space (`C:/Program Files/...`, a venv under `C:/Users/First Last`) needs the call
+  operator: `& "C:/Program Files/Python312/python.exe" "C:/.../codex.py"`. `moth hook codex` writes that (and
+  `moth hooks` flags an older entry without it); without it Codex ran nothing, silently (seen in `tests/e2e`).
 - Hooks are a stable feature, enabled by default (`features/src/lib.rs`, `CodexHooks`, key `hooks`, at
   `rust-v0.163.0`). They are loaded from `<config folder>/hooks.json` (`hooks/src/engine/discovery.rs`).
 - The Stop input carries `last_assistant_message` (`hooks/src/events/stop.rs`).
@@ -528,15 +533,23 @@ Open points:
 - **Pi**: a follow-up you queue mid-run runs before `agent_settled`, so only the last reply in that chain posts.
 - **Claude Code / Codex Stop hooks** were run live on 2026-10-18 (Claude Code 2.1.302, Codex 0.163.0,
   `../../video/raw/INDEX.md` in the dev checkout): `async: true` posted from the interactive TUIs but not from
-  `claude -p` / `codex exec`, so the hooks now run in the foreground. The foreground hook was only re-checked
-  here with a simulated harness exit, not in a new live run.
+  `claude -p` / `codex exec`, so the hooks now run in the foreground.
+- **Real CLIs, fake model** (`tests/e2e/`, `.github/workflows/e2e.yml`, GitHub-hosted Linux, macOS and Windows):
+  `run_e2e.py` installs the hooks with `moth hook ... --yes` into a scratch home from a folder with a space (and
+  again with a venv Python in a folder with a space), runs `claude -p` (2.1.302), `codex exec` (0.163.0), `pi -p`
+  (1.3.0) and `opencode run` (newest) against a fake Anthropic / OpenAI API, and checks that serve.py's real handler
+  got the final reply with the harness's own session id and the folder label, before the CLI exited. Codex's run
+  uses `--dangerously-bypass-hook-trust`; a control run without it must post nothing (the unapproved hook is
+  skipped). The approval itself was checked by hand in the interactive `codex` (`tui_live.py --tui codex`, Linux):
+  the startup review's "trust" writes the `trusted_hash`, and `codex exec` then posts without the flag.
 - **dsh**:
   - Not confirmed: whether a root-level `ctx.on('session/event')` receives events with no `inject`, and whether
     `session.id` equals `SubagentRunInfo.id` for in-process children.
   - Remote (`local: false`) subagents emit no local session events anyway.
 - **OpenCode**:
   - Not confirmed live: that the assistant `message.updated` arrives before its idle event.
-  - In one-shot `opencode run` / `pi -p`, the process may exit before the POST lands.
+  - In one-shot `opencode run` / `pi -p`, the process may exit before the POST lands. In `tests/e2e` (one short
+    reply, local fake model) both posted before exit on Linux, macOS and Windows; a slow machine may still lose it.
 - **Pi**: child `pi` processes spawned by subagent extensions are not filtered.
 - **Hermes**: in one-shot runs (`hermes -q`), the daemon thread can die at exit before posting.
 
@@ -550,8 +563,14 @@ Display layer: everything was checked against a stub moth with a real log (`Disp
 - OpenCode toast with a fake `client.tui`. The event hook doesn't wait on the poll.
 - Per-session displays: another harness's reaction landing last is not shown by the Pi widget, two OpenCode
   sessions in one process each get their own toast, the Hermes Desktop pet voices Hermes reactions only, and
-  serve.py's `/api/says?source=&session=` filter (stripped answer, `next` unchanged, no ids leaked). The Claude
-  Code band's filter passed `claude plugin validate` only; it was not run in a live session.
+  serve.py's `/api/says?source=&session=` filter (stripped answer, `next` unchanged, no ids leaked).
+- The Claude Code band, live in the real interactive `claude` 2.1.302 (`tests/e2e/tui_live.py`, Linux, tmux, scratch
+  home, fake model, serve.py's real handler): `$.session.id()` equals the Stop hook's `session_id` (the band polls
+  `/api/says?...&session=<id>` every 2 s, the hook posts the same id), also after `/clear` (both switch to the new
+  id, the old line is cleared). With this session's reaction shown, two decoys posted last (another session id; the
+  same id under `source=codex`) don't replace it. The field: ctrl+x tab focuses it, Enter posts `/api/chat` with the
+  token from `~/.moth/token` (`$.fs.read`) and shows the answer, no model request follows, and the field comes back
+  empty.
 - Pi's `/moth`: a reply slower than 4 s is picked up by an unfiltered poll (chat replies carry no session), so in
   that rare case another session's reaction could show instead.
 - `show_in_harness`: off by default in Pi and OpenCode (the turn is still posted, no `/api/says` poll, no widget or
@@ -571,15 +590,9 @@ Display layer: everything was checked against a stub moth with a real log (`Disp
   `moth tail --session`.
 
 Not verified:
-- **Claude Code mod**: only `claude plugin validate` was run, which is static. Not confirmed live:
-  - that `$.http.fetch` reaches `127.0.0.1` from the hooks worker;
-  - that `$.clock.every` started in `session.start` keeps ticking;
-  - how the band looks;
-  - the band's text field: focusing it (ctrl+x tab or a click), Enter sending, and the field coming back empty
-    and focused after a send (it is redrawn under a new key);
-  - whether the poller survives a mid-session reload of the mod. It is started in `session.start`, and a reload
-    drops timers.
-  `claude plugin test` was not used, because it starts the engine host.
+- **Claude Code mod** (the rest was run live, see above): a click to focus the field; the band on macOS / Windows
+  terminals; whether the poller survives a mid-session reload of the mod (it is started in `session.start`, and a
+  reload drops timers).
 - **Hermes Desktop**:
   - that the packaged renderer really sends `Origin: null`, or `file://`, both of which are allowed;
   - that the renderer's `fetch` to `http://127.0.0.1:4747` isn't blocked by a CSP or by Chromium's
@@ -589,7 +602,8 @@ Not verified:
 - **OpenCode**: that `client.tui.showToast` works from a plugin in 1.2.10 (the SDK types have it), and that
   `opencode run` exits promptly with the poll pending.
 - **tail**: readline's redraw is called from the poll thread. It is cosmetic, but GNU readline was not tried.
-- **Token reads inside harnesses**: that the Claude Code mod's `$.fs.read` may read `~/.moth/token` (outside the
-  session folder) without an fs hook objecting, and that Pi's jiti and OpenCode's Bun load the `node:fs` imports.
+- **Token reads inside harnesses**: checked (the Claude Code mod's `$.fs.read` of `~/.moth/token` live; Pi's and
+  OpenCode's `node:fs` reads in `tests/e2e`, where moth refuses a post without the right token), but only with no
+  other fs hook installed that might object.
 - **Proxies in JS**: Node's `fetch` ignores `HTTP_PROXY`, but Bun's (OpenCode) honours it; with a proxy set and no
   `NO_PROXY=127.0.0.1`, OpenCode's posts may go to the proxy.
