@@ -975,7 +975,8 @@ class Serve(unittest.TestCase):
         moth.agents = lambda: {"active": 1, "skipped": 0,
                                "sessions": [{"source": "codex", "session": "s9", "label": "secret-proj"}]}
         moth.say_to = lambda text: moth.chats.append(text) or [{"say": "ok"}]
-        moth.forget = lambda: moth.log.clear()
+        moth.forgot = []
+        moth.forget = lambda everything=False: moth.forgot.append(everything) or moth.log.clear()
         self.moth = moth
         self.srv = ThreadingHTTPServer(("127.0.0.1", 0), serve.make_handler(moth, TOKEN))
         self.srv.daemon_threads = True
@@ -1161,6 +1162,15 @@ class Serve(unittest.TestCase):
         self.assertIn("won't delete", json.loads(body)["error"])
         self.assertTrue(os.path.exists(os.path.join(home, "precious.txt")))
         self.assertEqual(self.post("/api/reset", {"new_home": True}, **{"X-Moth-Token": None})[0], 401)
+
+    def test_reset_everything_is_moth_forget(self):
+        """"new chat" keeps moth's phrase memory; {"everything": true} (what `moth forget` sends) wipes it too."""
+        self.assertEqual(self.post("/api/reset", {})[0], 200)
+        self.assertEqual(self.post("/api/reset", {"everything": "yes"})[0], 200)   # only a real true counts
+        self.assertEqual(self.post("/api/reset", {"everything": True})[0], 200)
+        self.assertEqual(self.moth.forgot, [False, False, True])
+        self.assertEqual(self.post("/api/reset", {"everything": True}, **{"X-Moth-Token": None})[0], 401)
+        self.assertEqual(self.moth.forgot, [False, False, True])
 
 
 class AdapterToLog(unittest.TestCase):

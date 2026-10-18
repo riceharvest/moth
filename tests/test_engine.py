@@ -435,6 +435,8 @@ class Sessions(unittest.TestCase):
         self.assertNotIn((great, great), m._hook.table)
         self.assertIn(m.enc(" was the"), [list(k) for k in m._hook.table])
         m.ban_chat = False
+        m.forget(everything=True)                      # `moth forget` on a running moth: the phrases go too
+        self.assertEqual((len(m.phrases), len(m.messages), m.phrases.recent()), (0, 1, set()))
         m.phrases = serve.PhraseMemory(0)              # --phrase-memory 0: off
         m.agent_said("Fixed it again.", "claude-code", "A")
         self.assertIsNone(m._hook)

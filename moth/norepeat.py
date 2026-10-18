@@ -20,7 +20,7 @@ penalty (--rep-penalty, on moth's last 3 replies in this chat) to the words of t
 (recent()): that is what makes the motif itself come back less often, also after a "new chat".
 
 The memory is moth's own recent lines, in RAM only. It deliberately survives "new chat" (moth.serve.Moth.forget):
-the same human sees every reaction. Chat replies are never stored (they can hold the human's name or facts), and
+the same human sees every reaction. `moth forget` (Moth.forget(everything=True)) and stopping moth wipe it. Chat replies are never stored (they can hold the human's name or facts), and
 chat turns don't use the ban unless asked (moth.serve --phrase-ban-chat), so recall ("what's my name?") is untouched.
 """
 from __future__ import annotations

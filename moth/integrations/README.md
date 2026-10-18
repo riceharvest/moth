@@ -107,6 +107,8 @@ Test them all offline against a stub moth: `python3 moth/integrations/test_integ
   `moth hook`, and moth's home folder `home/`: its files, its diary, and anything it wrote down from your chats.
   - `serve.log` holds the server's output when the pet starts it: status lines and errors, no chat text.
   - The conversation itself lives only in RAM. Stopping moth wipes it, and so does the page's "new chat" button.
+    moth's memory of its own last 16 reactions (token ids, so it doesn't repeat a joke) is RAM-only too. "New chat"
+    keeps it; stopping moth or `moth forget` wipes it.
   - In the dev checkout, the home is `live/home/` and the logs are `live/*.log`.
 - **The agent never receives anything back.** The adapters only post. They ignore the answer, print nothing and
   exit 0, so nothing reaches the agent's context.
@@ -117,6 +119,8 @@ Test them all offline against a stub moth: `python3 moth/integrations/test_integ
   - `moth forget` deletes its logs.
   - `moth forget --all` also resets its home folder, but only a folder moth made itself.
   - `moth forget --all --token` also deletes the token and settings.
+  - On a moth that's still running, `moth forget` deletes no files but makes it forget the chat and its last
+    reactions (`POST /api/reset {"everything": true}`).
 
   `moth unhook --all` removes the hooks.
 

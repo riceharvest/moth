@@ -905,6 +905,43 @@ class Forget(TempHome):
         for p in (self.token, self.config, self.log, self.mhome / "diary" / "tuesday.txt"):
             self.assertTrue(p.exists(), p)
 
+    def test_wipes_a_running_moths_memory_and_keeps_the_files(self):
+        """A running moth: no file goes, but (asked first; --yes skips) it is told to forget everything it holds in
+        RAM, the chat and its phrase memory: POST /api/reset {"everything": true} with the token."""
+        posts = []
+
+        class Hd(BaseHTTPRequestHandler):
+            def do_GET(self):
+                b = json.dumps({"ok": True, "pid": os.getpid()}).encode()
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b)
+
+            def do_POST(self):
+                posts.append((self.path, self.headers["X-Moth-Token"],
+                              json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"ok": true}')
+
+            def log_message(self, *a):
+                pass
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Hd)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+        try:
+            rc, out = self.run_cli(F.main, ["--port", str(port), "--home", str(self.mhome)])   # stdin closed: no
+            self.assertEqual((rc, posts), (1, []))
+            rc, out = self.run_cli(F.main, ["--port", str(port), "--home", str(self.mhome), "--all", "--yes"])
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        self.assertEqual(rc, 1)
+        self.assertEqual(posts, [("/api/reset", "tok", {"everything": True})])
+        self.assertIn("forgot this chat and its last reactions", out)
+        self.assertIn("stop it first", out)
+        self.assertTrue(self.log.exists() and (self.mhome / "diary" / "tuesday.txt").exists())
+
     def test_refuses_when_health_answers_without_pidfile(self):
         fake = HealthServer(pid=1)
         try:

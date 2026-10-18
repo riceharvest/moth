@@ -287,11 +287,14 @@ python -m moth update --rollback   # back to the version before the last update 
   127.0.0.1 (the page's fonts are bundled). moth goes online only to download the weights or an update from the
   Hugging Face Hub.
 - **Where it's stored: `~/.moth/`.** That holds the token, settings, a server log (status and errors, no chat text),
-  and moth's home folder: its files, its diary, and anything it wrote down. The conversation itself lives only in RAM, so stopping moth wipes it.
+  and moth's home folder: its files, its diary, and anything it wrote down. The conversation itself lives only in
+  RAM, and so does moth's memory of its own last 16 reactions (kept so it doesn't tell the same joke twice, also
+  across "new chat"). Stopping moth wipes both.
 - **The agent never receives anything back.** The hooks only post, print nothing and exit 0. moth's lines show only
   in displays you turn on, and none of them feed the model.
 - **Wiping it.** Stop moth, then `python -m moth forget` deletes its logs. `--all` also resets its home folder, and
-  `--all --token` also deletes the token and settings.
+  `--all --token` also deletes the token and settings. Run on a moth that's still running, `forget` deletes no files,
+  but it makes that moth forget the chat and its last reactions right away.
 
 ## How it was made
 

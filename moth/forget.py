@@ -1,14 +1,17 @@
 """moth forget : wipe what moth remembers about you.
 
-  moth forget [--yes]                 its log files (and stale pidfiles). Its conversation memory lives only in RAM
-                                      while moth runs, so stopping moth already wipes it (the chat page's "new chat"
-                                      button wipes it without stopping).
+  moth forget [--yes]                 its log files (and stale pidfiles). What moth remembers while it runs (the
+                                      chat, and the token ids of its own last 16 reactions, which its phrase memory
+                                      keeps so it doesn't repeat a joke) lives only in RAM: stopping moth wipes it.
+                                      The chat page's "new chat" button wipes the chat but keeps those reactions.
   moth forget --all [--yes]           also its home folder (its files and diary, and whatever it wrote down there),
                                       reset on its next start; only a folder moth made itself (.moth-home marker).
   moth forget --all --token [--yes]   also the install token and moth's settings (~/.moth/token, config.json).
 
-The token and settings are never removed otherwise; hook backups in ~/.moth/backups are kept. Refuses while a moth
-is running (pidfiles in ~/.moth and /api/health): stop it first. Asks before deleting anything (--yes skips).
+The token and settings are never removed otherwise; hook backups in ~/.moth/backups are kept. Deletes no files while a
+moth is running (pidfiles in ~/.moth and /api/health): it wipes that moth's memory in RAM instead, the chat and its
+last reactions (POST /api/reset {"everything": true}, with the token), and asks you to stop moth and run it again for
+the files. Asks before deleting or wiping anything (--yes skips).
 """
 from __future__ import annotations
 
@@ -62,6 +65,25 @@ def running(port: int = 4747) -> tuple[int, int | None] | None:
     if isinstance(h, dict) and h.get("ok"):
         return port, h.get("pid")
     return None
+
+
+def wipe_running(port: int, timeout: float = 30.0) -> str | None:
+    """Make the moth on `port` forget everything it holds in RAM: the chat and its phrase memory (serve.Moth.forget
+    with everything=True). None when done, else why not. Never via a proxy (moth is local)."""
+    import urllib.request
+    try:
+        with open(token_path(), encoding="utf-8") as f:
+            token = f.read().strip()
+    except OSError as e:
+        return f"can't read the token ({e.strerror or e})"
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/api/reset", data=json.dumps({"everything": True}).encode(),
+                                 headers={"Content-Type": "application/json", "X-Moth-Token": token})
+    try:   # timeout: a reply moth is writing finishes first (forget waits for the model's lock)
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout) as r:
+            ok = json.load(r).get("ok") is True
+    except Exception as e:  # noqa: BLE001  refused, wrong token, an older moth, not moth: say so
+        return f"{type(e).__name__}: {e}"
+    return None if ok else "it didn't say ok"
 
 
 def stale_pidfiles() -> list[str]:
@@ -121,10 +143,14 @@ def main(argv=None) -> int:
         return 2
     live = running(a.port)
     if live:
-        print(f"moth is running (port {live[0]}{f', pid {live[1]}' if live[1] else ''}): stop it first, then run "
-              f"`{prog()} forget` again. Its conversation memory lives only in RAM, so stopping it wipes that too\n"
-              "(the chat page's \"new chat\" button wipes it without stopping). If the desktop pet is running, quit "
-              f"it as well, or it may wake moth up again (and `{prog()} autostart off` if you turned autostart on).")
+        print(f"moth is running (port {live[0]}{f', pid {live[1]}' if live[1] else ''}), so its files can't go yet.")
+        if a.yes or _confirm("wipe what it remembers right now (this chat and its last reactions, all in RAM)?"):
+            why = wipe_running(live[0])
+            print("wiped: the running moth forgot this chat and its last reactions." if why is None else
+                  f"couldn't wipe its memory ({why}); stopping moth wipes it.")
+        print(f"To delete its logs (and with --all its home), stop it first, then run `{prog()} forget` again; "
+              "stopping it also wipes everything it holds in RAM.\nIf the desktop pet is running, quit it as well, or "
+              f"it may wake moth up again (and `{prog()} autostart off` if you turned autostart on).")
         return 1
     targets: list[tuple[str, str]] = [(p, "log") for p in log_files()] + [(p, "stale pidfile") for p in stale_pidfiles()]
     if a.all:
@@ -141,7 +167,8 @@ def main(argv=None) -> int:
             from moth import config
             targets += [(p, w) for p, w in ((token_path(), "token (hooks pick up the new one on moth's next start)"),
                                             (config.path(), "settings")) if os.path.exists(p)]
-    print("conversation memory: nothing on disk (it lives only in RAM while moth runs; moth isn't running now)")
+    print("conversation and reaction memory: nothing on disk (they live only in RAM while moth runs; moth isn't "
+          "running now)")
     if not targets:
         print("nothing else to forget" + ("" if a.all else f" (`{prog()} forget --all` also resets moth's home folder)"))
         return 0

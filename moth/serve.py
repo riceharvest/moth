@@ -330,7 +330,8 @@ class Moth:
         self.budget = getattr(a, "ctx_budget", None) or CTX_BUDGET
         self.keep = self.budget * CTX_KEEP // CTX_BUDGET
         self.common = {i for w in COMMON.split() for v in (w, " " + w) for i in self.enc(v)}
-        # moth's last reactions, for the phrase ban (moth/norepeat.py); kept across reset() and forget() on purpose
+        # moth's last reactions, for the phrase ban (moth/norepeat.py); kept across reset() and "new chat" on purpose,
+        # wiped by forget(everything=True) (moth forget) and by stopping moth
         self.phrases = PhraseMemory(_opt(a, "phrase_memory", 16), _opt(a, "phrase_n", 3))
         self.ban_chat = bool(getattr(a, "phrase_ban_chat", False))
         self.word_ids, self.boring_ids = vocab_classes(self.tok, self.common)
@@ -367,14 +368,17 @@ class Moth:
         self.said = deque(maxlen=3)    # token ids of moth's last replies (repetition penalty)
         self.protect: set[int] = set()  # ids from this turn's user message and tool results: free to copy
 
-    def forget(self):
+    def forget(self, everything: bool = False):
         """New chat (the page's button / POST /api/reset): history, log (new epoch), any pending reaction or open
         batch, and the list of active agent sessions. Kept on purpose: self.phrases, the token ids of moth's own last
-        reactions (RAM only, never shown anywhere), so a new chat doesn't bring back the same joke; stopping moth
-        wipes them."""
+        reactions (RAM only, never shown anywhere), so a new chat doesn't bring back the same joke.
+        everything=True (POST /api/reset {"everything": true}, what `moth forget` sends a running moth): those too,
+        so nothing moth remembers about this session is left in RAM. Stopping moth wipes all of it as well."""
         with self.lock:
             self.reset()
             self.log.clear()
+            if everything:
+                self.phrases.clear()
             with self.wake:
                 self.pending, self.batch = None, None
                 self.sessions.clear()
@@ -909,7 +913,10 @@ def make_handler(moth: Moth, token: str, hosts: tuple[str, ...] = ("127.0.0.1", 
                         return self._json({"error": f"moth didn't make {moth.home.root} itself, so it won't delete "
                                                     f"it. move it away by hand for a fresh home.",
                                            "tree": moth.home.tree()}, 409)
-                    moth.forget()
+                    if body.get("everything") is True:   # moth forget: also the phrase memory
+                        moth.forget(everything=True)
+                    else:
+                        moth.forget()
                     if body.get("new_home") is True:
                         shutil.rmtree(moth.home.root, ignore_errors=True)
                         moth.home = Home(moth.a.home, random.randrange(10**6), moth.a.pool_file)
