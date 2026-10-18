@@ -113,6 +113,13 @@ can run it with `moth config model <your repo>`.
 Tests need no weights and no GPU; see [`CONTRIBUTING.md`](CONTRIBUTING.md). CI runs them on Linux, macOS and
 Windows.
 
+## Installers
+
+Installers that need no Python are coming with the release: a Windows setup `.exe` (per user, no admin), a macOS
+`.dmg` (Apple silicon) and a Linux AppImage or tarball. Each bundles everything except the weights, which download on
+first launch. CI builds and tests them already (`.github/workflows/installers.yml`), but they aren't published yet.
+How they work, the unsigned-app warnings and how to get past them: [docs/INSTALL.md](docs/INSTALL.md).
+
 ## Licenses
 
 - Code: **Apache-2.0** ([`LICENSE`](LICENSE)). The weights will be Apache-2.0 too.

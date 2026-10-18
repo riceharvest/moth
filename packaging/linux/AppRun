@@ -1,0 +1,8 @@
+#!/bin/sh
+# moth's AppImage entry. `hook-run` (the coding-agent hooks `moth hook` writes: "<this AppImage>" hook-run ...) goes
+# to the small moth-hook runner, which starts several times faster than the app; everything else to the app.
+HERE="${APPDIR:-$(dirname "$(readlink -f "$0")")}"
+if [ "$1" = "hook-run" ]; then
+    exec "$HERE/usr/lib/moth/moth-hook" "$@"
+fi
+exec "$HERE/usr/lib/moth/moth" "$@"

@@ -60,3 +60,7 @@ build/
 
 # Claude Code agent worktrees and local settings
 .claude/
+
+# the installers (packaging/): PyInstaller and AppImage build output
+/build/
+/dist

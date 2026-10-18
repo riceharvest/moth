@@ -24,6 +24,14 @@ CODE = os.path.dirname(HERE)   # the folder that holds the moth package
 ICON = os.path.join(HERE, "assets", "silkmoth_adult_female_icon.svg")
 LABEL = "local.moth.pet"
 MARKER = "X-Moth-Autostart=1"
+# the installers' app (PyInstaller, sys.frozen): moth is inside the executable, so the entry runs from the home folder
+# (an AppImage's mount, where CODE and ICON are, moves on every launch) and names the icon by its theme name
+FROZEN = bool(getattr(sys, "frozen", False))
+RUN_DIR = os.path.expanduser("~") if FROZEN else CODE
+if FROZEN:
+    from moth.hooks import appimage   # stdlib only
+    if appimage():
+        ICON = "moth"
 
 
 def prog() -> str:
@@ -48,12 +56,18 @@ def entry_path(platform: str | None = None) -> str:
 
 
 def pet_python(platform: str | None = None) -> str:
-    """sys.executable; on Windows its pythonw.exe sibling (no console window) if there is one."""
+    """sys.executable; on Windows its pythonw.exe sibling (no console window) if there is one. The installers' app:
+    its windowed mothw.exe on Windows, the .AppImage file itself ($APPIMAGE) rather than its per-launch mount."""
     py = sys.executable
+    if FROZEN:
+        from moth.hooks import appimage
+        if appimage():
+            return appimage()
     if kind(platform) == "windows":
-        w = os.path.join(os.path.dirname(py), "pythonw.exe")
-        if os.path.isfile(w):
-            return w
+        for name in ("mothw.exe",) if FROZEN else ("pythonw.exe",):
+            w = os.path.join(os.path.dirname(py), name)
+            if os.path.isfile(w):
+                return w
     return py
 
 
@@ -70,18 +84,18 @@ def render(platform: str | None = None) -> str:
     if k == "mac":
         log = os.path.join(os.path.expanduser("~"), ".moth", "pet.log")
         return plistlib.dumps({"Label": LABEL, "ProgramArguments": [py, "-m", "moth.pet"],
-                               "WorkingDirectory": CODE, "RunAtLoad": True, "KeepAlive": False,
+                               "WorkingDirectory": RUN_DIR, "RunAtLoad": True, "KeepAlive": False,
                                "ProcessType": "Interactive", "StandardOutPath": log,
                                "StandardErrorPath": log}).decode()
     if k == "windows":
         return ("@echo off\r\nrem moth: start the desktop pet at login (made by `moth autostart on`; "
                 "`moth autostart off` removes it)\r\n"
-                f'cd /d "{CODE}"\r\nstart "" "{py}" -m moth.pet\r\n')
+                f'cd /d "{RUN_DIR}"\r\nstart "" "{py}" -m moth.pet\r\n')
     return "\n".join([
         "[Desktop Entry]", "Type=Application", "Name=moth",
         "Comment=moth, a tiny companion, flying around your screen (desktop pet)",
         "Exec=" + " ".join(_desktop_quote(a) for a in (py, "-m", "moth.pet")),
-        "Path=" + CODE, "Icon=" + ICON, "Terminal=false", "X-GNOME-Autostart-enabled=true",
+        "Path=" + RUN_DIR, "Icon=" + ICON, "Terminal=false", "X-GNOME-Autostart-enabled=true",
         "X-GNOME-Autostart-Delay=5", "X-KDE-autostart-after=panel", MARKER, ""])
 
 
@@ -128,7 +142,7 @@ def main(argv=None, platform: str | None = None) -> int:
     st, p = state(platform)
     if a.action == "status":
         print({"off": f"autostart is off (no {p})",
-               "on": f"autostart is on: {p}\n  starts: {pet_python(platform)} -m moth.pet  (in {CODE})",
+               "on": f"autostart is on: {p}\n  starts: {pet_python(platform)} -m moth.pet  (in {RUN_DIR})",
                "stale": f"autostart is on, but {p} starts another Python or folder than this one "
                         f"(`{prog()} autostart on` points it here)",
                "foreign": f"{p} exists but wasn't made by moth"}[st])

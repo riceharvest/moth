@@ -34,7 +34,6 @@ import time
 from moth import autostart, config, doctor, hooks, launch, weights
 
 DEFAULT_URL = "http://127.0.0.1:4747"
-MIN_RUN_GB = 1.0                       # moth itself, once loaded (~0.8 GB)
 PET_LOG = ("~", ".moth", "pet.log")    # same log as the macOS autostart entry (moth forget wipes ~/.moth/*.log)
 PIDFILE = ("~", ".moth", "setup-pet.pid")
 TORCH_INDEX = "https://download.pytorch.org/whl/cpu"
@@ -145,7 +144,7 @@ class Setup:
         self.had: list[str] = []      # already in place
         self.left: list[str] = []     # still missing (declined, blocked or failed)
         self.failed = False
-        self.serve_ok = self.weights_ok = self.pet_ok = self.ram_ok = True
+        self.serve_ok = self.weights_ok = self.pet_ok = True
         self.mode = weights.mode()
         self.started = self.running = False
 
@@ -361,21 +360,19 @@ class Setup:
 
     # 3 -------------------------------------------------------------------------------------------------------
     def memory(self):
+        """A warning, never a block: free-memory estimates run low (macOS counts only free + inactive pages), and
+        moth itself needs about 1 GB once loaded. On Linux the pet still refuses to wake moth below
+        launch.MIN_FREE_GB (MemAvailable is reliable there), and step 6 shows that message if it does."""
         self.head(3, "memory")
         gb = ram_gb()
         if self.running:
             self.line("✓", (f"{gb:.1f} GB available" if gb is not None else "fine") + " (moth is already loaded)")
         elif gb is None:
             self.line("·", "couldn't read free memory here; moth needs about 1 GB")
-        elif gb < MIN_RUN_GB:
-            self.ram_ok = False
-            self.line("✗", f"only {gb:.1f} GB available: moth needs about 1 GB (and ~3 GB free to start)")
-            self.left.append("free memory")
         elif gb < launch.MIN_FREE_GB:
-            self.ram_ok = False
-            self.line("!", f"{gb:.1f} GB available: enough for moth once it runs (~1 GB), but the pet won't wake it "
-                           f"below ~{launch.MIN_FREE_GB:g} GB free (loading takes more). close something first")
-            self.left.append("free memory (~3 GB to start)")
+            self.line("!", f"{gb:.1f} GB available by this system's count: moth needs about 1 GB once it runs and "
+                           f"~{launch.MIN_FREE_GB:g} GB while it loads. if it doesn't wake, close something and "
+                           f"start it again")
         else:
             self.line("✓", f"{gb:.1f} GB available (moth needs about 1 GB)")
 
@@ -513,8 +510,6 @@ class Setup:
             why.append("no weights yet (step 2)")
         if not self.pet_ok:
             why.append("PySide6 missing (step 1)")
-        if not self.ram_ok:
-            why.append("not enough free memory (step 3)")
         if not has_display():
             why.append("no graphical session here (moth without the pet: " + prog() + ")")
         if why:

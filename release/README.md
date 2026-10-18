@@ -177,6 +177,12 @@ the chat page in your browser). Start it before the pet and the pet uses it.
 - The server only listens on localhost. Everything that reads or drives the chat needs a per-install token
   (`~/.moth/token`, made on first run). The hooks read the token from that file.
 
+### Installers (coming with the release)
+
+No Python? Installers for Windows (setup `.exe`), macOS (`.dmg`, Apple silicon) and Linux (AppImage or tarball) are
+coming with the release. They bundle Python, CPU torch and the pet, and download these weights on first launch.
+They aren't published yet. Details: [docs/INSTALL.md](https://github.com/riceharvest/moth/blob/main/docs/INSTALL.md).
+
 ### Speed
 
 On the CPU, moth stores its Linear weights in int8, with one scale per output channel, and runs them through

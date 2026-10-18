@@ -1,0 +1,254 @@
+# moth's installers: a Windows setup .exe (Inno Setup, per user), a macOS .dmg (moth.app, arm64) and a Linux AppImage
+# plus tarball, built with PyInstaller (packaging/, docs/INSTALL.md) on GitHub-hosted runners only, then each one
+# installed on a fresh runner and smoke-tested (packaging/smoke.py: first-run window, the real frozen server with a
+# tiny random model, the hooks as written, screenshots, uninstall).
+# Output: workflow artifacts only. This workflow never creates a release, a tag or anything else public; its token
+# can only read the repo. Unsigned for now (docs/INSTALL.md: SmartScreen / Gatekeeper).
+# Runs on demand (Actions tab / gh workflow run installers.yml -f os=all|windows|macos|linux) and on v* tags.
+name: installers
+
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: "which installers to build"
+        type: choice
+        options: [all, windows, macos, linux]
+        default: all
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHON_VERSION: "3.12"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  HF_HUB_DISABLE_TELEMETRY: "1"
+  TOKENIZER_REPO: darioooooo0o/tiny-agent-112m           # as test.yml: the real tokenizer for the smoke fixture
+  TOKENIZER_REVISION: 4397e12be190c10f40e47c9e268e405d78ab0b78
+  TOKENIZER_SHA256: 8b5b984a41969952af13be0f21f8a57f72119bb71779669a282e6d56910fa12f
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        env:
+          WANT: ${{ github.event.inputs.os || 'all' }}
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os
+          # build: ubuntu-22.04 so the AppImage runs on older glibc too; smoke: a fresh, current runner
+          rows = [dict(name="windows", build="windows-latest", smoke="windows-latest"),
+                  dict(name="macos", build="macos-latest", smoke="macos-latest"),
+                  dict(name="linux", build="ubuntu-22.04", smoke="ubuntu-24.04")]
+          want = os.environ["WANT"]
+          print("matrix=" + json.dumps({"include": [r for r in rows if want in ("all", r["name"])]}))
+          EOF
+
+  build:
+    needs: plan
+    name: build / ${{ matrix.name }}
+    runs-on: ${{ matrix.build }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Qt libraries for PyInstaller to bundle (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libegl1 libgl1 libxkbcommon0 libxkbcommon-x11-0 \
+            libfontconfig1 libdbus-1-3 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-shape0 libxcb-xfixes0 libxcb-xkb1 libxcb-util1 libxcb-sync1
+
+      - name: CPU torch (Linux, Windows; macOS arm64's default wheel is CPU / MPS)
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then python -m pip install torch; else
+            python -m pip install torch --index-url https://download.pytorch.org/whl/cpu; fi
+
+      - name: Bundle and build dependencies
+        run: python -m pip install -r packaging/requirements.txt
+
+      - name: Versions
+        id: v
+        run: |
+          python -c "import torch, PySide6, PyInstaller, sys; print(sys.version); print('torch', torch.__version__, 'PySide6', PySide6.__version__, 'PyInstaller', PyInstaller.__version__)"
+          echo "version=$(cat moth/VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Icons from the silkmoth SVG
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python packaging/make_icons.py build/icons
+
+      - name: PyInstaller (onedir)
+        run: python -m PyInstaller --noconfirm --clean --log-level WARN --distpath dist --workpath build/pyi packaging/moth.spec
+
+      - name: Windows installer (Inno Setup)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null; $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          & $iscc /Qp "/DAppVersion=${{ steps.v.outputs.version }}" "/DSourceDir=$PWD\dist\moth" "/DIconFile=$PWD\build\icons\moth.ico" "/DOutputDir=$PWD\dist" packaging\windows\moth.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: macOS disk image
+        if: runner.os == 'macOS'
+        run: packaging/macos/build.sh
+
+      - name: Linux AppImage and tarball
+        if: runner.os == 'Linux'
+        run: packaging/linux/build.sh
+
+      - name: Smoke-test fixture (tiny random model + the real tokenizer)
+        run: python packaging/make_fixture.py build/fixture
+
+      - name: Sizes
+        run: |
+          python - <<'EOF' | tee -a "$GITHUB_STEP_SUMMARY"
+          import glob, os
+          print("| installer | size |\n|---|---|")
+          for f in sorted(glob.glob("dist/moth-*")):
+              print(f"| {os.path.basename(f)} | {os.path.getsize(f) / 1e6:.0f} MB |")
+          total = sum(os.path.getsize(os.path.join(d, f)) for d, _, fs in os.walk("dist/moth" if os.path.isdir("dist/moth") else "dist/moth.app") for f in fs)
+          print(f"| (installed app folder) | {total / 1e6:.0f} MB |")
+          EOF
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: moth-installer-${{ matrix.name }}
+          path: |
+            dist/moth-*.exe
+            dist/moth-*.dmg
+            dist/moth-*.AppImage
+            dist/moth-*.tar.gz
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: smoke-fixture-${{ matrix.name }}
+          path: build/fixture/
+          retention-days: 3
+
+  smoke:
+    needs: [plan, build]
+    name: smoke / ${{ matrix.name }}
+    runs-on: ${{ matrix.smoke }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      PYTHONIOENCODING: utf-8
+    steps:
+      # no setup-python and no pip: the app must bring everything; the runner's own python3 only drives smoke.py
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: packaging
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: moth-installer-${{ matrix.name }}
+          path: installer
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: smoke-fixture-${{ matrix.name }}
+          path: fixture
+
+      - name: Install silently (per user, into a folder with a space), smoke-test, uninstall (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $setup = (Get-ChildItem installer\moth-*-setup.exe).FullName
+          $dir = "$env:LOCALAPPDATA\Programs\moth app"
+          $p = Start-Process $setup -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/TASKS=addtopath","/DIR=`"$dir`"","/LOG=`"$PWD\install.log`"" -Wait -PassThru
+          "installer exit $($p.ExitCode)"; Get-ChildItem $dir | Select-Object Name, Length
+          if (-not (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\moth.lnk")) { throw "no Start menu shortcut" }
+          python packaging/smoke.py --app "$dir\mothw.exe" --cli "$dir\moth.exe" --model fixture --out smoke-out --uninstall "$dir\unins000.exe"
+          $rc = $LASTEXITCODE
+          if (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\moth.lnk") { "Start menu shortcut left behind"; $rc = 1 }
+          Copy-Item install.log smoke-out\ -ErrorAction SilentlyContinue
+          exit $rc
+
+      - name: Install from the disk image, smoke-test, uninstall (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          dmg=$(ls installer/moth-*.dmg)
+          mnt=$(mktemp -d)
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$dmg"
+          ls -la "$mnt"
+          cp -R "$mnt/moth.app" /Applications/
+          hdiutil detach "$mnt"
+          codesign --verify --deep --strict --verbose=2 /Applications/moth.app
+          plutil -p /Applications/moth.app/Contents/Info.plist | grep -E "LSUIElement|CFBundleName|CFBundleExecutable"
+          rc=0
+          python3 packaging/smoke.py --app /Applications/moth.app/Contents/MacOS/moth --model fixture --out smoke-out || rc=$?
+          rm -rf /Applications/moth.app
+          exit $rc
+
+      - name: Run the AppImage and the tarball, smoke-test both (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          # a desktop's usual libraries (the AppImage leaves those to the host), FUSE 2 to mount it, a virtual screen
+          sudo apt-get install -y -qq --no-install-recommends libfuse2t64 libegl1 libgl1 libxkbcommon0 \
+            libfontconfig1 libdbus-1-3 libglib2.0-0t64 libx11-xcb1 xvfb xauth
+          img=$(ls "$PWD"/installer/moth-*.AppImage)
+          chmod +x "$img"
+          "$img" --version || { echo "::warning::FUSE mount failed; running the AppImage extracted"; export APPIMAGE_EXTRACT_AND_RUN=1; }
+          rc=0
+          SMOKE_APPIMAGE="$img" xvfb-run -a -s "-screen 0 1280x800x24" \
+            python3 packaging/smoke.py --app "$img" --model fixture --out smoke-out/appimage || rc=$?
+          mkdir -p "$RUNNER_TEMP/tar" && tar -C "$RUNNER_TEMP/tar" -xzf installer/moth-*-linux-*.tar.gz
+          xvfb-run -a -s "-screen 0 1280x800x24" \
+            python3 packaging/smoke.py --app "$RUNNER_TEMP/tar/moth/moth" --model fixture --out smoke-out/tarball --port 4792 || rc=$?
+          exit $rc
+
+      - name: Results
+        if: always()
+        run: |
+          python3 - <<'EOF' | tee -a "$GITHUB_STEP_SUMMARY"
+          import glob, json
+          for f in sorted(glob.glob("smoke-out/**/smoke.json", recursive=True)):
+              d = json.load(open(f))
+              ok = sum(c["ok"] for c in d["checks"].values())
+              print(f"### {f}: {ok}/{len(d['checks'])} checks passed\n")
+              for k, c in d["checks"].items():
+                  if not c["ok"]:
+                      print(f"- FAIL {k}: `{c['detail'][:300]}`")
+              print("\n| timing | cold ms | warm median ms |\n|---|---|---|")
+              for k, t in d["timings_ms"].items():
+                  print(f"| {k} | {t['cold']} | {t['median_warm']} |" if isinstance(t, dict) else f"| {k} | {t} | |")
+              print()
+          EOF
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: smoke-${{ matrix.name }}
+          path: smoke-out/
+          retention-days: 14
+          if-no-files-found: warn

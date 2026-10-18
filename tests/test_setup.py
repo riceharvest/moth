@@ -345,13 +345,12 @@ class Problems(Base):
         self.assertIn("something else answers at http://127.0.0.1:4747", out)
         self.assertEqual(self.launched, [])
 
-    def test_low_memory_doesnt_start(self):
+    def test_low_memory_warns_but_starts(self):
         make_weights(Path(S.weights.cache_dir()))
-        with unittest.mock.patch.object(S, "ram_gb", return_value=2.0):
+        with unittest.mock.patch.object(S, "ram_gb", return_value=0.5):   # estimates run low (macOS): never a block
             rc, out = self.setup_run("--yes")
-        self.assertIn("2.0 GB available", out)
-        self.assertIn("not enough free memory (step 3)", out)
-        self.assertEqual(self.launched, [])
+        self.assertIn("0.5 GB available by this system's count", out)
+        self.assertEqual(len(self.launched), 1, out)
 
     def test_download_failure(self):
         with unittest.mock.patch.object(S, "fetch_weights", side_effect=SystemExit("moth: download failed (boom)")):
