@@ -142,7 +142,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: python -m pytest -q -rs -p no:cacheprovider tests/test_setup.py
 
-      - name: test_frozen (the installers' app: hooks and autostart run the bundled executables)
+      - name: "test_frozen (the installers' app: hooks and autostart run the bundled executables)"
         if: ${{ !cancelled() }}
         run: python -m pytest -q -rs -p no:cacheprovider tests/test_frozen.py
 
