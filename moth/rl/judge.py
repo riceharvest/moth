@@ -94,7 +94,10 @@ class LLMJudge(Judge):
     def __init__(self, client: OAIClient, cache: JudgeCache | None = None):
         super().__init__(cache)
         self.client = client
-        self.model_id = client._model or "auto"
+
+    @property
+    def model_id(self) -> str:   # the served model (/v1/models when not given): a swapped judge never hits old labels
+        return self.client.model
 
     def _ask(self, prompt, n, meter, card, turns, attempt) -> str:
         return self.client.chat([{"role": "user", "content": prompt}], meter=meter, role="judge", temperature=0,

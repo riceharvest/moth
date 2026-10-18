@@ -409,6 +409,13 @@ def test_llm_components_against_fake_server():
         assert ep["labels"] is None   # the fake server can't label: masked, not scored as off-gist
         r = m.roles
         assert r["judge"]["calls"] == 3 and r["policy"]["calls"] == len(ep["turns"]) and r["sim"]["est"]
+        # the pilot CLI: no --out (nothing written), 2 worker threads; every policy call is metered once
+        from moth.rl.__main__ import main
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            eps, total = main(["run", "--sim-url", url, "--judge-url", url, "--policy-url", url, "--episodes", "4",
+                               "--workers", "2", "--agent-pool", os.path.join(tempfile.mkdtemp(), "none.json")])
+        assert total.roles["policy"]["calls"] == sum(len(e["turns"]) for e in eps) > 0
+        assert all(e["labels"] is None for e in eps)
     finally:
         srv.kill()
         srv.wait()

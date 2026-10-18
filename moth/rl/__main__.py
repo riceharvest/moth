@@ -2,6 +2,7 @@
 
   python -m moth.rl mock --episodes 3 [--policy good|selfy|assistant|parrot] [--json out.json]
   python -m moth.rl run  --sim-url URL --judge-url URL (--policy-url URL | --moth-model PATH) --episodes 20 --out DIR
+                         [--agent-pool ~/moth/moth/agent_pool.json]   (read-only; the eval's agent messages are skipped)
   python -m moth.rl eval --version v1 (--mock | --policy-url URL | --moth-model PATH) [--sim-url --judge-url]
                          [--ref OTHER/results.json] --out DIR
   python -m moth.rl cost --meter DIR/meter.json --episodes 100000 --tps sim=20000:2500 --tps judge=15000:1500
@@ -16,7 +17,9 @@ import argparse
 import json
 import os
 import random
+import re
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from moth.rl.env import MockPolicy, MothPolicy, OpenAIPolicy, run_episodes  # noqa: E402
@@ -55,25 +58,25 @@ def build_moth(a):
     ns = argparse.Namespace(model=a.moth_model, tokenizer=os.path.join(ROOT, "data/tiny-agent-112m/tokenizer.json"),
                             pool_file=os.path.join(ROOT, "moth/file_pool.json"), device=a.device, temperature=0.7,
                             top_p=0.95, rep_penalty=1.3, ctx_budget=None, max_turn_tokens=200, max_tool_rounds=3,
-                            home=os.path.join(a.out, "home"), seed=0)
+                            home=os.path.join(a.out or tempfile.mkdtemp(prefix="moth-rl-"), "home"), seed=0)
     return MothPolicy(Moth(ns), home_root=ns.home)
 
 
 def components(a, mock: bool):
+    cache = JudgeCache(os.path.join(a.out, "judge_cache.jsonl") if a.out else None)
     if mock:
-        return MockSimulator(), MockJudge(JudgeCache(os.path.join(a.out, "judge_cache.jsonl") if a.out else None))
-    sim = LLMSimulator(OAIClient(a.sim_url, a.sim_model))
-    judge = LLMJudge(OAIClient(a.judge_url, a.judge_model), JudgeCache(os.path.join(a.out, "judge_cache.jsonl")))
-    return sim, judge
+        return MockSimulator(), MockJudge(cache)
+    return LLMSimulator(OAIClient(a.sim_url, a.sim_model)), LLMJudge(OAIClient(a.judge_url, a.judge_model), cache)
 
 
 def policy_factory(a):
     if getattr(a, "mock", False) or a.cmd == "mock":
         return lambda: MockPolicy(a.policy)
-    if a.policy_url:
-        p = OpenAIPolicy(OAIClient(a.policy_url, a.policy_model))
-        return lambda: p
+    if a.policy_url:   # one per worker thread: run_episode sets policy.meter per episode
+        return lambda: OpenAIPolicy(OAIClient(a.policy_url, a.policy_model))
     if a.moth_model:
+        if a.workers > 1:
+            raise SystemExit("--moth-model runs one chat engine: use --workers 1")
         p = build_moth(a)
         return lambda: p
     raise SystemExit("need --policy-url or --moth-model (or --mock)")
@@ -136,7 +139,8 @@ def main(argv=None):
 
     if a.cmd == "eval":
         from moth.rl.evalrun import run_eval
-        a.out = a.out or os.path.join(ROOT, "evals", f"rl_{a.version}")
+        label = a.label or a.policy_model or a.moth_model or ("mock-" + a.policy)
+        a.out = a.out or os.path.join(ROOT, "evals", f"rl_{a.version}_" + re.sub(r"[^\w.-]+", "_", label).strip("_"))
         sim, judge = components(a, a.mock)
         pair_ask = None
         if a.ref and not a.mock:
@@ -144,7 +148,7 @@ def main(argv=None):
             pair_ask = lambda p: cl.chat([{"role": "user", "content": p}], temperature=0, max_tokens=300,  # noqa: E731
                                          chat_template_kwargs={"enable_thinking": False})["text"]
         s = run_eval(a.version, policy_factory(a), sim, judge, a.out, a.ref, pair_ask, a.workers, limit=a.limit,
-                     label=a.label or a.policy_model or a.moth_model or ("mock-" + a.policy))
+                     label=label)
         with open(os.path.join(a.out, "report.md"), encoding="utf-8") as f:
             print(f.read())
         write_json(os.path.join(a.out, "meter.json"), {"per_episode": s["cost_per_episode"]}, indent=1)
@@ -154,6 +158,9 @@ def main(argv=None):
     reg = Registry()
     rng = random.Random(a.seed)
     agent = train_agent_msgs(getattr(a, "agent_pool", None)) or None
+    if agent is None and not mock:
+        print(f"WARNING: no agent message pool at {a.agent_pool}: agent episodes use the 8 built-in stand-ins. "
+              "Pass --agent-pool (e.g. the main tree's moth/agent_pool.json, read-only).", file=sys.stderr, flush=True)
     specs = [sample_spec(reg, rng, a.split, agent_msgs=agent) for _ in range(a.episodes)]
     if a.out:
         os.makedirs(a.out, exist_ok=True)
@@ -172,6 +179,7 @@ def main(argv=None):
         write_json(os.path.join(a.out, "meter.json"), {"per_episode": per, "total": total.summary()}, indent=1)
     if getattr(a, "json", None):
         write_json(a.json, eps)
+    return eps, total
 
 
 if __name__ == "__main__":

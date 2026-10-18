@@ -106,11 +106,15 @@ def clean_sim(t: str, card: dict) -> str | None:
     return t[:300]
 
 
+PROMPT_HASH = hashlib.sha256((SIM_SYSTEM + USER_SIM_PROMPT + SIM_NO_REPEAT).encode()).hexdigest()[:12]
+
+
 class Simulator:
     """next_user(spec, turns, i, meter) -> the human's i-th message (1-based, agent messages not counted), or None
     to end the chat. Subclasses implement _ask(prompt, seed, meter) -> raw text."""
 
     temperature = 1.0
+    model_id = "mock-sim"
 
     def next_user(self, spec: dict, turns: list[dict], i: int, meter: CostMeter | None = None) -> str | None:
         rng = random.Random(f"{spec['seed']}:sim:{i}")
@@ -132,6 +136,10 @@ class Simulator:
 class LLMSimulator(Simulator):
     def __init__(self, client: OAIClient, temperature: float = 1.0, max_tokens: int = 80):
         self.client, self.temperature, self.max_tokens = client, temperature, max_tokens
+
+    @property
+    def model_id(self) -> str:
+        return self.client.model
 
     def _ask(self, prompt, seed, meter, spec, turns, i) -> str:
         r = self.client.chat([{"role": "system", "content": SIM_SYSTEM}, {"role": "user", "content": prompt}],

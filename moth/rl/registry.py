@@ -303,6 +303,9 @@ MOCK_AGENT_MSGS = [   # tiny built-in stand-ins for the training pool (mock runs
 ]
 
 
+_WARNED: list = []
+
+
 def make_spec(card: dict, scenario: str, rng: random.Random, seed: int, agent_msgs: list[str] | None = None,
               sid: str | None = None, turns: int | None = None) -> dict:
     """A fully resolved episode spec (JSON-serialisable): everything the simulator and policy need."""
@@ -311,6 +314,10 @@ def make_spec(card: dict, scenario: str, rng: random.Random, seed: int, agent_ms
             "turns": turns or rng.choice(TURN_CHOICES), "script": None, "agent_msgs": [], "recall": None}
     if scenario == "agent":
         spec["persona"], spec["goal"] = rng.choice(AGENT_USER_PERSONAS), rng.choice(AGENT_SCENARIOS)
+        if not agent_msgs and not _WARNED:
+            _WARNED.append(1)
+            print("moth.rl: no agent messages given: agent episodes use the 8 built-in stand-ins (MOCK_AGENT_MSGS); "
+                  "pass agent_msgs=train_agent_msgs(<agent_pool.json>) for training", file=sys.stderr, flush=True)
         pool = agent_msgs or MOCK_AGENT_MSGS
         k = rng.randint(1, 3)
         spec["agent_msgs"] = [clean_agent_message(t) for t in rng.sample(pool, min(k, len(pool)))]

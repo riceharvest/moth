@@ -57,7 +57,8 @@ def summarize(eps: list[dict]) -> dict:
     for e in eps:
         by_s[e["scenario"]].append(e)
         by_c[card_group(e["card_id"])].append(e)
-    return {"all": block(eps), "by_scenario": {k: block(v) for k, v in sorted(by_s.items())},
+    held = [e for e in eps if card_group(e["card_id"]).startswith("heldout")]
+    return {"all": block(eps), "heldout": block(held), "by_scenario": {k: block(v) for k, v in sorted(by_s.items())},
             "by_card": {k: block(v) for k, v in sorted(by_c.items())}}
 
 
@@ -66,8 +67,9 @@ KEYS = ("episodes", "replies", "on_gist", "self", "follows_card", "assistant", "
 
 def report_md(s: dict, title: str) -> str:
     L = [f"# {title}", "", "| group | " + " | ".join(KEYS) + " |", "|---|" + "---|" * len(KEYS)]
-    rows = [("**ALL**", s["all"])] + [(f"scenario {k}", v) for k, v in s["by_scenario"].items()] + \
-           [(f"card {k}", v) for k, v in s["by_card"].items()]
+    rows = ([("**ALL**", s["all"]), ("**held-out cards only**", s["heldout"])]
+            + [(f"scenario {k}", v) for k, v in s["by_scenario"].items()]
+            + [(f"card {k}", v) for k, v in s["by_card"].items()])
     for name, b in rows:
         L.append(f"| {name} | " + " | ".join("n/a" if b[k] is None else str(b[k]) for k in KEYS) + " |")
     return "\n".join(L)
@@ -92,6 +94,14 @@ def mock_pair_ask(prompt: str) -> str:
     return json.dumps({"reason": f"mock {a} vs {b}", "winner": w})
 
 
+def settings(sim: Simulator, judge: Judge) -> dict:
+    """What has to match for two eval runs to be comparable (besides the frozen set's sha256)."""
+    from moth.rl import judge as J
+    from moth.rl import sim as S
+    return {"sim_model": sim.model_id, "sim_temperature": sim.temperature, "sim_prompt": S.PROMPT_HASH,
+            "judge_model": judge.model_id, "label_prompt": J.PROMPT_HASH}
+
+
 def run_eval(version: str, policy_factory, sim: Simulator, judge: Judge, out: str, ref: str | None = None,
              pair_ask=None, workers: int = 1, root: str = POOL_DIR, limit: int | None = None,
              label: str = "policy") -> dict:
@@ -102,7 +112,7 @@ def run_eval(version: str, policy_factory, sim: Simulator, judge: Judge, out: st
     recs = [to_eval_record(e) for e in eps]
     s = summarize(eps)
     s.update({"version": version, "sha256": doc["sha256"], "label": label, "n_specs": len(specs),
-              "cost_per_episode": meter.per_episode()})
+              "settings": settings(sim, judge), "cost_per_episode": meter.per_episode()})
     os.makedirs(out, exist_ok=True)
     write_json(os.path.join(out, "results.json"), recs)
     write_json(os.path.join(out, "episodes.json"), eps)
@@ -115,6 +125,22 @@ def run_eval(version: str, policy_factory, sim: Simulator, judge: Judge, out: st
     if ref:
         from moth import pairwise  # imports moth.eval -> build_sft -> torch: only when asked
         rows, warn = pairwise.run(recs, read_json(ref), pair_ask or mock_pair_ask, workers=max(1, workers))
+        ref_sum = os.path.join(os.path.dirname(os.path.abspath(ref)), "summary.json")
+        if os.path.exists(ref_sum):
+            rs = read_json(ref_sum)
+            for k in ("version", "sha256"):
+                if rs.get(k) != s[k]:
+                    warn.insert(0, f"ref {k} {rs.get(k)} != {s[k]}: not the same frozen eval set")
+            for k, v in (rs.get("settings") or {}).items():
+                if s["settings"].get(k) != v:
+                    warn.insert(0, f"ref {k}={v!r} but this run {s['settings'].get(k)!r}: scores not comparable")
+        # simulated chats diverge after the first reply (the sim answers each policy), so "user lines differ" is
+        # expected there; scripted probes stay paired line for line
+        warn = [w for w in warn if "user lines differ" not in w] + (
+            [f"{sum('user lines differ' in w for w in warn)} simulated chats diverge after turn 1 (expected)"]
+            if any("user lines differ" in w for w in warn) else [])
+        for w in warn[:5]:
+            print("pairwise warning:", w, flush=True)
         c = collections.Counter(r["result"] for r in rows)
         s["pairwise"] = {"ref": ref, "pairs": len(rows), "A_wins": c["A"], "ties": c["tie"], "B_wins": c["B"],
                          "A_win_rate": round((c["A"] + c["tie"] / 2) / len(rows), 4) if rows else None,
