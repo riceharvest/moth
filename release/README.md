@@ -125,7 +125,7 @@ moth: i'm moth, not rosa.
 moth is [tiny-agent-112m](https://huggingface.co/darioooooo0o/tiny-agent-112m) fine-tuned into a character. The
 base is a 112M-parameter model I trained from scratch on one Intel Arc Pro B70. moth lives on that same graphics
 card, or at least it thinks it does. With its Engram lookup tables it stores 431M parameters, about 860 MB in bf16.
-It still runs fine on a CPU, in about 0.9 GB of RAM.
+It still runs fine on a CPU, in about 0.8 GB of RAM.
 
 ## What it does
 
@@ -158,10 +158,11 @@ Without a desktop (or for your coding agents' hooks): `cd moth-112m/code && pyth
 the terminal and prints ready-to-paste hook snippets with this install's real paths filled in (`--open` also opens
 the chat page in your browser). Start it before the pet and the pet uses it.
 
-- CPU is fine. A plain reply takes about a second. One where moth reads through its files can take up to ~10 s.
-  The server uses about 0.9 GB of RAM: the Engram tables stay in bf16, memory-mapped from `model.safetensors`, and
+- CPU is fine: a plain reply takes about a quarter of a second. One where moth reads through its files takes a
+  second or two.
+  The server uses about 0.8 GB of RAM: the Engram tables stay in bf16, memory-mapped from `model.safetensors`, and
   the OS reads in only the rows moth uses. `--device cuda` or `--device xpu` work with `python -m moth` (the pet
-  passes server flags on: `python -m moth.pet -- --device xpu`).
+  passes server flags on: `python -m moth.pet -- --device xpu`). Speed and the `--quant` flag: see below.
 - Coming soon: once moth is on PyPI, `pip install moth-companion` gives you the `moth` and `moth-pet` commands, and
   moth downloads these weights from this repo on first run.
 - `python -m moth.cli` chats in the terminal instead.
@@ -170,6 +171,31 @@ the chat page in your browser). Start it before the pet and the pet uses it.
   on Linux, macOS and Windows.
 - The server only listens on localhost. Everything that reads or drives the chat needs a per-install token
   (`~/.moth/token`, made on first run). The hooks read the token from that file.
+
+### Speed
+
+On the CPU, moth stores its Linear weights in int8, with one scale per output channel, and runs them through
+PyTorch's built-in int8 kernel, so there's nothing to compile. Each new token streams 136 MB of weights instead of
+545 MB in fp32. A lean decode step and a top-k sampler cut the per-token overhead too. These numbers are from a
+Ryzen 9 5950X (16 cores, AVX2, no AVX-512) at the default 8 threads, measured while other jobs kept the desktop busy
+(load average 10-20; the lower figure is the busier desktop):
+
+| `--quant` | reply speed | median chat turn | next to exact fp32 |
+|---|---|---|---|
+| `int8` (CPU default) | 85-110 tokens/s | 0.19-0.24 s | now and then a word or phrase differs |
+| `bf16` | 60-70 tokens/s | 0.3-0.37 s | nearly identical |
+| `none` (exact fp32) | 20-28 tokens/s | 0.9-1.1 s | exact |
+
+int8 replies read the same as exact fp32's. Over 36 greedy test turns, 28 came out word for word and the rest
+differed by a word or a phrase ("it's my cozy one" vs "it's my cozy lamp"). bf16 stays even closer to fp32 (35 of 36),
+so it's the mode to pick if you want replies as close to fp32 as possible at a bit less speed.
+
+- `--quant auto` (the default) means int8 on the CPU and unquantized on a GPU (`--device cuda|xpu` are unchanged).
+- `--quant bf16` stores the weights in bf16. `--quant none` is exact fp32 and the slowest. `--fast` is the same as
+  `--quant int8`.
+- If your PyTorch build has no int8 kernel for this, moth falls back to bf16 and says so.
+- `--threads N` sets the CPU threads (default: min(8, CPUs)). More threads help when the cores are free (16 on the
+  5950X), but more threads than free cores (a busy machine, a CPU quota) make it slower.
 
 ## Agent companion setup
 
@@ -220,6 +246,35 @@ reacts to the most interesting one, and keeps the sessions apart, so it doesn't 
 
 Details, caveats and what has been tested per harness:
 [`code/moth/integrations/README.md`](code/moth/integrations/README.md).
+
+## Updating
+
+From the download's `code/` folder (`moth update` for pip installs):
+
+```bash
+python -m moth update --check      # what would change; exit 0 = up to date, 10 = update available, 1 = error
+python -m moth update              # asks, then updates this folder in place (--yes: don't ask)
+python -m moth update --rollback   # back to the version before the last update (works offline)
+```
+
+- **Stop moth first.** The update refuses while a moth server from this folder runs (`--check` is fine). The pet
+  only checks once a day and says so in a bubble; it never installs anything.
+- **An interrupted update changes nothing.** New files download into `.moth-update/` first and are checked against
+  the Hub's hashes. Only then are they swapped in, which takes a moment. If the network drops or you press Ctrl-C,
+  the old version keeps working. Run the update again: files that finished downloading are kept, and a file that
+  was cut off halfway downloads again. A swap that can't finish (a file open in another program on Windows, a
+  read-only file) is undone on the spot. If the computer dies during the swap itself, the next update or rollback
+  undoes the half-done swap first.
+- **Your files.** Files you added are never touched. If you edited a shipped file, your edit stays when the new
+  version didn't change that file, and gets replaced when it did. The update names every file it replaces, and your
+  copy goes into the backup.
+- **Backup.** Replaced and removed files go to `.moth-backup/<old version>/`. Only the last update's backup is
+  kept, and a rollback uses it up. Hook paths stay valid: the folder never moves. `~/.moth/` (home, token, settings)
+  is never touched.
+- `--revision <tag or commit>` (or `MOTH_REVISION`) pins a version, older ones included. `--repo` / `MOTH_REPO` picks
+  another repo. With `HF_HUB_OFFLINE=1` or `MOTH_OFFLINE=1` set, it says so and doesn't go online.
+- pip installs: `moth update` refreshes only the model files in `~/.cache/moth/<repo>/`, with the same backup and
+  rollback. `--check` also tells you when newer code is out (`pip install -U moth-companion`).
 
 ## Privacy
 
@@ -326,7 +381,8 @@ keyword-based. One of the 5-turn "passes" is a false positive, shown as the last
 
 ## Changelog
 
-Update an existing download in place with `python -m moth update` (from `code/`; `--check` shows what changed).
+Update an existing download in place with `python -m moth update` (from `code/`; `--check` shows what changed;
+see [Updating](#updating)).
 
 **0.3.0** (round 3)
 - Conversation-first data: 70% of the 67k kept chats (from 98,660 teacher chats) are plain back-and-forth talk,

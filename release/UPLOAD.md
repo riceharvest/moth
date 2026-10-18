@@ -23,6 +23,10 @@ Repo: `darioooooo0o/moth-112m` (model). That id is hard-coded in `moth/weights.p
       (`--skin`, `config pet_skin`, `config update_check`).
 - [ ] Fresh-download test on the rebuilt folder: copy it to a scratch folder outside the repo, then run `--version`, `--help`,
       `doctor`, one `/api/chat` and one `/api/agent` from a clean venv with a scratch `HOME`.
+- [ ] Update rehearsal: `python -m pytest -q tests/test_update_e2e.py` passes (fake Hub, real huggingface_hub
+      downloads, real servers). To rehearse with the real weights, serve two local builds with
+      `python tests/fake_hub.py --commit old=<build A> --commit new=<build B> --main old` and point `HF_ENDPOINT` at
+      it (see the docstring). Never point a test at the real repo.
 - [ ] Order: Hugging Face first, PyPI second. The pip package downloads its weights from this repo, so it must
       exist (and be public) before `moth-companion` goes on PyPI. Until then the card says "once moth is on PyPI".
 
@@ -45,8 +49,13 @@ hf download darioooooo0o/moth-112m --local-dir /tmp/moth-hubtest    # the real f
 cd /tmp/moth-hubtest/code && python -m moth update --check           # should say up to date (exit 0)
 ```
 
-A later update is the same `hf upload` command. `moth update` compares against the Hub revision, so users get it
-with `python -m moth update`.
+A later update is the same `hf upload` command: bump `moth/VERSION`, add a `## Changelog` entry to the card (that
+section is what `moth update --check` prints), rebuild `release/hf`, upload. `moth update` compares file hashes
+against the newest Hub revision, so users get exactly the changed files with `python -m moth update`. The pet's
+daily check sees the new version. Files dropped from the repo are removed from users' downloads, but only files the
+previous upload shipped (`.moth-version` keeps the list), never their own files. Keep old revisions on the Hub (no
+force-push or squash): users roll back with `--rollback` and pin with `--revision`, and the update uses the installed
+revision to tell users' edits from upstream changes.
 
 ## Optional follow-up: the training chats as a dataset
 

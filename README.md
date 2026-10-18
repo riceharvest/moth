@@ -33,7 +33,8 @@ The model card with the full details (example chats, how it was trained, eval nu
 - **Keeps your agent company.** One way only: the agent never sees moth or what you tell it.
 - **Has a home folder** (`~/.moth/home`: `lamps/ diary/ snacks/ friends/ sounds/ saved/`). It looks around with a
   tiny pure-Python shell (`ls`, `cat`, `head`, `wc`, `echo`, plus `write`) that can't leave that folder.
-- **Runs locally.** CPU is fine (about a second per reply, ~0.9 GB of RAM). The server listens on 127.0.0.1 only and
+- **Runs locally.** CPU is fine (about a quarter of a second per reply, ~0.8 GB of RAM; int8 weights by default, `--quant none` for exact
+  fp32, see the model card's "Speed"). The server listens on 127.0.0.1 only and
   needs a per-install token (`~/.moth/token`). It goes online only to download the weights or an update.
 
 ## Running it (once the weights are out)
@@ -48,6 +49,11 @@ cd moth-112m/code && python -m moth.pet                              # the deskt
 
 `python -m moth` runs just the server and prints hook snippets with your real paths. `python -m moth.cli` chats in
 the terminal, `python -m moth.tail` watches moth in a side terminal.
+
+`python -m moth update` (from `code/`; `moth update` for pip installs) updates in place. Stop moth first.
+`--check` only shows what would change, and `--rollback` restores the previous version. An interrupted update
+changes nothing, and running it again keeps the files that already finished downloading. Files you added are kept,
+and so are your edits to files the new version didn't change. Details: [Updating](release/README.md#updating) in the model card.
 
 ## Hooks
 
