@@ -377,6 +377,9 @@ class Moth:
         with self.lock:
             self.reset()
             self.log.clear()
+            # what the last turn left behind (rebuilt at the next turn anyway): the phrase-ban hook (reaction n-grams,
+            # words of user messages), the reactions' penalty ids, and the decoder that still holds the old KV cache
+            self._hook, self._carry, self._dec = None, set(), None
             if everything:
                 self.phrases.clear()
             with self.wake:

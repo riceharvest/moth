@@ -189,16 +189,18 @@ class TestHarness(unittest.TestCase):
         """tests/e2e/fake_moth.py loads moth/serve.py with torch and the model modules faked (the e2e workflow, which
         runs on every push touching serve.py, installs no torch). serve.py's other top-level imports must stay light:
         no torch, numpy, tokenizers, huggingface_hub, safetensors or sympy really imported, in a few seconds."""
-        code = ("import sys, time; sys.path.insert(0, sys.argv[1]); t = time.monotonic(); import fake_moth; "
+        # load_serve imports inside mock.patch.dict(sys.modules): whatever serve.py pulled in is gone from
+        # sys.modules afterwards, so look at it during the import. A None entry makes any real import of those
+        # modules raise ImportError (torch and tokenizers: load_serve's own fakes win over the None)
+        code = ("import sys, time; sys.path.insert(0, sys.argv[1]); "
+                "heavy = ('torch', 'numpy', 'tokenizers', 'huggingface_hub', 'safetensors', 'sympy', 'PySide6'); "
+                "sys.modules.update(dict.fromkeys(heavy)); t = time.monotonic(); import fake_moth; "
                 "s = fake_moth.load_serve(); took = time.monotonic() - t; assert s.make_handler and s.Log; "
-                "heavy = {'torch', 'numpy', 'tokenizers', 'huggingface_hub', 'safetensors', 'sympy', 'PySide6'}; "
-                "print(sorted(heavy & {m.split('.')[0] for m in sys.modules}), round(took, 2))")
+                "print(round(took, 2))")
         p = subprocess.run([sys.executable, "-c", code, str(ROOT / "tests" / "e2e")], cwd=ROOT, capture_output=True,
                            text=True, timeout=60)
-        self.assertEqual(p.returncode, 0, p.stderr)
-        heavy, took = p.stdout.rsplit(" ", 1)
-        self.assertEqual(heavy, "[]", p.stdout)
-        self.assertLess(float(took), 10.0, p.stdout)
+        self.assertEqual(p.returncode, 0, p.stderr[-2000:])
+        self.assertLess(float(p.stdout.split()[-1]), 10.0, p.stdout)
 
 
 if __name__ == "__main__":

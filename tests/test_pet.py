@@ -1080,6 +1080,34 @@ class QtTest(unittest.TestCase):
         self.assertEqual((app.applicationName(), app.applicationDisplayName()), ("moth", "moth"))
         P.set_app_name(object())   # not a Qt app at all: silently nothing
 
+    @unittest.skipUnless(os.name == "posix", "SIGTERM to itself: POSIX")
+    def test_signal_while_qt_starts_quits_through_qt(self):
+        """A SIGTERM while QApplication and the windows are being built (here: during load_art) is noted, and the
+        pet quits through Qt once it exists (exit 0). It used to raise KeyboardInterrupt through half-made Qt
+        objects (exit 130), and PySide6 could abort at exit over those (rc -6 on macOS)."""
+        from unittest import mock
+        real, seen = P.load_art, {}
+
+        def load_art_then_sigterm():
+            os.kill(os.getpid(), signal.SIGTERM)
+            return real()
+
+        def ready(pet):
+            from PySide6.QtCore import QTimer
+
+            def fallback():
+                seen["fallback"] = True
+                pet.quit()
+            QTimer.singleShot(5000, fallback)   # never hang the suite if the deferred quit is lost
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            url = f"http://127.0.0.1:{s.getsockname()[1]}"   # nothing listens: --no-server just waits
+        a = P.parse_args(["--url", url, "--no-server", "--token-file", "/nonexistent/token"])
+        with mock.patch.object(P, "load_art", load_art_then_sigterm):
+            rc = P.run(a, on_ready=ready)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("fallback", seen)
+
     def test_windows_run_offscreen(self):
         """The real windows against a stub moth: a new line shows in the bubble and the moth gets excited."""
         lines = [[], [{"say": "Hello From The Lamp"}]]
