@@ -68,9 +68,10 @@ jobs:
         run: python -m pip install -r .github/ci-requirements.txt
 
       - name: Check Qt loads (so the pet's Qt tests can't skip silently)
-        run: python -c "from PySide6 import QtGui, QtWidgets; print('PySide6', QtGui.qVersion())"
+        run: python -c "from PySide6 import QtCore, QtGui, QtWidgets; print('PySide6', QtCore.qVersion())"
 
       - name: Fetch tokenizer.json (no weights)
+        if: ${{ !cancelled() }}   # without it moth runs in pip mode and the pet tests try the Hub
         run: |
           python - <<'EOF'
           import hashlib, os
