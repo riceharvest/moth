@@ -148,6 +148,11 @@ class TempHome(unittest.TestCase):
             p.write_text(f"#!{sys.executable}\n{body}")
             p.chmod(0o755)
 
+    def remove_bin(self, name: str):
+        for p in (self.bin / name, self.bin / f"{name}.cmd", self.bin / f"_{name}.py"):
+            p.unlink(missing_ok=True)
+        self.assertIsNone(shutil.which(name, path=str(self.bin)))
+
     def run_cli(self, mod, *args, stdin_eof: bool = True):
         out = io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out), \
@@ -534,7 +539,7 @@ class Hermes(TempHome):
         self.assertIn("display:\n  skin: default", self.cfg.read_text())
 
     def test_without_hermes_binary_prints_the_step(self):
-        (self.bin / "hermes").unlink()
+        self.remove_bin("hermes")
         rc, out = self.hook("hermes", "--yes")
         self.assertEqual(rc, 0, out)
         self.assertIn("hermes plugins enable moth", out)

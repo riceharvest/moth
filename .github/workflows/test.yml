@@ -61,10 +61,6 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           bwrap --ro-bind / / --unshare-all true && echo "bwrap works" || echo "::warning::bwrap cannot make namespaces here: test_shell's differential test will skip"
 
-      - name: Reverse-DNS timing (macOS diagnostic)
-        if: runner.os == 'macOS'
-        run: python -c "import socket, time; t = time.monotonic(); n = socket.getfqdn('127.0.0.1'); print(repr(n), f'{time.monotonic() - t:.1f} s')"
-
       - name: Install CPU torch (Linux, Windows)
         if: runner.os != 'macOS'
         run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu

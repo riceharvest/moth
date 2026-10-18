@@ -618,7 +618,7 @@ class LaunchTest(LaunchBase):
         os.environ["FAKE_SERVE_DELAY"] = "0.6"
         boot = L.prepare(self.url, model=self.model, extra=["--react-every", "0"], mem=lambda: 32.0)
         self.assertEqual(boot.state, "starting", boot)
-        self.assertEqual(L.probe(self.url)[0], "none")   # still "loading"
+        self.assertEqual(L.probe(self.url, timeout=0.3)[0], "none")   # still "loading" (Windows: connect times out)
         ok, why = boot.server.wait_ready(timeout=20)
         self.assertTrue(ok, f"{why}: {self.serve_log()!r}")
         argv = self.fake_info()["argv"]

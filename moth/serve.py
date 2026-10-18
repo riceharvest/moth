@@ -732,7 +732,7 @@ class Moth:
 class Server(ThreadingHTTPServer):
     """ThreadingHTTPServer minus the reverse-DNS lookup HTTPServer.server_bind does (socket.getfqdn of the bind
     address, used only for CGI's SERVER_NAME). Where reverse DNS is slow that lookup sits between bind() and listen(),
-    so the port refuses connections for that long (tens of seconds on macOS CI runners) and the pet gives up."""
+    so the port refuses connections for that long (35 s on GitHub's macOS runners) and the pet gives up waiting."""
     daemon_threads = True
 
     def server_bind(self):
