@@ -13,7 +13,7 @@ if [ "$DRY" != 1 ] && [ -z "$MODEL" ]; then
 fi
 OUT=${MOTH_RELEASE_OUT:-release/hf}   # override to try a build elsewhere
 TA_FILES="model generate chat checkpoint tools optim"
-MOTH_FILES="__init__ __main__ persona agent home serve shell cli tail eval probes metrics gen_dialogs build_sft sft add_hermes_pool _tools pet config weights launch hooks doctor autostart forget pairwise"
+MOTH_FILES="__init__ __main__ persona agent home serve shell cli tail eval probes metrics gen_dialogs build_sft sft add_hermes_pool _tools pet config weights launch hooks doctor autostart forget pairwise norepeat"
 
 # what goes where: "<source>\t<path in the repo>"
 files() {
@@ -62,12 +62,21 @@ bad = []
 for src, dst in pairs:
     if not dst.endswith(".py"):
         continue
+    pkg_of = dst.split("/")[1] if dst.count("/") == 2 else None   # code/<pkg>/<mod>.py
     for node in ast.walk(ast.parse(open(src).read(), src)):
         names = []
-        if isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+        if isinstance(node, ast.ImportFrom) and node.level == 1 and pkg_of:   # from .x import y / from . import x
+            module = f"{pkg_of}.{node.module}" if node.module else pkg_of
+            names = [module] + [f"{module}.{a.name}" for a in node.names]
+            node = ast.ImportFrom(module=module, names=node.names, level=0)
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
             names = [node.module] + [f"{node.module}.{a.name}" for a in node.names]
         elif isinstance(node, ast.Import):
             names = [a.name for a in node.names]
+        elif isinstance(node, (ast.List, ast.Tuple)):   # [sys.executable, "-m", "moth.pet"]: a module run by name
+            vals = [e.value if isinstance(e, ast.Constant) else None for e in node.elts]
+            names = [b for a, b in zip(vals, vals[1:]) if a == "-m" and isinstance(b, str)]
+            node = None
         for n in names:
             parts = n.split(".")
             if parts[0] in ("moth", "tiny_agent") and len(parts) == 2:
