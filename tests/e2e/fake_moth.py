@@ -6,8 +6,9 @@ What the hooks see is the real thing: the Host check, the X-Moth-Token check, /a
 label, /api/says with its ?source=&session= filter. Only the engine is a stub:
   hear_agent  appends {"t", "text", "source", "session", "label"} to --record (one JSON line per post, t = time.time()
               when it arrived), then logs moth's "reaction" the way Moth.react does: a say event tagged
-              re={"source", "session"}, saying "moth> heard <label or session>: <first words>".
-  say_to      (the chat field, /api/chat) answers "moth> you said: <text>".
+              re={"source", "session"}, saying "heard <label or session>: <first words>".
+  say_to      (the chat field, /api/chat) answers "you said: <text>".
+<--record>.access gets one JSON line per request (t, method, path with query): which session a display polled for.
 The token is made here and written to --token-file (where the hooks read it: ~/.moth/token of the scratch home).
 torch, tokenizers and tiny_agent's model modules are faked before serve.py is imported, as in
 moth/integrations/test_integrations.py load_serve().
@@ -63,16 +64,32 @@ def main():
         words = " ".join(text.split()[:4])
         tag = {k: v for k, v in (("source", source), ("session", session)) if v}
         card = {"agent": text, **tag, **({"label": label} if label else {})}   # as Moth.card: the pet's caption
-        moth.log.add(card, {"say": f"moth> heard {label or session}: {words}", "re": tag})
+        moth.log.add(card, {"say": f"heard {label or session}: {words}", "re": tag})
         return "queued"
 
     moth = types.SimpleNamespace(log=serve.Log(), lock=threading.RLock(), hear_agent=hear_agent,
                                  home=serve.Home(tmp, 1, None), a=types.SimpleNamespace(home=tmp, pool_file=None))
     moth.agents = lambda: {"active": 0, "skipped": 0, "sessions": []}
-    moth.say_to = lambda text: [{"say": f"moth> you said: {text}"}]
+    moth.say_to = lambda text: [{"say": f"you said: {text}"}]
     moth.forget = lambda: moth.log.clear()
 
-    srv = serve.Server(("127.0.0.1", a.port), serve.make_handler(moth, token))
+    base = serve.make_handler(moth, token)
+    access = a.record + ".access"   # every request's time, method and path (with query): who polled what, when
+
+    class H(base):
+        def _access(self):
+            with lock, open(access, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"t": time.time(), "method": self.command, "path": self.path}) + "\n")
+
+        def do_GET(self):
+            self._access()
+            super().do_GET()
+
+        def do_POST(self):
+            self._access()
+            super().do_POST()
+
+    srv = serve.Server(("127.0.0.1", a.port), H)
     srv.daemon_threads = True
     with open(a.info + ".tmp", "w") as f:
         json.dump({"port": srv.server_address[1], "pid": os.getpid()}, f)

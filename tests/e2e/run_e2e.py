@@ -129,7 +129,9 @@ def run(cmd: list[str], env: dict, cwd: Path, name: str, out: Path, timeout: flo
     log(f"$ {subprocess.list2cmdline(cmd) if WIN else ' '.join(cmd)}   (in {cwd.name})")
     t0 = time.time()
     try:
-        p = subprocess.run(cmd, env=env, cwd=str(cwd), capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        # PWD as a shell would set it: OpenCode 1.19 takes its directory from $PWD, not the process's cwd
+        p = subprocess.run(cmd, env={**env, "PWD": str(cwd)}, cwd=str(cwd), capture_output=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL)
         code, so, se = p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired as e:
         code, so, se = -999, e.stdout or b"", (e.stderr or b"") + b"\n[run_e2e: timed out]"
@@ -362,6 +364,10 @@ def e_label(e: Env) -> str:
 
 
 def main():
+    try:   # a Windows console / CI log may be cp1252: never die printing moth's check marks
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--harness", nargs="+", default=list(HARNESSES))
     ap.add_argument("--soft", nargs="*", default=[], help="harnesses whose failure or absence doesn't fail the run")

@@ -6,7 +6,7 @@ Starts tests/e2e/fake_moth.py (serve.py's real handler; token in a scratch home)
 `python -m moth.pet --no-server --no-wander` against it (a real window: no QT_QPA_PLATFORM=offscreen), posts one
 Claude Code turn to /api/agent as the Stop hook would, and takes full-screen screenshots before and after (Windows:
 .NET CopyFromScreen via PowerShell; macOS: screencapture; elsewhere: Qt's screen grab). The pet sits in the
-bottom-right corner, so the bubble ("moth> heard moth-repo: ...", captioned "claude · moth-repo") and the tray area
+bottom-right corner, so the bubble ("heard moth-repo: ...", captioned "claude · moth-repo") and the tray area
 should both be in the shot. Writes DIR/pet-*.png, DIR/pet.log and DIR/fake_moth.log; exit 1 if the pet died.
 """
 from __future__ import annotations
