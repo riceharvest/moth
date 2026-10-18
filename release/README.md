@@ -146,10 +146,15 @@ pip install huggingface_hub                                          # for the `
 hf download darioooooo0o/moth-112m --local-dir moth-112m
 pip install torch --index-url https://download.pytorch.org/whl/cpu   # CPU build; skip if you already have torch
 pip install -r moth-112m/code/requirements.txt PySide6               # tokenizers, safetensors, numpy; PySide6: the pet
-cd moth-112m/code && python -m moth.pet
+cd moth-112m/code && python -m moth setup
 ```
 
-That's the one command: a small moth flies around your desktop and says moth's lines in a speech bubble. It wakes
+`python -m moth setup` takes you from the install to a running moth. It checks the packages (and prints the exact pip
+command for anything missing) and that the weights downloaded completely. It hooks moth into the coding agents it
+finds (it backs up their configs first), offers to start the pet when you log in, and starts it now. It asks before
+each step. `--yes` takes the defaults, `--dry-run` only shows the plan, and running it again only offers what's
+still missing. After that, `python -m moth.pet` is the one command: a small moth flies around your desktop and says
+moth's lines in a speech bubble. It wakes
 moth's server by itself (on the CPU; it dozes with "waking up…" while the model loads) and puts it to sleep again
 when you quit the pet. Click the moth to talk to it; right-click for the chat page (`http://127.0.0.1:4747`), mute,
 sleep and quit. If a moth server is already running, the pet just uses it. Python 3.10+.
@@ -163,8 +168,8 @@ the chat page in your browser). Start it before the pet and the pet uses it.
   The server uses about 0.8 GB of RAM: the Engram tables stay in bf16, memory-mapped from `model.safetensors`, and
   the OS reads in only the rows moth uses. `--device cuda` or `--device xpu` work with `python -m moth` (the pet
   passes server flags on: `python -m moth.pet -- --device xpu`). Speed and the `--quant` flag: see below.
-- Coming soon: once moth is on PyPI, `pip install moth-companion` gives you the `moth` and `moth-pet` commands, and
-  moth downloads these weights from this repo on first run.
+- Coming soon: once moth is on PyPI, `pip install "moth-companion[pet]"` gives you the `moth` and `moth-pet`
+  commands, and `moth setup` downloads these weights from this repo (about 860 MB) and sets up the rest.
 - `python -m moth.cli` chats in the terminal instead.
 - moth's tools run in a tiny pure-Python shell that only knows `ls`, `cat`, `head`, `wc` and `echo`, plus a
   `write` tool, and can't leave the home folder. It runs no subprocess and needs no sandbox, so it works the same
@@ -237,6 +242,12 @@ reacts to the most interesting one, and keeps the sessions apart, so it doesn't 
   install them yourself.
 - **Update bubble.** Once a day the pet checks for a new moth and says so in a bubble. It never installs anything
   itself (`python -m moth config update_check off` turns the check off).
+- **"Your agent is done".** The moth hops as each reaction comes up, and right-click → "what did i miss" lists the
+  last 10 (harness · project · how long ago). More pet settings, with `python -m moth config KEY VALUE` (most are
+  in the right-click menu too): `hide_in_fullscreen on|off` (default on: hide while a game or video is fullscreen;
+  native Wayland can't tell, so there it never hides), `chirp on|off` (default off: a soft sound with the hop),
+  `muted_sources codex,pi|none` (no bubble or hop for those harnesses), `pet_screen <name>|any` (stay on one
+  screen), `quiet_hours 23:00-08:00|off` (no bubbles or sound, the moth dozes).
 - **moth as a Petdex pet.** `python -m moth.pet --export-petdex DIR` writes moth as a Petdex pet (`pet.json` and a
   sprite sheet) for other apps that show Petdex pets.
 - **Personality is in the weights, not the prompt.** The system prompt is short and fixed, and every training chat
@@ -246,6 +257,24 @@ reacts to the most interesting one, and keeps the sessions apart, so it doesn't 
 
 Details, caveats and what has been tested per harness:
 [`code/moth/integrations/README.md`](code/moth/integrations/README.md).
+
+## Swap the model
+
+One setting puts another model behind the pet and hooks. Options are a later moth, another small persona model, any
+small chat model with a chat template, or a local llama.cpp / Ollama / vLLM server:
+
+```bash
+python -m moth config model someone/persona-100m                       # an HF repo id or a weights folder
+python -m moth config model "openai:http://127.0.0.1:11434/v1#qwen3:0.6b"  # an OpenAI-compatible local server
+python -m moth config model default                                    # back to moth
+```
+
+- **`moth.json`.** A file next to the weights sets the backend, character name, system prompt, how agent messages
+  are shown, and sampling. A folder without one runs exactly as moth-112m always has.
+- **transformers models.** These need `pip install "moth-companion[transformers]"`.
+- **Privacy.** An `openai:` endpoint that isn't localhost gets everything moth sees, and moth and `moth doctor`
+  warn about it.
+- **More.** [`code/moth/docs/MODEL_BACKENDS.md`](code/moth/docs/MODEL_BACKENDS.md) has the details.
 
 ## Updating
 
@@ -285,7 +314,8 @@ python -m moth update --rollback   # back to the version before the last update 
   It never gets your prompts to the agent, the agent's tool calls, or your files.
 - **Everything stays on your machine.** The server, the hooks, the pet, `moth tail` and the chat page use only
   127.0.0.1 (the page's fonts are bundled). moth goes online only to download the weights or an update from the
-  Hugging Face Hub.
+  Hugging Face Hub. The one exception is a model you swap in yourself (`moth config model openai:...`) on another
+  host. That server gets everything moth sees, and moth warns at startup and in `moth doctor`.
 - **Where it's stored: `~/.moth/`.** That holds the token, settings, a server log (status and errors, no chat text),
   and moth's home folder: its files, its diary, and anything it wrote down. The conversation itself lives only in
   RAM, and so does moth's memory of its own last 16 reactions (kept so it doesn't tell the same joke twice, also
@@ -397,6 +427,7 @@ see [Updating](#updating)).
 - `python -m moth update` and `python -m moth --version`.
 - `python -m moth hook` / `unhook` / `hooks` (installs the integrations with backups and merging), `doctor`,
   `autostart on|off|status` and `forget`.
+- `python -m moth setup`: one guided command from the install to a running moth.
 
 ## Files
 

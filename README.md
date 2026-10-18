@@ -22,7 +22,8 @@ weights are not in git.
 - **Weights: coming to Hugging Face** as [`darioooooo0o/moth-112m`](https://huggingface.co/darioooooo0o/moth-112m).
   They're not published yet. Until they are, a clone of this repo can run the tests but not moth itself.
 - **pip: not on PyPI yet.** Once it is, `pip install moth-companion` (or `"moth-companion[pet]"` for the desktop
-  pet) gives you the `moth` and `moth-pet` commands, and moth downloads its weights from the Hub on first run.
+  pet) gives you the `moth` and `moth-pet` commands; then `moth setup` downloads the weights from the Hub and
+  sets the rest up.
 
 The model card with the full details (example chats, how it was trained, eval numbers, limitations) is
 [`release/README.md`](release/README.md).
@@ -44,8 +45,14 @@ From a Hugging Face download (`hf download darioooooo0o/moth-112m --local-dir mo
 ```bash
 pip install torch --index-url https://download.pytorch.org/whl/cpu   # CPU build; skip if you have torch
 pip install -r moth-112m/code/requirements.txt PySide6               # PySide6 only for the pet
-cd moth-112m/code && python -m moth.pet                              # the desktop pet; it starts the server
+cd moth-112m/code && python -m moth setup                            # then this: hooks, autostart, starts the pet
 ```
+
+`python -m moth setup` (`moth setup` for pip installs) is the first thing to run after installing. It checks the
+packages and the weights (a pip install downloads them here, about 860 MB, if you say yes), hooks moth into the
+coding agents it finds, offers autostart at login, and starts the pet. It asks before each step, `--yes` takes the
+defaults, `--dry-run` only shows the plan, and running it again only offers what's still missing. Later,
+`python -m moth.pet` starts the pet by itself (it wakes the server).
 
 `python -m moth` runs just the server and prints hook snippets with your real paths. `python -m moth.cli` chats in
 the terminal, `python -m moth.tail` watches moth in a side terminal.
@@ -79,11 +86,27 @@ talk, right-click for the chat page, mute, sleep and quit. It can wear any [petd
 have installed (`--skin <id>`, or `python -m moth config pet_skin <id>` to keep it), and
 `--export-petdex DIR` writes moth as a Petdex pet. moth ships no third-party pets.
 
+When an agent finishes, the moth hops as its reaction comes up; right-click → "what did i miss" lists the last 10.
+Settings (`python -m moth config KEY VALUE`; the pet picks them up within 30 s, most are in its menu too):
+`hide_in_fullscreen` (on: hide while a game or video is fullscreen; not on native Wayland), `chirp` (off: a soft
+sound with the hop), `muted_sources` (e.g. `codex,pi`: no bubble for those harnesses), `pet_screen` (`any`, or the
+screen to stay on) and `quiet_hours` (e.g. `23:00-08:00`: no bubbles, the moth dozes).
+
+## Swap the model
+
+`python -m moth config model <folder | HF repo id | openai:URL#model | default>` puts another model behind the
+pet and hooks: a later moth, another small persona model, any small chat model through `transformers`
+(`pip install "moth-companion[transformers]"`), or a local llama.cpp / Ollama / vLLM server. A `moth.json` next to
+the weights sets the backend, character name, prompt, agent-card format and sampling. A folder without one runs
+exactly as before. `moth doctor` shows what's active. Details and examples:
+[`moth/docs/MODEL_BACKENDS.md`](moth/docs/MODEL_BACKENDS.md).
+
 ## Make your own character
 
 The personality is in the weights, not the prompt, so a new character means re-running the pipeline:
 [`moth/docs/OWN_CHARACTER.md`](moth/docs/OWN_CHARACTER.md). It needs an OpenAI-compatible teacher server and a
-CUDA or Intel XPU GPU for the fine-tune.
+CUDA or Intel XPU GPU for the fine-tune. Ship the result with a `moth.json` (its name, prompt and repo) and anyone
+can run it with `moth config model <your repo>`.
 
 ## Development
 
