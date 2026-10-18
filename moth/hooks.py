@@ -119,6 +119,26 @@ def hook_command(*parts: str) -> str:
     return shlex.join(parts)
 
 
+def ps_call(cmd: str) -> str:
+    """Codex on Windows runs a hook command through PowerShell: `powershell -NoProfile -Command <cmd>`, the session's
+    shell (codex-rs core/src/session/mod.rs build_hooks_config, core/src/shell.rs derive_exec_args, rust-v0.163.0).
+    There a line that starts with a quoted path is a string, not a call ("Unexpected token"), so an interpreter path
+    with a space (C:/Program Files/..., a venv under C:/Users/First Last) needs PowerShell's call operator `&` before
+    it. Seen on windows-latest (tests/e2e): without it Codex ran nothing. Not for Claude Code, whose Git Bash rejects &."""
+    return "& " + cmd if cmd.startswith('"') else cmd
+
+
+def harness_command(name: str, py: str | None = None) -> str:
+    """The hook command for integrations/<name> as `moth hook` writes it, per harness: Codex's gets ps_call on Windows."""
+    cmd = hook_command(py or sys.executable, script(name))
+    return ps_call(cmd) if _WIN and name == "codex.py" else cmd
+
+
+def _uncalled(h: dict, name: str) -> bool:
+    """Windows: a Codex hook whose command starts with a quoted path and no `&`, which PowerShell won't run."""
+    return _WIN and name == "codex.py" and str(h.get("command", "")).lstrip().startswith('"')
+
+
 def _backslashed(h: dict) -> bool:
     """Windows: a moth hook written with backslash paths (older moth), which Git Bash would mangle."""
     return _WIN and "\\" in str(h.get("command", ""))
@@ -338,6 +358,9 @@ def json_hook_status(path: str, name: str) -> tuple[str, str]:
         if any(_backslashed(h) for _, h, _ in entries):
             return "outdated", (f"Stop hook in {short(path)} has backslash paths, which Git Bash mangles; "
                                 f"`{prog()} hook` rewrites them with forward slashes")
+        if any(_uncalled(h, name) for _, h, _ in entries):
+            return "outdated", (f"Stop hook in {short(path)} starts with a quoted path, which PowerShell (Codex's hook "
+                                f"shell on Windows) doesn't run; `{prog()} hook` adds its call operator &")
         extra = f" ({len(entries)} moth hooks: duplicates)" if len(entries) > 1 else ""
         return "installed", f"Stop hook in {short(path)}{extra}"
     if "other" in kinds:
@@ -351,12 +374,13 @@ def plan_json_hook(plan: Plan, path: str, name: str, what: str) -> None:
         plan.error = err
         return
     old = _read(path)
-    want = hook_command(sys.executable, script(name))
+    want = harness_command(name)
     entries = _stop_entries(data, name)
     here = any(_where(p, name) == "this" for _, _, p in entries)
     background = [h for _, h, _ in entries if h.get("async")]
     slashes = [h for _, h, _ in entries if _backslashed(h)]
-    if here and not background and not slashes:
+    uncalled = [h for _, h, _ in entries if _uncalled(h, name)]
+    if here and not background and not slashes and not uncalled:
         plan.nothing = f"already installed ({what} in {short(path)})"
         return
     if entries:   # moth's hook from a moved / older install, or an older background one: fix it in place
@@ -369,6 +393,11 @@ def plan_json_hook(plan: Plan, path: str, name: str, what: str) -> None:
             for h in slashes:
                 h["command"] = h["command"].replace("\\", "/")
             changes.append("forward slashes in its paths (Git Bash mangles backslashes)")
+        if here and uncalled:
+            for h in uncalled:
+                h["command"] = ps_call(h["command"].strip())
+            changes.append("PowerShell's call operator & before its quoted interpreter path (Codex runs hooks "
+                           "through PowerShell on Windows)")
         for h in background:
             del h["async"]
             h["timeout"] = HOOK_TIMEOUT

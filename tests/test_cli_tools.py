@@ -478,6 +478,32 @@ class WindowsPathsInConfigs(TempHome):
                 self.assertTrue(runs(fixed, self.script("claude_code.py").replace("\\", "/")), fixed)
                 self.assertEqual(H.status("claude-code")["state"], "installed")
 
+    def test_windows_codex_hook_gets_powershell_call_operator(self):
+        """Codex runs hooks through PowerShell on Windows, where a quoted first path is a string, not a call (seen in
+        tests/e2e on windows-latest with a venv under "py env": the hook never ran). Claude Code's stays plain."""
+        with unittest.mock.patch.object(H, "_WIN", True):
+            self.assertTrue(H.harness_command("codex.py").startswith('& "C:/Program Files/Python312/python.exe" '))
+            self.assertTrue(H.harness_command("claude_code.py").startswith('"C:/Program Files/'))
+            self.assertEqual(H.ps_call("C:/Python/python.exe x.py"), "C:/Python/python.exe x.py")   # unquoted: as is
+            p = self.write(".codex/hooks.json", "{}")
+            rc, out = self.hook("codex", "--yes")
+            self.assertEqual(rc, 0, out)
+            cmd = json.loads(p.read_text())["hooks"]["Stop"][0]["hooks"][0]["command"]
+            self.assertTrue(cmd.startswith("& "), cmd)
+            self.assertTrue(runs(cmd, self.script("codex.py").replace("\\", "/")), cmd)
+            with unittest.mock.patch.object(H, "_where", return_value="this"):
+                self.assertEqual(H.status("codex")["state"], "installed")
+                rc, out = self.hook("codex", "--yes")   # installing twice changes nothing (keeps Codex's trust)
+                self.assertIn("already installed", out)
+                # a hook an older moth wrote without the & is outdated, and `moth hook` adds it
+                p.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [H.hook_entry(cmd[2:])]}]}}))
+                self.assertEqual(H.status("codex")["state"], "outdated")
+                rc, out = self.hook("codex", "--yes")
+                self.assertEqual(rc, 0, out)
+                self.assertIn("call operator", out)
+                self.assertEqual(json.loads(p.read_text())["hooks"]["Stop"][0]["hooks"][0]["command"], cmd)
+                self.assertEqual(H.status("codex")["state"], "installed")
+
     def test_toml_escapes(self):
         for body, want in ((r"a\\b", "a\\b"), (r"tab\there", "tab\there"), (r"\u00e9\U0001F98B", "\u00e9\U0001F98B"),
                            (r"\e[0m", "\x1b[0m"), (r'say \"hi\"', 'say "hi"'), (r"C:\Users\x", r"C:\Users\x"),
