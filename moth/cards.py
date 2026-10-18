@@ -10,7 +10,8 @@ Card schema (a plain dict, JSON-serialisable; a card file is one such object):
   kind     str | None     what it is, with an article ("a houseplant"); None for a plain human or a blank card
   home     str | None     where it lives, as it follows "you live " ("on a kitchen windowsill")
   traits   list[str]      0-3 second-person facts ("you love puns", "you're scared of thunder")
-  refs     list[str]      words that count as an identity reference (metrics: identity_ref %), lowercase stems
+  refs     list[str]      words that count as an identity reference (metrics: identity_ref %): whole words (plural
+                          ok); a trailing * marks a stem ("waddl*"). Everyday words (walk, water, rain...) never count
   folders  list[str]      folders of its home ~ (generic by default; the moth card keeps its six)
 
 student_system(card) renders the student prompt; for MOTH_CARD it is byte-identical to the old fixed prompt, so the
@@ -44,8 +45,8 @@ STUDENT_TAIL = ("your home folder is ~. talk with your friend. use tools to look
 MOTH_LORE = ["your great great great grandma was the first computer bug, a real moth found in a computer in 1947",
              "you're scared of the vacuum cleaner", "you like lamps and blinking lights",
              "you think butterflies are the fancy ones"]
-MOTH_REFS = ["moth", "wing", "lamp", "light", "glow", "dust", "crumb", "wool", "sock", "fan", "grandma", "1947",
-             "vacuum", "gpu", "graphics card", "butterfl", "flutter", "cocoon", "the card"]
+MOTH_REFS = ["moth", "wing", "lamp", "lights", "glow", "dust", "crumb", "wool", "sock", "fan", "grandma", "1947",
+             "vacuum", "gpu", "graphics card", "butterfl*", "flutter", "cocoon", "the card"]
 MOTH_CARD = {"id": "moth", "name": "moth", "kind": None, "home": "on a graphics card", "traits": [],
              "refs": MOTH_REFS, "folders": MOTH_FOLDERS, "about": "a small moth"}
 BLANK_CARD = {"id": "blank", "name": None, "kind": None, "home": None, "traits": [], "refs": [],
@@ -58,7 +59,7 @@ KINDS = [
     ("a houseplant", ["on a kitchen windowsill", "in a pot by the bookshelf", "in a greenhouse"],
      ["fern", "basil", "sprout", "leafy", "ivy"], ["plant", "leaf", "leaves", "pot", "water", "soil", "root", "sun"]),
     ("a little robot", ["on a workbench", "in a toy shop", "inside an old laptop"],
-     ["bolt", "beep", "gizmo", "rivet", "unit 7"], ["robot", "beep", "battery", "circuit", "bolt", "gear", "charg"]),
+     ["bolt", "beep", "gizmo", "rivet", "unit 7"], ["robot", "beep", "battery", "circuit", "bolt", "gear", "charg*"]),
     ("a ghost", ["in an old laptop", "in a dusty attic", "in a library at night"],
      ["boo", "whisper", "casper", "misty", "wisp"], ["ghost", "haunt", "boo", "spooky", "float", "invisible"]),
     ("a toaster", ["on a kitchen counter", "in a camper van", "in a student flat"],
@@ -70,7 +71,7 @@ KINDS = [
     ("a teapot", ["on a cafe shelf", "in a grandmother's kitchen", "in a picnic basket"],
      ["earl", "chamomile", "spout", "pippa", "oolong"], ["tea", "teapot", "spout", "steam", "kettle", "brew"]),
     ("a penguin", ["at a zoo", "on an iceberg", "in a snowy town"],
-     ["pebble", "waddles", "flipper", "oscar", "pingu"], ["penguin", "ice", "fish", "waddl", "snow", "flipper"]),
+     ["pebble", "waddles", "flipper", "oscar", "pingu"], ["penguin", "ice", "fish", "waddl*", "snow", "flipper"]),
     ("a duck", ["on a pond in a park", "in a bathtub", "by a canal"],
      ["quackers", "dilly", "bill", "puddle", "waddle"], ["duck", "quack", "pond", "feather", "bread", "beak"]),
     ("a frog", ["by a pond", "in a terrarium", "in a rainy garden"],
@@ -78,11 +79,11 @@ KINDS = [
     ("a tiny dragon", ["in a teacup", "on a bookshelf", "in a castle made of cardboard"],
      ["ember", "smudge", "sparky", "toast", "flicker"], ["dragon", "fire", "flame", "scale", "smoke", "treasure"]),
     ("a hamster", ["in a cage with a wheel", "in a classroom", "in a shoebox house"],
-     ["peanut", "nibbles", "button", "chip", "hazel"], ["hamster", "wheel", "seed", "cheek", "nibbl", "cage"]),
+     ["peanut", "nibbles", "button", "chip", "hazel"], ["hamster", "wheel", "seed", "cheek", "nibbl*", "cage"]),
     ("a library book", ["on a high shelf", "in a school library", "in a backpack"],
      ["chapter", "dewey", "page", "margot", "folio"], ["book", "page", "chapter", "shelf", "library"]),
     ("a jellyfish", ["in an aquarium", "in a warm sea", "in a rock pool"],
-     ["wobble", "jelly", "glimmer", "squish", "medusa"], ["jelly", "sea", "wobbl", "tentacle", "float", "ocean"]),
+     ["wobble", "jelly", "glimmer", "squish", "medusa"], ["jelly", "sea", "wobbl*", "tentacle", "float", "ocean"]),
     ("a mushroom", ["in a damp forest", "under an old log", "in a fairy ring"],
      ["morel", "button", "shroomy", "cap", "truffle"], ["mushroom", "forest", "spore", "damp", "log", "moss"]),
     ("a rubber duck", ["on the edge of a bath", "on a programmer's desk", "in a toy box"],
@@ -98,7 +99,7 @@ KINDS = [
     ("a bee", ["in a hive in an orchard", "on a city rooftop", "in a flower garden"],
      ["buzz", "honey", "bumble", "pollen", "bea"], ["bee", "buzz", "honey", "flower", "hive", "pollen"]),
     ("a cactus", ["on a sunny desk", "in a desert", "in an office"],
-     ["spike", "prickles", "sandy", "cacty", "pokey"], ["cactus", "spike", "prickl", "desert", "water", "sun"]),
+     ["spike", "prickles", "sandy", "cacty", "pokey"], ["cactus", "spike", "prickl*", "desert", "water", "sun"]),
     ("a lamp", ["on a bedside table", "in a reading corner", "on an office desk"],
      ["lumen", "glowy", "bulb", "shade", "flick"], ["lamp", "light", "bulb", "glow", "switch", "shade"]),
     ("an owl", ["in an oak tree", "in a barn", "in a clock tower"],
@@ -120,7 +121,7 @@ KINDS = [
     ("a paper plane", ["on a school desk", "on top of a wardrobe", "in a park"],
      ["swoosh", "folds", "glider", "zoom", "a4"], ["plane", "paper", "fly", "fold", "wing", "glide"]),
     ("a kettle", ["in a busy office kitchen", "in a cottage", "in a hostel"],
-     ["whistle", "steamy", "boil", "copper", "ketty"], ["kettle", "boil", "steam", "tea", "water", "whistl"]),
+     ["whistle", "steamy", "boil", "copper", "ketty"], ["kettle", "boil", "steam", "tea", "water", "whistl*"]),
     ("a pigeon", ["on a train station roof", "in a city square", "on a balcony"],
      ["coo", "gus", "pidge", "crumb", "nugget"], ["pigeon", "coo", "crumb", "feather", "wing", "bread"]),
     ("a tiny alien", ["in a shoebox spaceship", "behind the fridge", "on the moon"],
@@ -138,12 +139,12 @@ HUMAN_NAMES = ["sam", "noor", "kai", "fenna", "lars", "ivy", "tomas", "yara", "m
                "jun", "ada", "theo", "rosa", "ben", "maya", "olu", "freya", "dev", "ines", "max", "zoe"]
 HELDOUT_KINDS = [
     ("a hedgehog", ["under a hedge in a back garden", "in a leaf pile"], ["hazel", "prickle"],
-     ["hedgehog", "spike", "prickl", "leaf", "leaves", "hedge"]),
+     ["hedgehog", "spike", "prickl*", "leaf", "leaves", "hedge"]),
     ("a lighthouse keeper's cat", ["in a lighthouse"], ["whiskers"], ["cat", "lighthouse", "purr", "paw"]),
     ("a weather vane", ["on a church roof"], ["gusty"], ["wind", "roof", "weather", "spin", "north"]),
     ("a submarine", ["at the bottom of a lake"], ["bubbles"], ["submarine", "lake", "water", "deep", "periscope"]),
     ("a cardboard box", ["in a garage"], ["boxy"], ["box", "cardboard", "tape", "garage"]),
-    ("a strawberry", ["in a fruit bowl"], ["berry"], ["strawberr", "berry", "fruit", "bowl", "seed"]),
+    ("a strawberry", ["in a fruit bowl"], ["berry"], ["strawberr*", "berry", "fruit", "bowl", "seed"]),
     ("a koala", ["in a eucalyptus tree"], ["gumnut"], ["koala", "tree", "eucalyptus", "leaf", "leaves"]),
     ("a lava lamp", ["on a teenager's desk"], ["blob"], ["lava", "lamp", "blob", "glow", "goo"]),
 ]
@@ -241,7 +242,8 @@ def _card(i: int, rng: random.Random, kinds, names_human, traits) -> dict:
 def build_pool(n: int = 800, seed: int = 0) -> list[dict]:
     """n training cards (deterministic). Names of held-out cards never appear here."""
     rng = random.Random(seed)
-    held_names = {nm for _, _, names, _ in HELDOUT_KINDS for nm in names} | {nm for nm, _ in HELDOUT_HUMAN}
+    held_names = ({nm for _, _, names, _ in HELDOUT_KINDS for nm in names} | {nm for nm, _ in HELDOUT_HUMAN}
+                  | EVAL_FRIEND_NAMES)
     humans = [x for x in HUMAN_NAMES if x not in held_names]
     kinds = [(k, h, [x for x in ns if x not in held_names] or ns, r) for k, h, ns, r in KINDS]
     return [_card(i, rng, kinds, humans, TRAITS) for i in range(n)]
@@ -258,6 +260,18 @@ def heldout_cards() -> list[dict]:
                     "traits": [TRAITS[(5 * j + 11) % len(TRAITS)]], "refs": [], "folders": GENERIC_FOLDERS})
     return out
 
+
+# names the eval's friends use (probes, interview missions): never a card's name, or recall checks get muddy
+EVAL_FRIEND_NAMES = {"rosa", "biscuit", "noor", "luna", "mila", "joris", "sam", "kai", "fenna", "lars", "ivy", "tomas",
+                     "yara", "pixel", "kevin", "dot", "sushi", "wasabi", "bram", "lena"}
+# ref words too common to mean "it talks about itself" ("i went for a walk" is not dog talk)
+GENERIC_REFS = {"water", "sun", "sleep", "slow", "night", "hot", "rain", "sky", "air", "tree", "snow", "fish", "garden",
+                "flower", "walk", "float", "pop", "sea", "ocean", "wave", "forest", "log", "damp", "seed", "cheek", "fire",
+                "smoke", "scale", "foot", "feet", "pair", "smooth", "milk", "string", "swim", "fly", "flies", "paper",
+                "bread", "space", "earth", "hat", "nap", "soup", "switch", "leg", "spin", "deep", "wind", "weather",
+                "fluffy", "ice", "fold", "read", "lake", "roof", "box", "tape", "bowl", "fruit", "page", "shelf", "sniff",
+                "bake", "bath", "beach", "stone", "rock", "branch", "boil", "bone", "invisible", "spooky", "glide",
+                "leaves", "light"}
 
 _POOL: list[dict] = []
 SHARES = {"moth": 0.08, "blank": 0.10}   # the rest: a pool card
@@ -299,8 +313,11 @@ def load_card(spec: str | dict | None) -> dict:
 
 
 def ref_regex(card: dict | None) -> re.Pattern | None:
-    """Identity-reference words of a card as one regex (word starts, so 'leaf' hits 'leafy'), or None."""
-    refs = list((card or MOTH_CARD).get("refs") or [])
+    """Identity-reference words of a card as one regex, or None. Whole words with an optional plural ("cat" hits
+    "cats", not "catch"); "waddl*" is a stem; GENERIC_REFS never count."""
+    refs = {r.lower() for r in (card or MOTH_CARD).get("refs") or []} - GENERIC_REFS
     if not refs:
         return None
-    return re.compile(r"\b(?:" + "|".join(re.escape(r) for r in sorted(set(refs), key=len, reverse=True)) + r")", re.I)
+    alts = [re.escape(r[:-1]) + r"\w*" if r.endswith("*") else re.escape(r) + r"(?:s|es)?"
+            for r in sorted(refs, key=len, reverse=True)]
+    return re.compile(r"\b(?:" + "|".join(alts) + r")\b", re.I)

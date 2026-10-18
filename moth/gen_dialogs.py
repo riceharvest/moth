@@ -29,7 +29,7 @@ from moth import _tools as tools  # noqa: E402  (vendored copy of tiny_agent/too
 from moth.agent import (AGENT_CHAT_REMIND, AGENT_LENGTHS, AGENT_PROMPT, AGENT_REMIND,  # noqa: E402
                         AGENT_RULES, AGENT_SCENARIOS, AGENT_TAG, AGENT_TASKS, AGENT_USER_PERSONAS, HARNESS_STYLES,
                         OUTCOMES, agent_turn)
-from moth.cards import build_pool, describe, display_name, ref_regex, sample_card  # noqa: E402
+from moth.cards import build_pool, describe, display_name, sample_card  # noqa: E402
 from moth.gist import ASKED, identity_ref  # noqa: E402
 from moth.home import load_pool, sample_home  # noqa: E402
 from moth.persona import (CARD_FILES_PROMPT, FILE_POOL_PROMPT, FOLDER_HINTS, FOLDERS, HOME_SCENARIOS,  # noqa: E402
@@ -265,9 +265,9 @@ def bash_cmd(tc) -> str:
 
 
 def id_allowed(u: str, card: dict | None) -> bool:
-    """The friend asked who/what it is or used one of the card's own words: a short identity answer fits."""
-    rx = ref_regex(card) if card is not None else None
-    return bool(ASKED.search(u) or (rx and rx.search(u)))
+    """The friend asked who/what it is: a short identity answer fits. (A card word in the friend's line only makes
+    that word "prompted" for identity_ref; it does not invite identity talk.)"""
+    return bool(ASKED.search(u))
 
 
 def teacher_view(u: str, remind: str | None = None, extra: str = "", card: dict | None = None) -> str:

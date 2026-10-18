@@ -6,8 +6,8 @@
 An input is an eval results.json (its chats, old judge scores dropped) or teacher dialogs as path:N[:type], which
 samples N chats that pass build_sft's filter (lowercased, as trained on) and turns them into eval records (cat =
 chat type): a ceiling for the student's scores. Writes report.md / transcripts.md / results.json to --out.
-Scores with moth.eval's current judge prompt (v2: strict character, grounding = moth's own home only, back_and_forth)
-and adds the deterministic metrics (moth.metrics). To compare two checkpoints, prefer python -m moth.pairwise.
+Labels every reply ON/OFF gist (moth.gist) and scores with moth.eval's current judge prompt (v3: gist-first,
+identity as seasoning), and adds the deterministic metrics (moth.metrics). To compare two checkpoints, prefer python -m moth.pairwise.
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ import random
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from moth.eval import judge_all, report  # noqa: E402
+from moth.eval import gist_all, judge_all, report  # noqa: E402
 
 
 def dialog_record(d: dict, msgs: list[dict]) -> dict:
@@ -35,8 +35,11 @@ def dialog_record(d: dict, msgs: list[dict]) -> dict:
             turns[-1]["events"] += [{"tool": c["name"], "args": c["arguments"], "result": res}
                                     for c, res in zip(calls, m["results"])]
     ev = [e for t in turns for e in t["events"]]
-    return {"cat": d["type"], "name": f"teacher_{d['type']}", "seed": d["seed"], "turns": turns, "flags": {},
-            "check": None, "tools": sum("tool" in e for e in ev), "n_replies": sum("say" in e for e in ev)}
+    r = {"cat": d["type"], "name": f"teacher_{d['type']}", "seed": d["seed"], "turns": turns, "flags": {},
+         "check": None, "tools": sum("tool" in e for e in ev), "n_replies": sum("say" in e for e in ev)}
+    if d.get("card"):   # identity-card chats: judge and label them as that card, not as moth
+        r["card"], r["card_id"] = d["card"], d["card"].get("id")
+    return r
 
 
 def from_dialogs(spec: str, rng: random.Random) -> list[dict]:
@@ -73,7 +76,9 @@ def main():
         else:
             results += from_dialogs(src, rng)
     os.makedirs(a.out, exist_ok=True)
-    judge_all(results, a.judge_url, {"auto": None, "on": True, "off": False}[a.judge_think])
+    think = {"auto": None, "on": True, "off": False}[a.judge_think]
+    gist_all(results, a.judge_url, think)   # per-reply on_gist: the teacher ceiling for moth.eval's headline
+    judge_all(results, a.judge_url, think)
     print(report(results, a.out, a.label or "rejudge " + " ".join(a.inputs)))
 
 

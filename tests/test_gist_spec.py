@@ -218,9 +218,28 @@ def test_identity_ref():
     assert not gist.identity_ref("i'm moth, i live on a graphics card", m, "who are you?")
     assert gist.identity_ref("i'm just a little guy, i don't know", m, "what's 2+2")
     plant = cards.load_card({"id": "p", "name": "fern", "kind": "a houseplant", "refs": ["leaf", "leaves", "pot", "soil"]})
-    assert gist.identity_ref("my leaves are droopy today", plant, "how are you")
+    assert gist.identity_ref("my pot is too small today", plant, "how are you")
     assert not gist.identity_ref("my lamp is on", plant, "hi")   # moth words don't count for a plant
-    assert gist.identity_ref_rate([("hi", "hi!"), ("yo", "my leaves hurt")], plant) == 0.5
+    assert gist.identity_ref_rate([("hi", "hi!"), ("yo", "my soil is dry")], plant) == 0.5
+
+
+NEUTRAL = ["i've been so tired", "i hope it works", "a walk sounds nice", "go team", "that is popular",
+           "i like ice cream", "the website is down", "catch it!", "my login broke", "i love potatoes", "what a season",
+           "the fireworks were loud", "is it hot outside?", "did it rain?", "a fancy hat", "that sounds fun",
+           "the box is still booting", "she leaves at five", "the light was green"]
+
+
+def test_identity_ref_ignores_everyday_words_for_every_card():
+    for c in cards.build_pool() + cards.heldout_cards() + [cards.MOTH_CARD, cards.BLANK_CARD]:
+        hits = [n for n in NEUTRAL if gist.identity_ref(n, c, "hello")]
+        assert not hits, (c["id"], c.get("kind"), hits)
+
+
+def test_card_words_in_the_friends_line_do_not_invite_identity_talk():
+    pytest.importorskip("openai")
+    from moth import gen_dialogs as G
+    dog = next(c for c in cards.build_pool() if c.get("kind") == "a dog")
+    assert G.teacher_view("i went for a walk with my dog", card=dog).endswith(G.TALK_REMIND)
 
 
 def test_follows_card_and_probes_for_card():

@@ -1,7 +1,7 @@
 """Test moth like a user would: scripted multi-turn probes through the real chat engine (moth.serve.Moth).
 
   python -m moth.eval --model runs/sft1/model --samples 3 --device cuda [--judge-url http://127.0.0.1:8000/v1] [--out DIR]
-      [--cards moth,heldout:0,heldout:4,heldout:8]
+      [--cards moth,heldout:0,heldout:4,heldout:8]   (default: moth + a hedgehog, a cardboard box and a human)
 
 Probes live in moth/probes.py (scripted chats, "what X" follow-ups built from moth's own reply, recall at 5/10/20
 turns, the user's own typing style, held-out real agent final messages). Every (probe, sample) gets a seed from a
@@ -366,7 +366,7 @@ def main():
     ap.add_argument("--judge-think", choices=["auto", "on", "off"], default="auto",
                     help="judge reasons first (LFM2.5) or not (Qwen); auto = from /v1/models")
     ap.add_argument("--only", default=None, help="comma-separated categories")
-    ap.add_argument("--cards", default="moth",
+    ap.add_argument("--cards", default="moth,heldout:0,heldout:4,heldout:8",
                     help="comma-separated identity cards to run the probes with: moth, blank, heldout:<i>, a card "
                          "JSON file (held-out cards never appear in training)")
     ap.add_argument("--no-gist", action="store_true", help="with --judge-url: skip the per-reply on_gist labels")
