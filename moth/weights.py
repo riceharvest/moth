@@ -49,8 +49,12 @@ def cache_dir(repo_id: str | None = None) -> str:
     return os.path.join(base, *(repo_id or repo()).split("/"))
 
 
+def missing(folder: str) -> list[str]:
+    return [f for f in FILES if not os.path.isfile(os.path.join(folder, f))]
+
+
 def present(folder: str) -> bool:
-    return all(os.path.isfile(os.path.join(folder, f)) for f in FILES)
+    return not missing(folder)
 
 
 def ensure(folder: str | None = None, repo_id: str | None = None, revision: str | None = None) -> str:
@@ -61,33 +65,67 @@ def ensure(folder: str | None = None, repo_id: str | None = None, revision: str 
     if present(folder):
         return folder
     revision = revision or pinned_revision()
+    from moth import config   # stdlib only
+    if config.offline():   # MOTH_OFFLINE / HF_HUB_OFFLINE: nothing goes to the network, not even the first download
+        raise SystemExit(f"moth: the model isn't downloaded yet ({', '.join(missing(folder))} missing in {folder}) and "
+                         "offline mode is on (HF_HUB_OFFLINE / MOTH_OFFLINE). Unset it for the first run, or pass "
+                         "--model and --tokenizer.")
     try:
         import huggingface_hub as hub
     except ImportError:
         raise SystemExit("moth needs huggingface_hub to download its weights:  pip install -U huggingface_hub")
     try:
-        sha = hub.HfApi().model_info(repo_id, revision=revision).sha   # pin the download to one commit
+        info = hub.HfApi().model_info(repo_id, revision=revision)
+        sha = info.sha   # pin the download to one commit
     except Exception as e:
         raise SystemExit(f"moth: can't get {repo_id}{'@' + revision if revision else ''} from the Hugging Face Hub "
                          f"({type(e).__name__}: {_first_line(e)}). Check your connection, or set MOTH_REPO / "
                          "MOTH_REVISION, or pass --model and --tokenizer.")
     size = f" ({SIZE_HINT})" if repo_id == REPO_ID else ""
-    print(f"moth: first run, downloading the model{size} from https://huggingface.co/{repo_id} "
+    endpoint = (os.environ.get("HF_ENDPOINT") or "https://huggingface.co").rstrip("/")
+    print(f"moth: first run, downloading the model{size} from {endpoint}/{repo_id} "
           f"(revision {sha[:12]})\n      into {folder}  (only once; `moth update` refreshes it)", file=sys.stderr,
           flush=True)
     os.makedirs(folder, exist_ok=True)
+    drop_orphans(folder)   # what killed first runs left
     try:
         hub.snapshot_download(repo_id=repo_id, revision=sha, local_dir=folder, allow_patterns=list(FILES))
     except Exception as e:
         raise SystemExit(f"moth: download failed ({type(e).__name__}: {_first_line(e)}); run moth again to resume")
-    if not present(folder):
-        missing = [f for f in FILES if not os.path.isfile(os.path.join(folder, f))]
-        raise SystemExit(f"moth: {repo_id}@{sha[:12]} has no {', '.join(missing)}; is MOTH_REPO a moth repo?")
+    gone = missing(folder)
+    if gone:   # huggingface_hub can return quietly when the Hub stops answering halfway
+        on_hub = {s.rfilename for s in (info.siblings or [])}
+        if any(f not in on_hub for f in gone) and on_hub:
+            raise SystemExit(f"moth: {repo_id}@{sha[:12]} has no {', '.join(f for f in gone if f not in on_hub)}; "
+                             "is MOTH_REPO a moth repo?")
+        raise SystemExit(f"moth: download incomplete ({', '.join(gone)} missing; the Hub stopped answering?); "
+                         "run moth again to resume")
     with open(os.path.join(folder, REVISION_FILE), "w") as f:
         json.dump({"revision": sha, "files": sorted(FILES)}, f, indent=1)
         f.write("\n")
     print("moth: model downloaded", file=sys.stderr, flush=True)
     return folder
+
+
+def drop_orphans(folder: str, min_age: float = 300.0) -> int:
+    """Delete huggingface_hub's leftover partial downloads under folder/.cache/huggingface/download/: since hub 1.x
+    names them <file>.<etag>.<random>.incomplete, a killed download is never resumed and its part (up to the whole
+    model) would stay forever. Only ones untouched for min_age seconds (a live download writes all the time); the
+    older <file>.<etag>.incomplete form is left alone (huggingface_hub resumes it). Returns how many went."""
+    import re
+    import time
+    base, n = os.path.join(folder, ".cache", "huggingface", "download"), 0
+    for d, _, files in os.walk(base):
+        for f in files:
+            if re.fullmatch(r"[\w=-]+\.[0-9a-f]+\.[0-9a-f]{8}\.incomplete", f):
+                p = os.path.join(d, f)
+                try:
+                    if time.time() - os.path.getmtime(p) >= min_age:
+                        os.remove(p)
+                        n += 1
+                except OSError:
+                    pass
+    return n
 
 
 def ensure_default(model_dir: str) -> None:

@@ -5,7 +5,9 @@
 Covers --check (up to date / update available), an in-place update that leaves ~/.moth alone, backup + rollback,
 files the new version dropped (removed, restored on rollback; user files kept), the refusal only while a moth from
 this install runs (serve.py's real /api/health handler and pidfile, torch faked out), the offline path, the
-missing-huggingface_hub hint and `python -m moth --help`.
+missing-huggingface_hub hint and `python -m moth --help`. Regressions: a download that "succeeds" without the files,
+staged downloads resumed, failed and crashed swaps undone, edited files, offline switches, the update lock, disk
+space, an interrupted `hf download` completed. tests/test_update_e2e.py runs the same against a fake Hub over HTTP.
 """
 from __future__ import annotations
 
@@ -331,7 +333,7 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual(self.tree(), V1)
 
     def test_download_failure_restores(self):
-        def broken(repo_id, local_dir, revision=None):
+        def broken(repo_id, local_dir, revision=None, allow_patterns=None):
             (Path(local_dir) / "code/moth/serve.py").write_bytes(b"# half\n")
             (Path(local_dir) / "code/moth/new.py").write_bytes(b"# half\n")
             raise ConnectionError("connection reset")
@@ -356,9 +358,205 @@ class UpdateTest(unittest.TestCase):
 
     def test_not_a_download(self):
         (self.root / "model.safetensors").unlink()
+        (self.root / U.REVISION_FILE).unlink()   # no weights and no sign of a download: leave the folder alone
         code, out = self.run_cli("--yes")
         self.assertEqual(code, 1)
         self.assertIn("isn't a Hugging Face download", out)
+
+    def test_completes_an_interrupted_download(self):   # `hf download` killed before model.safetensors arrived
+        (self.root / U.REVISION_FILE).unlink()
+        for path in V1:
+            meta = self.root / ".cache/huggingface/download" / (path + ".metadata")
+            meta.parent.mkdir(parents=True, exist_ok=True)
+            meta.write_text("sha1\netag\n0\n")
+        (self.root / "model.safetensors").unlink()
+        self.hub.head = "sha1"
+        code, out = self.run_cli("--check")
+        self.assertEqual(code, 10, out)
+        self.assertIn("files missing from this download", out)
+        self.assertEqual(self.run_cli("--yes")[0], 0)
+        self.assertEqual(self.tree(), V1)
+        self.assertEqual(self.hub.fetched, ["model.safetensors"])
+
+    def test_silent_hub_failure_changes_nothing(self):
+        """huggingface_hub returns local_dir without an error when the Hub stops answering after the file list: that
+        must not count as an update (it used to write the new revision and delete files)."""
+        self.hub.module.snapshot_download = lambda repo_id, local_dir, revision=None, allow_patterns=None: local_dir
+        code, out = self.run_cli("--yes")
+        self.assertEqual(code, 1, out)
+        self.assertIn("download incomplete", out)
+        self.assertEqual(self.tree(), V1)
+        self.assertEqual(U.state(str(self.root)), {"revision": "sha1", "files": sorted(V1)})
+        self.assertEqual(self.run_cli("--check")[0], 10)   # still offered
+
+    def test_rerun_resumes_staged_files(self):
+        real, calls = self.hub.snapshot_download, []
+
+        def half(repo_id, local_dir, revision=None, allow_patterns=None):   # dies after the first file
+            calls.append(list(allow_patterns))
+            if len(calls) == 1:
+                real(repo_id, local_dir, revision, allow_patterns[:1])
+                raise ConnectionError("connection reset")
+            return real(repo_id, local_dir, revision, allow_patterns)
+        self.hub.module.snapshot_download = half
+        self.assertEqual(self.run_cli("--yes")[0], 1)
+        self.assertEqual(self.tree(), V1)   # the install is untouched while files download
+        self.assertTrue((self.root / U.STAGING / "README.md").is_file())
+        self.hub.fetched = []
+        self.assertEqual(self.run_cli("--yes")[0], 0)
+        self.assertEqual(self.tree(), V2)
+        self.assertNotIn("README.md", self.hub.fetched)   # kept from the first try
+        self.assertFalse((self.root / U.STAGING).exists())
+
+    def test_failed_swap_is_undone(self):
+        """A file that can't be moved (open on Windows, read-only): everything already swapped goes back."""
+        real = os.replace
+
+        def replace(src, dst):
+            if str(dst).replace(os.sep, "/").endswith("code/moth/serve.py") and U.STAGING in str(src):
+                raise PermissionError(13, "Permission denied", str(dst))
+            return real(src, dst)
+        with unittest.mock.patch.object(U.os, "replace", replace):
+            code, out = self.run_cli("--yes")
+        self.assertEqual(code, 1, out)
+        self.assertIn("replacing the files failed: Permission denied", out)
+        self.assertIn("nothing was changed, still on moth 0.3.0", out)
+        self.assertEqual(self.tree(), V1)
+        self.assertFalse((self.root / U.JOURNAL).exists())
+        self.assertEqual(U.state(str(self.root))["revision"], "sha1")
+        self.assertEqual(self.run_cli("--yes")[0], 0)   # the staged files are reused
+        self.assertEqual(self.tree(), V2)
+
+    def test_crash_mid_swap_is_undone_next_run(self):
+        """The process dies between two moves (no undo runs): the next update puts the old files back first, then
+        updates; a rollback afterwards gives exactly the old version."""
+        class Crash(BaseException):
+            pass
+        real, n = os.replace, [0]
+
+        def replace(src, dst):
+            if U.JOURNAL in str(dst) or U.JOURNAL in str(src):
+                n[0] += 1
+                if n[0] == 4:
+                    raise Crash()
+            return real(src, dst)
+        with unittest.mock.patch.object(U.os, "replace", replace), unittest.mock.patch.object(U, "_undo"), \
+                self.assertRaises(Crash):
+            self.run_cli("--yes")
+        self.assertTrue((self.root / U.JOURNAL / "manifest.json").is_file())
+        self.assertNotEqual(self.tree(), V1)   # half swapped
+        (self.root / U.LOCK).write_text("999999999")   # the dead process's lock
+        code, out = self.run_cli("--yes")
+        self.assertEqual(code, 0, out)
+        self.assertIn("undid an update that stopped halfway: back on moth 0.3.0", out)
+        self.assertEqual(self.tree(), V2)
+        self.assertEqual(self.run_cli("--rollback", "--yes")[0], 0)
+        self.assertEqual(self.tree(), V1)
+
+    def test_rollback_failure_is_undone(self):
+        self.assertEqual(self.run_cli("--yes")[0], 0)
+        real = os.replace
+
+        def replace(src, dst):
+            if str(dst).replace(os.sep, "/").endswith("code/moth/serve.py") and U.BACKUP in str(src):
+                raise PermissionError(13, "Permission denied", str(dst))
+            return real(src, dst)
+        with unittest.mock.patch.object(U.os, "replace", replace):
+            code, out = self.run_cli("--rollback", "--yes")
+        self.assertEqual(code, 1, out)
+        self.assertIn("still on moth 0.3.1", out)
+        self.assertEqual(self.tree(), V2)
+        self.assertEqual(self.run_cli("--rollback", "--yes")[0], 0)   # the backup is still whole
+        self.assertEqual(self.tree(), V1)
+
+    def test_edited_files(self):
+        """Your edit of a file upstream didn't change is kept; of one it changed: replaced, named, kept in the backup."""
+        (self.root / "model.safetensors").write_bytes(b"my own finetune")   # unchanged sha1 -> sha2: kept
+        (self.root / "code/moth/serve.py").write_bytes(b"# my serve\n")   # changed upstream: replaced
+        code, out = self.run_cli("--check")
+        self.assertEqual(code, 10, out)
+        self.assertIn("kept your changes to model.safetensors (not changed upstream)", out)
+        self.assertIn("you changed code/moth/serve.py: the update replaces it", out)
+        code, out = self.run_cli("--yes")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.tree(), dict(V2, **{"model.safetensors": b"my own finetune"}))
+        self.assertEqual((self.root / U.BACKUP / "0.3.0/files/code/moth/serve.py").read_bytes(), b"# my serve\n")
+        self.assertEqual(self.run_cli("--yes")[0], 0)   # up to date: the kept edit isn't offered again
+        self.assertEqual(self.run_cli("--check")[0], 0)
+        self.assertEqual(self.run_cli("--rollback", "--yes")[0], 0)
+        self.assertEqual((self.root / "code/moth/serve.py").read_bytes(), b"# my serve\n")
+
+    def test_same_revision_keeps_edits_and_repairs_missing(self):
+        self.hub.head = "sha1"
+        (self.root / "code/moth/serve.py").write_bytes(b"# my serve\n")
+        (self.root / "README.md").unlink()
+        code, out = self.run_cli("--yes")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.hub.fetched, ["README.md"])
+        self.assertEqual((self.root / "code/moth/serve.py").read_bytes(), b"# my serve\n")
+
+    def test_repair_keeps_the_last_updates_backup(self):
+        """Fetching a deleted file of the same revision is no update: --rollback still goes back to the version
+        before the last real update (it used to swap in an "added only" backup and then delete the repaired file)."""
+        self.assertEqual(self.run_cli("--yes")[0], 0)
+        (self.root / "README.md").unlink()
+        code, out = self.run_cli("--yes")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("previous version kept", out)
+        self.assertEqual(self.tree(), V2)
+        self.assertEqual(self.run_cli("--rollback", "--yes")[0], 0)
+        self.assertEqual(self.tree(), V1)
+
+    def test_orphaned_partial_downloads_are_dropped(self):
+        dl = self.root / U.STAGING / ".cache/huggingface/download"
+        dl.mkdir(parents=True)
+        orphan = dl / "xGOKKLRSlIhH692hSVvI1-gpoa8=.def4523f0da085a8e2de49aeb3ff77d8476640101bcfa572810b33eba3cca3d8.71c11436.incomplete"
+        resumable = dl / "xGOKKLRSlIhH692hSVvI1-gpoa8=.def4523f0da085a8e2de49aeb3ff77d8476640101bcfa572810b33eba3cca3d8.incomplete"
+        for p in (orphan, resumable):
+            p.write_bytes(b"x" * 100)
+        self.assertEqual(W.drop_orphans(str(self.root / U.STAGING)), 0)   # fresh: could be a live download
+        old = os.path.getmtime(orphan) - 3600
+        os.utime(orphan, (old, old))
+        self.assertEqual(W.drop_orphans(str(self.root / U.STAGING)), 1)
+        self.assertFalse(orphan.exists())
+        self.assertTrue(resumable.exists())   # huggingface_hub < 1 resumes this one
+
+    def test_offline_switches(self):
+        self.assertEqual(self.run_cli("--yes")[0], 0)
+        for env in ({"MOTH_OFFLINE": "1"}, {"HF_HUB_OFFLINE": "1"}):
+            with unittest.mock.patch.dict(os.environ, env):
+                for args in (("--check",), ("--yes",)):
+                    code, out = self.run_cli(*args)
+                    self.assertEqual(code, 1)
+                    self.assertIn(f"offline mode is on ({next(iter(env))})", out)
+        self.assertEqual(self.tree(), V2)
+        with unittest.mock.patch.dict(os.environ, {"MOTH_OFFLINE": "1"}):
+            self.assertEqual(self.run_cli("--rollback", "--yes")[0], 0)   # no network needed
+        self.assertEqual(self.tree(), V1)
+
+    def test_another_update_running(self):
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(lambda: (p.kill(), p.wait()))
+        (self.root / U.LOCK).write_text(str(p.pid))
+        for args in (("--yes",), ("--rollback", "--yes")):
+            code, out = self.run_cli(*args)
+            self.assertEqual(code, 1)
+            self.assertIn(f"another moth update is running (pid {p.pid})", out)
+        self.assertEqual(self.tree(), V1)
+
+    def test_not_enough_disk_space(self):
+        with unittest.mock.patch.object(U.shutil, "disk_usage", return_value=types.SimpleNamespace(free=1000)):
+            code, out = self.run_cli("--yes")
+        self.assertEqual(code, 1)
+        self.assertIn("not enough disk space", out)
+        self.assertEqual(self.tree(), V1)
+        self.assertFalse((self.root / U.STAGING).exists())
+
+    def test_glob_escape(self):
+        import fnmatch as fm
+        for name in ("a[1].txt", "what?.md", "star*.py", "code/moth/x.py"):
+            self.assertEqual([n for n in (name, "a1.txt", "whatX.md", "starry.py", "code/moth/y.py")
+                              if fm.fnmatch(n, U._glob_escape(name))], [name])
 
     def test_main_version_flag(self):
         from moth import __main__ as M
@@ -470,6 +668,27 @@ class PipModeTest(unittest.TestCase):
         self.assertIn("pip install -U huggingface_hub", str(cm.exception))
         self.assertFalse(self.cache.exists())
 
+    def test_offline_switch_blocks_the_first_download(self):   # MOTH_OFFLINE used to be ignored here
+        for env in ({"MOTH_OFFLINE": "1"}, {"HF_HUB_OFFLINE": "true"}):
+            with unittest.mock.patch.dict(os.environ, env), self.assertRaises(SystemExit) as cm:
+                self.ensure()
+            self.assertIn("offline mode is on", str(cm.exception))
+        self.assertFalse(self.cache.exists())
+        self.ensure()
+        with unittest.mock.patch.dict(os.environ, {"MOTH_OFFLINE": "1"}):
+            self.assertEqual(self.ensure()[1], "")   # downloaded already: offline is fine
+
+    def test_quiet_hub_failure_is_an_incomplete_download(self):
+        self.hub.module.snapshot_download = lambda **kw: kw["local_dir"]   # returned without fetching
+        with self.assertRaises(SystemExit) as cm:
+            self.ensure()
+        self.assertIn("download incomplete", str(cm.exception))
+        self.hub.commits["sha5"] = {"README.md": b"not a moth"}
+        self.hub.head = "sha5"
+        with self.assertRaises(SystemExit) as cm:
+            self.ensure()
+        self.assertIn("is MOTH_REPO a moth repo?", str(cm.exception))
+
     def test_ensure_default_only_for_the_default_folder(self):
         W.ensure_default(str(self.tmp / "my-own-weights"))   # --model elsewhere: never downloads
         self.assertFalse(self.cache.exists())
@@ -525,7 +744,14 @@ class PipModeTest(unittest.TestCase):
         self.assertEqual(U.state(str(self.cache))["revision"], "sha1")
 
     def test_update_before_first_run_downloads(self):
-        self.assertEqual(self.run_cli("--yes")[0], 0)
+        code, out = self.run_cli("--yes")
+        self.assertEqual(code, 0, out)
+        self.assertTrue(W.present(str(self.cache)))
+        self.assertNotIn("previous weights kept", out)
+        code, out = self.run_cli("--rollback", "--yes")   # a first download leaves nothing to roll back to
+        self.assertEqual(code, 1, out)
+        self.assertIn("no backup to roll back to", out)
+        self.assertIn("moth update gets the newest again", out)
         self.assertTrue(W.present(str(self.cache)))
 
     def test_refuses_while_moth_from_this_install_runs(self):

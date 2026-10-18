@@ -118,6 +118,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: python -m pytest -q -rs -p no:cacheprovider tests/test_update.py
 
+      - name: test_update_e2e (fake Hub on localhost, real downloads, a tiny real model served)
+        if: ${{ !cancelled() }}
+        run: python -m pytest -q -rs -p no:cacheprovider tests/test_update_e2e.py
+
       - name: test_config
         if: ${{ !cancelled() }}
         run: python -m pytest -q -rs -p no:cacheprovider tests/test_config.py
