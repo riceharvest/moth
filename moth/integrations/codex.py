@@ -21,11 +21,9 @@ legacy_notify.rs). Prints nothing, always exits 0, gives up after 1 s. MOTH_URL 
 import json
 import os
 import sys
-import urllib.request
 
 URL = os.environ.get("MOTH_URL", "http://127.0.0.1:4747").rstrip("/") + "/api/agent"
 TOKEN_FILE = os.environ.get("MOTH_TOKEN_FILE") or os.path.join(os.path.expanduser("~"), ".moth", "token")
-_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # moth is local: never via a proxy
 
 
 def _token() -> str:
@@ -57,14 +55,39 @@ def final_turn(argv: list[str], stdin) -> tuple[str, str | None, str]:
     return text, session, label_of(d.get("cwd"), session)
 
 
+def http_post(url: str, data: bytes, headers: dict, timeout: float = 1.0) -> None:
+    """POST and wait for moth's answer (never via a proxy: moth is local). Plain http:// goes over a bare socket:
+    this runs on every agent turn, and importing urllib.request alone takes longer than the whole post.
+    (The same function as claude_code.py's: each adapter is one standalone file.)"""
+    if not url.lower().startswith("http://"):   # https (a moth behind something): the standard client
+        import urllib.request
+        req = urllib.request.Request(url, data=data, headers=headers)
+        urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout).close()
+        return
+    import socket
+    import time
+    netloc, _, path = url[7:].partition("/")
+    host, _, port = netloc.rpartition(":") if netloc.rpartition(":")[2].isdigit() else (netloc, "", "80")
+    if any("\r" in str(v) or "\n" in str(v) for v in headers.values()):
+        raise ValueError("bad header")   # a token with a line break in it: refused, as http.client does
+    head = "".join(f"{k}: {v}\r\n" for k, v in {**headers, "Content-Length": len(data)}.items())
+    req = f"POST /{path} HTTP/1.1\r\nHost: {netloc}\r\n{head}Connection: close\r\n\r\n".encode("latin-1") + data
+    with socket.create_connection((host.strip("[]"), int(port)), timeout=timeout) as s:
+        end = time.monotonic() + timeout   # as urllib: up to `timeout` to connect, then up to `timeout` for the answer
+        s.sendall(req)
+        while True:   # moth's answer, to the end (it has the turn before we go)
+            s.settimeout(max(0.001, end - time.monotonic()))
+            if not s.recv(4096):
+                break
+
+
 def main() -> None:
     try:
         text, session, label = final_turn(sys.argv, sys.stdin.buffer)   # bytes: UTF-8 whatever the locale
         if text.strip():
             body = {"text": text, "source": "codex", "session": session, "label": label}
-            req = urllib.request.Request(URL, data=json.dumps({k: v for k, v in body.items() if v}).encode(),
-                                         headers={"Content-Type": "application/json", "X-Moth-Token": _token()})
-            _OPENER.open(req, timeout=1).close()
+            http_post(URL, json.dumps({k: v for k, v in body.items() if v}).encode(),
+                      {"Content-Type": "application/json", "X-Moth-Token": _token()})
     except BaseException:  # noqa: BLE001  moth down, timeout, odd input: never bother Codex
         pass
 

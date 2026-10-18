@@ -23,10 +23,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-try:
-    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
-except ImportError:  # pragma: no cover
-    flex_attention = None
+# FlexAttention (the training / full-forward path) is imported on first use: importing it pulls in sympy (~0.4 s and
+# ~30 MB at every start), and serving (tiny_agent.generate) never runs it.
+flex_attention = create_block_mask = None
+
+
+def _load_flex():
+    global flex_attention, create_block_mask
+    if flex_attention is None:
+        from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+    return flex_attention
 
 
 # B70-tuned FlexAttention backward tiles (measured in tiny_moe/bench.py: dense L 50.8k -> 60.7k tok/s);
@@ -185,8 +191,8 @@ class Attention(nn.Module):
         k = torch.cat([shared["k"], kl], dim=2)
         v = torch.cat([shared["v"], vl], dim=2)
         dt = v.dtype  # rms_norm autocasts to fp32; flex backward needs one dtype
-        y = flex_attention(q.to(dt), k.to(dt), v, block_mask=block_mask, enable_gqa=True,
-                           kernel_options=FLEX_OPTS if q.device.type == "xpu" else None)
+        y = (flex_attention or _load_flex())(q.to(dt), k.to(dt), v, block_mask=block_mask, enable_gqa=True,
+                                             kernel_options=FLEX_OPTS if q.device.type == "xpu" else None)
         return self.w_o(y.transpose(1, 2).reshape(B, T, H * D))
 
 
@@ -227,6 +233,7 @@ def make_block_mask(doc: torch.Tensor, window: int):
         in_win = (q - j) < window
         return same & causal & (~is_local | in_win)
 
+    _load_flex()
     return create_block_mask(mask_mod, B, None, T, 2 * T, device=doc.device)
 
 

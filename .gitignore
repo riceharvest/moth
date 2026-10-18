@@ -57,3 +57,6 @@ build/
 *.parquet
 *.tar*
 *.zip
+
+# Claude Code agent worktrees and local settings
+.claude/

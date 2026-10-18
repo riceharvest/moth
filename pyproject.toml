@@ -29,7 +29,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-pet = ["PySide6"]
+pet = ["PySide6-Essentials"]   # QtCore/QtGui/QtWidgets/QtSvg; not the Addons wheel (WebEngine, 3D, ...: +56 MB on Linux)
 
 [project.scripts]
 moth = "moth.__main__:main"

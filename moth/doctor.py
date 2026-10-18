@@ -286,8 +286,12 @@ def check_pyside(r: Report):
               "pip install PySide6")
         return
     try:
-        from importlib.metadata import version
-        r.add("✓", "pet (PySide6)", version("PySide6"))
+        from importlib.metadata import PackageNotFoundError, version
+        try:
+            v = version("PySide6")
+        except PackageNotFoundError:   # the pet extra installs PySide6-Essentials alone
+            v = version("PySide6-Essentials")
+        r.add("✓", "pet (PySide6)", v)
     except Exception:
         r.add("✓", "pet (PySide6)", "installed")
 

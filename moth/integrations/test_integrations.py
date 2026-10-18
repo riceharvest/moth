@@ -138,6 +138,48 @@ class ClaudeCode(Base):
                            "http_proxy": proxy, "HTTP_PROXY": proxy, "no_proxy": "", "NO_PROXY": ""})
         self.assertEqual((p.returncode, self.ok.texts), (0, ["via no proxy"]))
 
+    def test_bare_socket_post(self):
+        """The plain-socket POST: a host name (localhost may resolve to ::1 first; the stub is on 127.0.0.1 only),
+        a path prefix in MOTH_URL kept, and a token with a line break refused (nothing sent), as urllib did."""
+        port = self.ok.url.rsplit(":", 1)[1]
+        p, took = run(self.HOOK, f"http://localhost:{port}", json.dumps({"last_assistant_message": "by name"}))
+        if sys.platform.startswith("linux"):   # Windows may sit out a refused ::1 connect first (~1 s): no timing
+            self.quiet(p, took)
+        self.assertEqual((p.returncode, self.ok.texts), (0, ["by name"]))
+        spec = importlib.util.spec_from_file_location("moth_cc_hook", HERE / "claude_code.py")
+        cc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cc)
+        seen = []
+
+        class Echo(BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen.append((self.path, self.headers["Host"], self.headers["X-Moth-Token"],
+                             self.rfile.read(int(self.headers["Content-Length"]))))
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Echo)
+        threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
+        try:
+            url = f"http://127.0.0.1:{srv.server_port}/moth/api/agent"
+            cc.http_post(url, b'{"text": "x"}', {"Content-Type": "application/json", "X-Moth-Token": "t0k"})
+            self.assertEqual(seen, [("/moth/api/agent", f"127.0.0.1:{srv.server_port}", "t0k", b'{"text": "x"}')])
+            with self.assertRaises(ValueError):
+                cc.http_post(url, b"{}", {"X-Moth-Token": "a\r\nX-Evil: 1"})
+            self.assertEqual(len(seen), 1)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        import ast   # codex.py carries the same function (each adapter is one file): the code must not drift apart
+
+        def body(file):
+            fn = next(n for n in ast.parse((HERE / file).read_text(encoding="utf-8")).body
+                      if isinstance(n, ast.FunctionDef) and n.name == "http_post")
+            return [ast.dump(s) for s in fn.body[1:]]   # minus the docstring
+        self.assertEqual(body("claude_code.py"), body("codex.py"))
+
     def test_empty_message_posts_nothing(self):
         p, took = run(self.HOOK, self.ok.url, json.dumps({"last_assistant_message": "", "transcript_path": "/nope"}))
         self.quiet(p, took)

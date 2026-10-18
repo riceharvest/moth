@@ -554,6 +554,9 @@ WINGS = [(1.0, 0), (0.8, -2), (0.58, -4), (0.38, -5), (0.24, -5),   # 0-4: open 
 OPEN, UP, RESTING, DOZING = 0, 4, 5, 6
 FLAP = (0, 1, 2, 3, 4, 3, 2, 1)   # one wingbeat
 FRAME_S = 0.05                    # s a frame: a wingbeat in 0.4 s
+SHIVER_S = 0.36                   # a resting wing flick: 6 frames of 0.06 s (pose_for)
+STILL_MS = 250                    # ms between ticks while the moth sits still (no flick, fade or flight due)
+DOZE_FPS = 4                      # frames per second of the doze z's (the moth; a skin keeps its own rate)
 MAX_TILT = 14.0                   # degrees: leaning toward where it flies
 ART_CREDIT = ("moth art: \"202206 Silkmoth adult female icon\" by DBCLS (Wikimedia Commons), CC BY 4.0, "
               "modified (wing frames)")
@@ -695,23 +698,36 @@ def paint_moth(p, cx: float, cy: float, width: float, pose: Pose):
         paint_z(p, cx, cy, w, h, pose.z)
 
 
+_Z_GLYPHS: dict = {}   # pixel size -> the "z" outline at (0, 0); building one runs the font's hinter, so it's cached
+
+
+def z_glyph(px: int):
+    zp = _Z_GLYPHS.get(px)
+    if zp is None:
+        from PySide6.QtCore import QPointF
+        from PySide6.QtGui import QFont, QPainterPath
+        f = QFont()
+        f.setFamilies(["Fraunces", "Georgia", "DejaVu Serif", "serif"])
+        f.setItalic(True)
+        f.setWeight(QFont.Weight.DemiBold)
+        f.setPixelSize(px)
+        zp = _Z_GLYPHS[px] = QPainterPath()
+        zp.addText(QPointF(0, 0), f, "z")
+    return zp
+
+
 def paint_z(p, cx: float, cy: float, w: float, h: float, phase: float):
     """The doze z's (a font glyph, not art): they drift up and to the right from the head (cx, cy - 0.36 h), fading."""
-    from PySide6.QtCore import QPointF
-    from PySide6.QtGui import QColor, QFont, QPainterPath, QPen
+    from PySide6.QtGui import QColor, QPen
 
     p.save()
     p.setRenderHint(p.RenderHint.Antialiasing, True)
-    f = QFont()
-    f.setFamilies(["Fraunces", "Georgia", "DejaVu Serif", "serif"])
-    f.setItalic(True)
-    f.setWeight(QFont.Weight.DemiBold)
     for i in range(3):
         ph = (phase * 0.45 + i / 3) % 1.0
-        f.setPixelSize(max(9, int(h * (0.24 + 0.18 * ph))))
         al = max(0.0, min(1.0, ph * 5)) * min(1.0, (1 - ph) * 2.2)
-        zp = QPainterPath()
-        zp.addText(QPointF(cx + w * (0.06 + 0.22 * ph), cy - h * (0.36 + 0.55 * ph)), f, "z")
+        # addText(point) puts the glyph at the point cut to 1/64 px (QFixed::fromReal); the same cut keeps the pixels
+        x, y = cx + w * (0.06 + 0.22 * ph), cy - h * (0.36 + 0.55 * ph)
+        zp = z_glyph(max(9, int(h * (0.24 + 0.18 * ph)))).translated(int(x * 64) / 64, int(y * 64) / 64)
         c, e = QColor(LAMP), QColor(INK)
         c.setAlphaF(al)
         e.setAlphaF(al * 0.8)
@@ -1660,6 +1676,8 @@ def _run(a, on_ready, boot, decided: str, quit_now: list) -> int:
                         self.notify(f"i couldn't look for a new me: {info}", ttl=NOTICE_TTL)
 
         menu_sleep = False
+        drawn = None       # (pose, dy, look) last handed to the window
+        cursor_at = -1e9   # when the cursor was last read
 
         def tick(self):
             try:
@@ -1688,8 +1706,11 @@ def _run(a, on_ready, boot, decided: str, quit_now: list) -> int:
                 if self.win.press is None and not (QGuiApplication.mouseButtons() & Qt.MouseButton.LeftButton):
                     self.drop()   # a compositor-driven move (Wayland) ends without a release event
             else:
-                c = QCursor.pos()
-                w.step(dt, now, cursor=(c.x(), c.y()), bounds=screen_bounds(w.x, w.y))
+                cursor = None   # QCursor.pos() is a round trip to the X server: every frame only while flying
+                if w.state in (FLY, LAND) or now - self.cursor_at >= 1.0:
+                    c, self.cursor_at = QCursor.pos(), now
+                    cursor = (c.x(), c.y())
+                w.step(dt, now, cursor=cursor, bounds=screen_bounds(w.x, w.y))
             self.anim["thinking"] = now < self.thinking_until
             pose = pose_for(w, now, self.anim)
             self.win.pose, self.win.dy = pose, bob(w, now)
@@ -1707,7 +1728,10 @@ def _run(a, on_ready, boot, decided: str, quit_now: list) -> int:
                 tx, ty = round(w.x - W / 2), round(w.y - H / 2)
                 if (tx, ty) != (self.win.x(), self.win.y()):
                     self.win.move(tx, ty)
-            self.win.update()
+            drawn = (self.win.pose, self.win.dy, self.win.look)
+            if drawn != self.drawn:   # the same frame again (a resting moth is a still image): no repaint
+                self.drawn = drawn
+                self.win.update()
             if bypass and now - self.last_raise > 3:   # unmanaged windows don't stay on top by themselves
                 self.last_raise = now
                 self.win.raise_()
@@ -1725,21 +1749,39 @@ def _run(a, on_ready, boot, decided: str, quit_now: list) -> int:
                     self.bub.show()
             fps = 30 if (b is not None and alpha < 1) else w.fps()
             iv = int(1000 / fps)
+            slow, due = None, now + 3600.0
+            if (fps == w.fps() and w.state == REST and not w.excited and self.skin is None and not self.anim["thinking"]
+                    and now - self.anim.get("shiver_at", -9.0) > SHIVER_S):
+                # sitting still: a few ticks a second, but on time for the next wing flick (then 12 fps through it)
+                slow, due = STILL_MS, self.anim.get("shiver_next", now)
+            elif fps == w.fps() and w.state == DOZE and self.skin is None:
+                slow = 1000 // DOZE_FPS   # asleep (all day, mostly): the z's drift on at a lower frame rate
+            if slow:
+                if b is not None and not self.muted:   # ... and on time for the bubble's fade-out
+                    due = min(due, b.shown + b.ttl - self.bubbles.FADE_OUT)
+                iv = max(iv, min(slow, int((due - now) * 1000) + 1))
             if self.timer.interval() != iv:
                 self.timer.setInterval(iv)
 
+        def kick(self):
+            """Tick now (a click / a drag starts): don't wait out a still moth's slow tick."""
+            self.timer.start(0)
+
         def grab(self):
             self.w.grab(time.monotonic())
+            self.kick()
 
         def drop(self):
             pos = self.win.pos()
             sb = screen_bounds(pos.x() + W / 2, pos.y() + H / 2)
             self.w.bounds = sb
             self.w.drop(time.monotonic(), pos.x() + W / 2, pos.y() + H / 2)
+            self.kick()
 
         def clicked(self):
             now = time.monotonic()
             self.w.poke(now)
+            self.kick()
             if self.inp.isVisible():   # a second click closes the box (if the box never got focus, Esc can't)
                 self.inp.hide()
                 return

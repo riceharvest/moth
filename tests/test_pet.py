@@ -948,6 +948,124 @@ class QtTest(unittest.TestCase):
                     self.assertIsNotNone(box, (row, col))
                     self.assertGreater(box[2] - box[0], 60)   # fills the cell, not a speck
 
+    def test_cached_z_glyphs_draw_the_same_pixels(self):
+        """paint_z draws cached glyph outlines: pixel for pixel what building them per frame (the old code) drew."""
+        from PySide6.QtCore import QPointF, Qt
+        from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPainterPath, QPen
+        from PySide6.QtWidgets import QApplication
+        QApplication.instance() or QApplication([])
+
+        def old_paint_z(p, cx, cy, w, h, phase):
+            p.save()
+            p.setRenderHint(p.RenderHint.Antialiasing, True)
+            f = QFont()
+            f.setFamilies(["Fraunces", "Georgia", "DejaVu Serif", "serif"])
+            f.setItalic(True)
+            f.setWeight(QFont.Weight.DemiBold)
+            for i in range(3):
+                ph = (phase * 0.45 + i / 3) % 1.0
+                f.setPixelSize(max(9, int(h * (0.24 + 0.18 * ph))))
+                al = max(0.0, min(1.0, ph * 5)) * min(1.0, (1 - ph) * 2.2)
+                zp = QPainterPath()
+                zp.addText(QPointF(cx + w * (0.06 + 0.22 * ph), cy - h * (0.36 + 0.55 * ph)), f, "z")
+                c, e = QColor(P.LAMP), QColor(P.INK)
+                c.setAlphaF(al)
+                e.setAlphaF(al * 0.8)
+                p.setPen(QPen(e, 0.8))
+                p.setBrush(c)
+                p.drawPath(zp)
+            p.restore()
+
+        def draw(fn, phase, w, h):
+            img = QImage(160, 160, QImage.Format.Format_ARGB32_Premultiplied)
+            img.fill(Qt.GlobalColor.transparent)
+            p = QPainter(img)
+            fn(p, 61.3, 97.7, w, h, phase)
+            p.end()
+            return bytes(img.constBits())
+        for phase in (0.0, 0.37, 1.1, 2.9, 1234.5678):
+            for w, h in ((64, 44.8), (112, 78.4), (40.5, 28.35)):
+                self.assertEqual(draw(old_paint_z, phase, w, h), draw(P.paint_z, phase, w, h), (phase, w, h))
+
+    def test_still_moth_ticks_slowly_and_skips_repaints(self):
+        """Idle cost: a resting moth ticks STILL_MS apart and repaints nothing new, yet is on time for its wing flick
+        (12 fps through it); dozing, the z's move at DOZE_FPS; flying is 30 fps; a click ticks at once."""
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                b = json.dumps({"ok": True, "pid": os.getpid(), "install_root": "x", "version": "t"} if
+                               self.path.startswith("/api/health") else {"events": [], "next": 1, "epoch": "e"}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        seen = {}
+
+        def ready(pet):
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, lambda: checks(pet))   # in the running loop: quit() before exec() would be lost
+
+        def checks(pet):
+            paints = []
+            pet.win.update = lambda: paints.append(1)
+            w, now = pet.w, time.monotonic()
+            pet.bubbles.clear()
+            w.wander, w.state, w.idle_since = False, P.REST, now
+            pet.anim["shiver_next"] = now + 5
+            pet._tick()
+            paints.clear()
+            for _ in range(3):
+                pet._tick()
+            seen["still"] = (pet.timer.interval(), len(paints))
+            pet.anim["shiver_next"] = time.monotonic() + 0.1
+            pet._tick()
+            seen["before_flick"] = pet.timer.interval()
+            pet.anim["shiver_next"] = time.monotonic() - 0.001
+            pet._tick()
+            seen["flick"] = (pet.win.pose.frame, pet.timer.interval(), len(paints))
+            w.sleep(time.monotonic(), True)
+            pet._tick()
+            n = len(paints)
+            time.sleep(0.02)
+            pet._tick()
+            seen["doze"] = (pet.timer.interval(), len(paints) > n)
+            pet.say("zzz", ttl=5)
+            b, _ = pet.bubbles.current()
+            b.shown, b.ttl = time.monotonic() - 1.0, 1.0 + pet.bubbles.FADE_OUT + 0.1   # fully shown, fade in 0.1 s
+            pet._tick()
+            seen["doze_fade"] = pet.timer.interval()
+            pet.bubbles.clear()
+            w.sleep(time.monotonic(), False)
+            pet.clicked()
+            seen["kick"] = pet.timer.interval()
+            pet.inp.hide()
+            w.wander = True
+            w.excite(time.monotonic(), 30)
+            pet._tick()
+            seen["fly"] = pet.timer.interval()
+            seen["complained"] = pet.complained
+            pet.quit()
+        a = P.build_parser().parse_args(["--url", f"http://127.0.0.1:{srv.server_port}", "--token-file",
+                                         "/nonexistent/token"])
+        try:
+            P.run(a, on_ready=ready)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        self.assertEqual(seen["still"], (P.STILL_MS, 0))
+        self.assertTrue(int(1000 / 12) <= seen["before_flick"] <= 101, seen)
+        self.assertEqual(seen["flick"][:2], (2, int(1000 / 12)))   # the flick's first frame, at the resting rate
+        self.assertEqual(seen["flick"][2], 1)
+        self.assertEqual(seen["doze"], (1000 // P.DOZE_FPS, True))
+        self.assertEqual(seen["doze_fade"], int(1000 / 8))   # the fade-out is no later than at the old 8 fps
+        self.assertEqual(seen["kick"], 0)
+        self.assertEqual(seen["fly"], int(1000 / 30))
+        self.assertFalse(seen["complained"])
+
     def test_windows_run_offscreen(self):
         """The real windows against a stub moth: a new line shows in the bubble and the moth gets excited."""
         lines = [[], [{"say": "Hello From The Lamp"}]]
