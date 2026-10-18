@@ -114,6 +114,18 @@ jobs:
         if: ${{ !cancelled() }}
         run: python -m pytest -q -rs -p no:cacheprovider tests/test_engine.py
 
+      - name: test_fast_infer (CPU int8 / bf16 paths, decode step, sampler)
+        if: ${{ !cancelled() }}
+        run: python -m pytest -q -rs -p no:cacheprovider tests/test_fast_infer.py
+
+      - name: test_norepeat (phrase memory)
+        if: ${{ !cancelled() }}
+        run: python -m pytest -q -rs -p no:cacheprovider tests/test_norepeat.py
+
+      - name: test_backends (moth.json, model specs, openai fake server, a tiny random transformers model)
+        if: ${{ !cancelled() }}
+        run: python -m pytest -q -rs -p no:cacheprovider tests/test_backends.py
+
       - name: test_update
         if: ${{ !cancelled() }}
         run: python -m pytest -q -rs -p no:cacheprovider tests/test_update.py
@@ -125,6 +137,10 @@ jobs:
       - name: test_config
         if: ${{ !cancelled() }}
         run: python -m pytest -q -rs -p no:cacheprovider tests/test_config.py
+
+      - name: test_setup
+        if: ${{ !cancelled() }}
+        run: python -m pytest -q -rs -p no:cacheprovider tests/test_setup.py
 
       - name: test_pet
         if: ${{ !cancelled() }}
