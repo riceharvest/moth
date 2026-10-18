@@ -827,7 +827,7 @@ class PetStartsServerTest(LaunchBase):
         self.assertFalse(os.path.exists(self.info))
 
 
-@unittest.skipUnless(HAVE_QT and os.name == "posix", "PySide6 / POSIX signals")
+@unittest.skipUnless(HAVE_QT, "PySide6 not installed")
 class PetProcessTest(LaunchBase):
     """`python -m moth.pet` as a real process (offscreen): signals and a hard kill must not orphan its server."""
 
@@ -848,6 +848,7 @@ class PetProcessTest(LaunchBase):
                         f"the pet never woke its server: {self.serve_log()!r}")
         return p
 
+    @unittest.skipUnless(os.name == "posix", "SIGTERM/SIGINT/SIGHUP to a process are POSIX (Windows has none of them)")
     def test_signals_stop_the_server(self):
         """Right after the server answers (the windows may not exist yet: the early path, exit 130) and once the pet
         is settled (quits through Qt, exit 0). Either way the server and its child go."""
@@ -863,13 +864,17 @@ class PetProcessTest(LaunchBase):
                 self.assertTrue(gone, f"{sig.name}: the server outlived the pet")
                 self.assertEqual(L.probe(self.url)[0], "none")
 
-    @unittest.skipUnless(sys.platform.startswith("linux"), "PR_SET_PDEATHSIG is Linux-only")
+    @unittest.skipUnless(sys.platform.startswith("linux") or os.name == "nt",
+                         "known gap: macOS has neither PR_SET_PDEATHSIG nor Job Objects, so a SIGKILLed pet leaves "
+                         "its server running")
     def test_hard_kill_of_the_pet_takes_the_server(self):
         pet = self.start_pet()
-        pid, _child = self.pids()
-        pet.kill()   # no atexit, no Qt quit: only the kernel's parent-death signal is left
-        pet.wait()
-        self.assertTrue(wait_until(lambda: not alive(pid), 5), "the server outlived a SIGKILLed pet")
+        pid, child = self.pids()
+        pet.kill()   # no atexit, no Qt quit: only the kernel is left (Linux: parent-death signal; Windows: the Job
+        pet.wait()   # Object's KILL_ON_JOB_CLOSE when the dead pet's handle closes)
+        self.assertTrue(wait_until(lambda: not alive(pid), 5), "the server outlived a hard-killed pet")
+        if os.name == "nt":   # the job holds the server's children too
+            self.assertTrue(wait_until(lambda: not alive(child), 5), "the server's child outlived a hard-killed pet")
 
 
 # --- Qt, offscreen --------------------------------------------------------------------------------------------------

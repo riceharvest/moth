@@ -103,8 +103,25 @@ def script(name: str) -> str:
     return os.path.join(INTEGRATIONS, name)
 
 
+_WIN = os.name == "nt"
+
+
 def command(*parts: str) -> str:
     return subprocess.list2cmdline(parts) if os.name == "nt" else shlex.join(parts)
+
+
+def hook_command(*parts: str) -> str:
+    """A hook's command string. On Windows with forward slashes: Claude Code can run hook commands through Git Bash,
+    which eats unquoted backslashes (C:\\Python\\python.exe -> C:Pythonpython.exe); C:/Python/python.exe works in bash,
+    cmd and PowerShell alike, and so does Python with a forward-slash script path."""
+    if _WIN:
+        return subprocess.list2cmdline([p.replace("\\", "/") for p in parts])
+    return shlex.join(parts)
+
+
+def _backslashed(h: dict) -> bool:
+    """Windows: a moth hook written with backslash paths (older moth), which Git Bash would mangle."""
+    return _WIN and "\\" in str(h.get("command", ""))
 
 
 def short(path: str) -> str:
@@ -318,6 +335,9 @@ def json_hook_status(path: str, name: str) -> tuple[str, str]:
         if any(h.get("async") for _, h, _ in entries):
             return "outdated", (f"Stop hook in {short(path)} runs in the background (\"async\": true), which one-shot "
                                 f"runs (claude -p, codex exec) kill before it posts")
+        if any(_backslashed(h) for _, h, _ in entries):
+            return "outdated", (f"Stop hook in {short(path)} has backslash paths, which Git Bash mangles; "
+                                f"`{prog()} hook` rewrites them with forward slashes")
         extra = f" ({len(entries)} moth hooks: duplicates)" if len(entries) > 1 else ""
         return "installed", f"Stop hook in {short(path)}{extra}"
     if "other" in kinds:
@@ -331,11 +351,12 @@ def plan_json_hook(plan: Plan, path: str, name: str, what: str) -> None:
         plan.error = err
         return
     old = _read(path)
-    want = command(sys.executable, script(name))
+    want = hook_command(sys.executable, script(name))
     entries = _stop_entries(data, name)
     here = any(_where(p, name) == "this" for _, _, p in entries)
     background = [h for _, h, _ in entries if h.get("async")]
-    if here and not background:
+    slashes = [h for _, h, _ in entries if _backslashed(h)]
+    if here and not background and not slashes:
         plan.nothing = f"already installed ({what} in {short(path)})"
         return
     if entries:   # moth's hook from a moved / older install, or an older background one: fix it in place
@@ -344,6 +365,10 @@ def plan_json_hook(plan: Plan, path: str, name: str, what: str) -> None:
             for _, h, p in entries:
                 h["command"] = want
             changes.append(f"{entries[0][2]} -> {script(name)}")
+        elif slashes:   # this install's hook, maybe with the person's own python: keep it, only turn the slashes
+            for h in slashes:
+                h["command"] = h["command"].replace("\\", "/")
+            changes.append("forward slashes in its paths (Git Bash mangles backslashes)")
         for h in background:
             del h["async"]
             h["timeout"] = HOOK_TIMEOUT

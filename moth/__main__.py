@@ -33,9 +33,9 @@ def command(*parts: str) -> str:
 def snippets() -> str:
     """Ready-to-paste setup for the six harnesses, with this install's real paths."""
     py = sys.executable
-    from .hooks import hook_entry   # stdlib only; the same entry `moth hook` writes (foreground: see HOOK_TIMEOUT)
+    from .hooks import hook_command, hook_entry   # stdlib only; the entry `moth hook` writes (see HOOK_TIMEOUT)
     hook = lambda name: json.dumps({"hooks": {"Stop": [{"hooks": [   # noqa: E731
-        hook_entry(command(py, os.path.join(INTEGRATIONS, name)))]}]}})
+        hook_entry(hook_command(py, os.path.join(INTEGRATIONS, name)))]}]}})
     home = os.path.expanduser("~")
     p = lambda *x: os.path.join(INTEGRATIONS, *x)   # noqa: E731
     return f"""

@@ -23,6 +23,7 @@ import os
 import plistlib
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -73,6 +74,18 @@ def free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def fwd(path) -> str:
+    """A path as moth writes it into a hook command (forward slashes on Windows, see hooks.hook_command)."""
+    return str(path).replace("\\", "/") if os.name == "nt" else str(path)
+
+
+def runs(cmd: str, script) -> bool:
+    """Does hook command `cmd` run this script? (Windows: moth writes forward slashes, see hooks.hook_command.)"""
+    found = H.moth_script_in(cmd, os.path.basename(str(script)))
+    norm = lambda p: os.path.normcase(os.path.normpath(str(p)))   # noqa: E731
+    return found is not None and norm(found) == norm(script)
 
 
 def sha(path) -> str:
@@ -191,7 +204,7 @@ class ClaudeCode(TempHome):
         mine = d["hooks"]["Stop"][1]["hooks"][0]
         # foreground (no "async"): a one-shot `claude -p` kills a background hook before it posts
         self.assertEqual((mine.get("async"), mine["timeout"], mine["type"]), (None, 3, "command"))
-        self.assertTrue(mine["command"].endswith(str(INTEG / "claude_code.py")))
+        self.assertTrue(runs(mine["command"], INTEG / "claude_code.py"), mine["command"])
         self.assertEqual(len(self.backups(p)), 1)
         self.assertEqual(json.loads(self.backups(p)[0].read_text()), orig)
         self.assertEqual(H.status("claude-code")["state"], "installed")
@@ -225,7 +238,7 @@ class ClaudeCode(TempHome):
         self.assertNotIn("hooks", json.loads(p.read_text()))
 
     def test_hand_install_with_other_python_counts(self):
-        cmd = f"/opt/some/venv/bin/python {INTEG / 'claude_code.py'}"
+        cmd = f"/opt/some/venv/bin/python {fwd(INTEG / 'claude_code.py')}"
         p = self.settings({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": cmd, "timeout": 10}]}]}})
         self.assertEqual(H.status("claude-code")["state"], "installed")
         before = sha(p)
@@ -234,7 +247,7 @@ class ClaudeCode(TempHome):
         self.assertEqual(sha(p), before)
 
     def test_background_hook_is_outdated_and_fixed_in_place(self):
-        cmd = f"/opt/some/venv/bin/python {INTEG / 'claude_code.py'}"
+        cmd = f"/opt/some/venv/bin/python {fwd(INTEG / 'claude_code.py')}"
         other = {"type": "command", "command": "notify-send done", "async": True}
         p = self.settings({"hooks": {"Stop": [{"hooks": [other]},
                                               {"hooks": [{"type": "command", "command": cmd, "async": True,
@@ -261,7 +274,7 @@ class ClaudeCode(TempHome):
         self.assertEqual(rc, 0, out)
         stop = json.loads(p.read_text())["hooks"]["Stop"]
         self.assertEqual(len(stop), 1)   # replaced, not duplicated
-        self.assertTrue(stop[0]["hooks"][0]["command"].endswith(str(INTEG / "claude_code.py")))
+        self.assertTrue(runs(stop[0]["hooks"][0]["command"], INTEG / "claude_code.py"))
 
     def test_symlinked_settings_keep_their_link(self):
         real = self.tmp / "dotfiles" / "settings.json"
@@ -313,7 +326,7 @@ class Codex(TempHome):
         self.assertIn("/hooks", out)   # the one-time approval reminder
         d = json.loads(self.hooks_json.read_text())
         self.assertEqual(d["hooks"]["SessionStart"], self.HERDR["hooks"]["SessionStart"])
-        self.assertTrue(d["hooks"]["Stop"][0]["hooks"][0]["command"].endswith(str(INTEG / "codex.py")))
+        self.assertTrue(runs(d["hooks"]["Stop"][0]["hooks"][0]["command"], INTEG / "codex.py"))
         self.assertEqual(self.toml.read_text(), self.TOML)   # legacy variant not touched
         self.assertEqual(H.status("codex")["state"], "installed")
         rc, out = self.hook("codex", "--legacy-notify", "--yes")
@@ -325,7 +338,7 @@ class Codex(TempHome):
         self.assertEqual(json.loads(self.hooks_json.read_text()), self.HERDR)
 
     def test_background_hook_is_rewritten_and_needs_approval_again(self):
-        cmd = f"python3 {INTEG / 'codex.py'}"
+        cmd = f"python3 {fwd(INTEG / 'codex.py')}"
         d = json.loads(self.hooks_json.read_text())
         d["hooks"]["Stop"] = [{"hooks": [{"type": "command", "command": cmd, "async": True, "timeout": 5}]}]
         self.hooks_json.write_text(json.dumps(d, indent=2))
@@ -409,7 +422,7 @@ class WindowsPathsInConfigs(TempHome):
         rc, out = self.hook("claude-code", "--yes")
         self.assertEqual(rc, 0, out)
         cmd = json.loads(p.read_text())["hooks"]["Stop"][0]["hooks"][0]["command"]   # valid JSON, path escaped
-        self.assertEqual(H.moth_script_in(cmd, "claude_code.py"), self.script("claude_code.py"))
+        self.assertTrue(runs(cmd, self.script("claude_code.py")), cmd)
         if os.name != "nt":
             import shlex
             self.assertEqual(shlex.split(cmd), [self.PY, self.script("claude_code.py")])
@@ -446,12 +459,61 @@ class WindowsPathsInConfigs(TempHome):
         self.assertEqual(rc, 0, out)
         self.assertEqual(toml.read_text(), self.TOML)
 
+    def test_windows_hook_command_uses_forward_slashes(self):
+        with unittest.mock.patch.object(H, "_WIN", True):
+            cmd = H.hook_command(self.PY, self.script("claude_code.py"))
+            self.assertNotIn("\\", cmd)   # Git Bash would eat unquoted backslashes
+            self.assertEqual(H.moth_script_in(cmd, "claude_code.py").replace("/", "\\"),
+                             self.script("claude_code.py").replace("/", "\\"))
+            # an older moth's backslash hook is outdated there, and `moth hook` rewrites it
+            p = self.write(".claude/settings.json", json.dumps({"hooks": {"Stop": [{"hooks": [H.hook_entry(
+                H.command(self.PY, self.script("claude_code.py")).replace("/", "\\"))]}]}}))
+            with unittest.mock.patch.object(H, "_where", return_value="this"):
+                self.assertEqual(H.status("claude-code")["state"], "outdated")
+                rc, out = self.hook("claude-code", "--yes")
+                self.assertEqual(rc, 0, out)
+                self.assertIn("forward slashes", out)
+                fixed = json.loads(p.read_text())["hooks"]["Stop"][0]["hooks"][0]["command"]
+                self.assertNotIn("\\", fixed)
+                self.assertTrue(runs(fixed, self.script("claude_code.py").replace("\\", "/")), fixed)
+                self.assertEqual(H.status("claude-code")["state"], "installed")
+
     def test_toml_escapes(self):
         for body, want in ((r"a\\b", "a\\b"), (r"tab\there", "tab\there"), (r"\u00e9\U0001F98B", "\u00e9\U0001F98B"),
                            (r"\e[0m", "\x1b[0m"), (r'say \"hi\"', 'say "hi"'), (r"C:\Users\x", r"C:\Users\x"),
                            (r"bad \q", r"bad \q"), (r"short \u12", r"short \u12")):
             with self.subTest(body=body):
                 self.assertEqual(H._toml_basic(body), want)
+
+
+class HookCommandRunsInShells(TempHome):
+    """The hook command moth writes, run the way harnesses run it: sh on POSIX; cmd.exe and Git Bash on Windows (Claude
+    Code can use either there). The script sits in a folder with a space, as under C:\\Users\\First Last."""
+
+    def test_runs(self):
+        integ = self.tmp / "Me Q" / "integrations"
+        integ.mkdir(parents=True)
+        out = self.tmp / "ran.txt"
+        (integ / "claude_code.py").write_text("import os, sys\nopen(os.environ['RAN'], 'a').write(sys.argv[0] + '\\n')\n")
+        with unittest.mock.patch.object(H, "INTEGRATIONS", str(integ)):
+            cmd = H.hook_command(sys.executable, H.script("claude_code.py"))
+        shells = []
+        if os.name == "nt":
+            shells.append(("cmd.exe", lambda: subprocess.run(cmd, shell=True, env=env, capture_output=True, text=True)))
+            git_bash = os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "bin", "bash.exe")
+            if os.path.isfile(git_bash):
+                shells.append(("git bash", lambda: subprocess.run([git_bash, "-c", cmd], env=env, capture_output=True,
+                                                                  text=True)))
+        else:
+            shells.append(("sh", lambda: subprocess.run(["/bin/sh", "-c", cmd], env=env, capture_output=True, text=True)))
+        env = dict(os.environ, RAN=str(out), PATH=os.environ.get("PATH", "") + os.pathsep + os.path.dirname(sys.executable))
+        for name, run in shells:
+            with self.subTest(shell=name):
+                out.unlink(missing_ok=True)
+                r = run()
+                self.assertEqual(r.returncode, 0, (cmd, r.stdout, r.stderr))
+                self.assertTrue(out.exists(), (cmd, r.stdout, r.stderr))
+                self.assertEqual(Path(out.read_text().strip()).resolve(), (integ / "claude_code.py").resolve())
 
 
 class CopiedAdapters(TempHome):

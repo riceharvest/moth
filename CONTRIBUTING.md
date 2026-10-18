@@ -44,8 +44,8 @@ Some parts skip where their inputs are missing, and `-rs` says why:
 - `test_shell.py`: the replay against the recorded training bash (needs the local `results/r3/b.jsonl`), and the
   differential test against real bash (needs a working `bwrap`, Linux only; on Ubuntu 24.04 also
   `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`, as CI does).
-- `test_pet.py`: the Qt tests without PySide6 (or its native libraries), the signal tests off POSIX, the
-  parent-death test off Linux.
+- `test_pet.py`: the Qt tests without PySide6 (or its native libraries), the signal tests on Windows (no POSIX
+  signals), and the hard-kill test on macOS (no parent-death signal or Job Object there: a known gap).
 
 Lint as CI does: `python -m compileall -q moth tiny_agent tests`, and `node --check` on each JS adapter copied to a
 `.mjs` file (they are plain ESM JavaScript, `pi/moth.ts` included).
