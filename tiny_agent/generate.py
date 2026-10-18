@@ -392,20 +392,53 @@ def sample_top_p(logits: torch.Tensor, temperature: float, top_p: float, pen: fl
                  ban_mask=None, generator=None) -> torch.Tensor:
     """moth's sampler, on the logits' device, no host sync: ban_mask -> -inf, repetition penalty on pen_mask (positive
     logits / pen, negative * pen), temperature, nucleus top_p, one multinomial draw. logits (1, V); masks (V,) bool or
-    None. Returns a (1,) token tensor. Same ops and values as moth.serve's per-token version (bit-identical draws).
+    None. Returns a (1,) token tensor. Same values as moth.serve's per-token version; for vocabularies up to
+    TOPK_SAMPLE_MIN also the same draws (bigger CPU vocabularies: _nucleus_draw_topk, same distribution).
     temperature <= 0: greedy (after the ban and the penalty)."""
+    src = logits
     logits = logits.float()
     if ban_mask is not None:
         logits = logits.masked_fill(ban_mask, float("-inf"))
     if pen != 1.0 and pen_mask is not None:
-        logits = torch.where(pen_mask, torch.where(logits > 0, logits / pen, logits * pen), logits)
+        if logits.device.type == "cpu":   # only the penalised ids (a few hundred), not four passes over V
+            ix = pen_mask.nonzero().squeeze(-1)
+            if logits is src:
+                logits = logits.clone()
+            v = logits[..., ix]
+            logits[..., ix] = torch.where(v > 0, v / pen, v * pen)
+        else:
+            logits = torch.where(pen_mask, torch.where(logits > 0, logits / pen, logits * pen), logits)
     if temperature <= 0:
         return logits.argmax(-1)
     p = torch.softmax(logits / temperature, dim=-1)
+    if p.device.type == "cpu" and p.size(-1) > TOPK_SAMPLE_MIN:
+        r = _nucleus_draw_topk(p, top_p, generator)
+        if r is not None:
+            return r
     sp, si = p.sort(dim=-1, descending=True)
     keep = sp.cumsum(-1) - sp < top_p
     sp = sp * keep
     return si[0, torch.multinomial(sp[0] / sp[0].sum(), 1, generator=generator)]
+
+
+TOPK_SAMPLE_MIN = 4096   # CPU vocabularies above this: nucleus via topk (sorting 32k probs costs ~2 ms per token)
+
+
+def _nucleus_draw_topk(p, top_p, generator):
+    """sample_top_p's sort + multinomial draw without the full sort: the nucleus is the top-k prefix (k grown until the
+    first dropped token is inside it), then one multinomial draw over those k. Same nucleus, same distribution; a
+    seeded draw differs from the sorted path's (multinomial draws one exponential per entry: k instead of V, which
+    also saves ~0.5 ms per token). None: the nucleus is most of the vocabulary (the caller sorts)."""
+    V = p.size(-1)
+    for k in (64, 1024):                                 # a flat distribution: two tries, then the sort
+        if k * 4 > V:
+            break
+        sp, si = p.topk(k, dim=-1)                       # sorted, descending
+        keep = sp.cumsum(-1) - sp < top_p
+        if not bool(keep[0, -1]):
+            sp = sp * keep
+            return si[0, torch.multinomial(sp[0] / sp[0].sum(), 1, generator=generator)]
+    return None
 
 
 def _sample_icdf(logits, temperature, top_p, pen, pen_mask, ban_mask, u):
@@ -422,6 +455,18 @@ def _sample_icdf(logits, temperature, top_p, pen, pen_mask, ban_mask, u):
     cdf = (sp * keep).cumsum(-1)
     j = torch.searchsorted(cdf, (u * cdf[:, -1])[:, None], right=True).clamp_max(cdf.size(-1) - 1)
     return si.gather(-1, j).view(1)
+
+
+def _phrase_ban_mask(out, i, ban_ctx, ban_tok, scratch, ar):
+    """moth.norepeat.BanHook on the device, graph-capturable (fixed shapes, no host values): (1, V) bool, True for the
+    ids that would complete a banned n-gram after the last k = ar.numel() sampled tokens out[i-k:i] (nothing before k
+    tokens are sampled, as the hook). ban_ctx (cap, k) context rows (-1 = unused row), ban_tok (cap,) the banned id per
+    row (V = unused, lands in scratch's extra slot), scratch (V + 1,) float work buffer, i (1,) long."""
+    k = ar.numel()
+    ctx = out.index_select(0, (i - k + ar).clamp_min(0))                      # (k,)
+    hit = (ban_ctx == ctx[None]).all(-1) & (i >= k)                           # (cap,)
+    scratch.zero_().index_add_(0, ban_tok, hit.to(scratch.dtype))
+    return (scratch[:-1] > 0)[None]
 
 
 def _decode_one(model, cache: KVCache, idx, L: int):
@@ -678,8 +723,11 @@ class Decoder:
     """Batch-1 token generation on row 0 of a KVCache (moth.serve's turn loop).
 
     CPU (and graph=False): an eager loop, one host-sampled token per step; each step runs the exact op sequence of
-    append_chunked for one token (bit-identical logits) and sample_top_p (bit-identical draws), so a seeded turn comes
-    out token-for-token the same as the old per-token append loop. On the CPU a host read costs nothing.
+    append_chunked for one token (bit-identical logits) and sample_top_p. For vocabularies up to TOPK_SAMPLE_MIN a
+    seeded turn comes out token-for-token the same as the old per-token append loop; bigger CPU vocabularies (moth's
+    32k) draw from the same distribution with a topk nucleus, so seeded draws differ from the old loop's. On the CPU a
+    host read costs nothing. A quantize_cpu model (the CPU speed modes) steps through _decode_fast instead
+    (Decoder.fast = False: _decode_one).
     CUDA/XPU (graph=True, the default there; graph="static" runs the same step uncaptured): one captured device
     graph per step = append the current token, sample the next one on the device (inverse-CDF draw from a pre-drawn
     uniform), store it; the host only reads the tokens back every sync_every steps. The decoder also attaches
@@ -719,13 +767,24 @@ class Decoder:
             for C in sf.BUCKETS:
                 if C not in sf.g:
                     sf._graph(C)
-        if self._g is None or self._key != (max_new, (temperature, top_p, pen), stop):
-            self._setup(max_new, temperature, top_p, pen, stop)
+        if self._g is None or self._key[:3] != (max_new, (temperature, top_p, pen), stop):
+            try:
+                self._setup(max_new, temperature, top_p, pen, stop)
+            except Exception as e:  # noqa: BLE001  the phrase-ban ops: retry with the plain step (as generate does)
+                if not self.ban_graph:
+                    raise
+                import warnings
+                warnings.warn(f"Decoder: device graph setup with the phrase ban failed ({type(e).__name__}: {e}); "
+                              "phrase-ban turns decode eagerly")
+                self.ban_graph, self._g = False, None
+                self._setup(max_new, temperature, top_p, pen, stop)
 
     def _static_aux(self):
         if self._aux is None:
             self._aux = _StaticAux(self.model, self.cache)
         return self._aux
+
+    fast = True   # CPU speed modes (quantize_cpu): step() runs the lean _decode_fast; False: _decode_one
 
     @torch.no_grad()
     def step(self, tok: int) -> torch.Tensor:
@@ -734,6 +793,9 @@ class Decoder:
         if L + 1 > self.cache.max_len:
             raise RuntimeError("KV cache full")
         self._tok.fill_(int(tok))
+        fs = getattr(self.model, "_cpu_fast", None)
+        if fs is not None and self.fast and self.dev.type == "cpu":
+            return _decode_fast(self.model, self.cache, self._tok, L, fs)
         return _decode_one(self.model, self.cache, self._tok, L)
 
     def _masks(self, V, pen_ids, ban_ids):
@@ -747,19 +809,28 @@ class Decoder:
 
     @torch.no_grad()
     def generate(self, logits: torch.Tensor, max_new: int, stop: int, temperature: float = 0.8, top_p: float = 0.95,
-                 pen: float = 1.0, pen_ids=(), ban_ids=(), generator=None) -> list[int]:
+                 pen: float = 1.0, pen_ids=(), ban_ids=(), generator=None, logits_hook=None) -> list[int]:
         """Sample up to max_new tokens starting from logits (1, V) (the prefill's), appending each one to the cache;
         stop (<|im_end|>) ends the turn and is appended too. A turn cut off at max_new gets stop appended so the cache
-        stays well-formed. Returns the sampled tokens (stop included when sampled)."""
+        stays well-formed. Returns the sampled tokens (stop included when sampled).
+        logits_hook(out, logits) -> logits: called before every draw with the tokens sampled so far (moth.norepeat's
+        phrase ban). It runs on the host: the eager loop calls it. A hook with a `table` ({context tuple of k ids:
+        [banned next ids]}) and `k` (moth.norepeat.BanHook) also works in the device-graph path, as fixed-size device
+        tensors matched on the device (_phrase_ban_mask), so it keeps the graphs; any other hook means the eager loop."""
         V = logits.size(-1)
         pm, bm = self._masks(V, pen_ids if pen != 1.0 else (), ban_ids)
         L = int(self.cache.lens_cpu[0])
-        if self.graph and L + max_new + 1 <= self.cache.max_len and max_new > 0:
-            return self._generate_graph(logits, max_new, stop, temperature, top_p, pen, pm, bm, generator)
+        table = getattr(logits_hook, "table", None)
+        graph_ok = logits_hook is None or (self.ban_graph and isinstance(table, dict)
+                                           and isinstance(getattr(logits_hook, "k", None), int))
+        if self.graph and graph_ok and L + max_new + 1 <= self.cache.max_len and max_new > 0:
+            return self._generate_graph(logits, max_new, stop, temperature, top_p, pen, pm, bm, generator, logits_hook)
         pm_ = pm if pen_ids and pen != 1.0 else None
         bm_ = bm if ban_ids else None
         out = []
         for _ in range(max_new):
+            if logits_hook is not None:
+                logits = logits_hook(out, logits)
             t = int(sample_top_p(logits, temperature, top_p, pen, pm_, bm_, generator))
             out.append(t)
             logits = self.step(t)
@@ -770,15 +841,28 @@ class Decoder:
         return out
 
     # --- device graph path --------------------------------------------------------------------------------------
-    def _setup(self, max_new, temperature, top_p, pen, stop):
+    BAN_CAP = 1024  # phrase-ban entries the captured graph holds (grown, with a re-capture, when a turn needs more)
+    BAN_K = 2       # context length of the phrase ban (moth.norepeat.N - 1)
+    ban_graph = True   # False after a capture with the ban ops failed: graphs without them, ban hooks run eagerly
+
+    def _setup(self, max_new, temperature, top_p, pen, stop, ban_cap=None, ban_k=None):
+        """ban_cap 0: the step without the phrase-ban ops (the plain body)."""
         dev, cache = self.dev, self.cache
         n = max_new + 2
+        V = self.model.cfg.vocab_size
+        ban_cap = (self.BAN_CAP if self.ban_graph else 0) if ban_cap is None else ban_cap
+        ban_k = ban_k or self.BAN_K
         self._done = torch.ones(1, dtype=torch.bool, device=dev)
         self._i = torch.zeros(1, dtype=torch.long, device=dev)
         self._out = torch.zeros(n, dtype=torch.long, device=dev)
         self._u = torch.zeros(n, device=dev)
-        self._pm = torch.zeros(1, self.model.cfg.vocab_size, dtype=torch.bool, device=dev)
+        self._pm = torch.zeros(1, V, dtype=torch.bool, device=dev)
         self._bm = torch.zeros_like(self._pm)
+        # the phrase ban (a logits_hook with a table): rows of k context ids (-1: unused) -> banned id (V: unused)
+        self._ban_ctx = torch.full((ban_cap, ban_k), -1, dtype=torch.long, device=dev)
+        self._ban_tok = torch.full((ban_cap,), V, dtype=torch.long, device=dev)
+        self._ban_scratch = torch.zeros(V + 1, device=dev)
+        self._ban_ar = torch.arange(ban_k, device=dev)
         aux = self._static_aux()     # the graph reads these: kept alive on the decoder
         self._stop = stop
         samp = (temperature, top_p, pen)
@@ -788,13 +872,17 @@ class Decoder:
             lg = _step_static(self.model, cache, self._tok, live.long(), aux)
             self._done |= self._tok[0] == stop
             u = self._u.index_select(0, self._i)
-            nxt = _sample_icdf(lg, *samp, self._pm, self._bm, u)
+            bm = self._bm
+            if ban_cap:
+                bm = bm | _phrase_ban_mask(self._out, self._i, self._ban_ctx, self._ban_tok, self._ban_scratch,
+                                           self._ban_ar)
+            nxt = _sample_icdf(lg, *samp, self._pm, bm, u)
             self._out.index_copy_(0, self._i, nxt)
             self._i += 1
             self._tok.copy_(nxt.view(1, 1))
 
         fn = self._fn = torch.compile(body, fullgraph=False, dynamic=False) if self.compile else body
-        self._key = (max_new, samp, stop)
+        self._key = (max_new, samp, stop, ban_cap, ban_k)
         if not self.capture:
             self._g = fn
             return
@@ -819,19 +907,40 @@ class Decoder:
             return "eager"
         return ("graph" if self.capture else "static") + ("+compile" if self.compile else "")
 
-    def _generate_graph(self, logits, max_new, stop, temperature, top_p, pen, pm, bm, generator):
-        if self._g is None or self._key != (max_new, (temperature, top_p, pen), stop):
+    def _generate_graph(self, logits, max_new, stop, temperature, top_p, pen, pm, bm, generator, hook=None):
+        table = getattr(hook, "table", None) or {}
+        rows = [(ctx, t) for ctx, toks in table.items() for t in toks]
+        k = hook.k if table else (self._key[4] if self._key else self.BAN_K)
+        if not self.ban_graph:
+            cap = 0
+        else:
+            cap = (self._key[3] if self._key else 0) or self.BAN_CAP
+            while cap < len(rows):
+                cap *= 2
+        if self._g is None or self._key != (max_new, (temperature, top_p, pen), stop, cap, k):
+            ids = (lambda m: [i for i in range(m.numel()) if m[i]])   # noqa: E731
             try:
-                self._setup(max_new, temperature, top_p, pen, stop)
-            except Exception as e:  # noqa: BLE001  e.g. an op this backend can't capture: decode eagerly instead
+                self._setup(max_new, temperature, top_p, pen, stop, cap, k)
+            except Exception as e:  # noqa: BLE001  e.g. an op this backend can't capture
                 import warnings
+                if cap:   # first without the phrase-ban ops: plain turns keep their graphs, ban hooks run eagerly
+                    warnings.warn(f"Decoder: device graph setup with the phrase ban failed ({type(e).__name__}: {e}); "
+                                  "phrase-ban turns decode eagerly")
+                    self.ban_graph, self._g = False, None
+                    return self.generate(logits, max_new, stop, temperature, top_p, pen,
+                                         ids(pm) if pen != 1.0 else (), ids(bm), generator, hook)
                 warnings.warn(f"Decoder: device graph setup failed ({type(e).__name__}: {e}); decoding eagerly")
                 self.graph, self.fallback = False, f"{type(e).__name__}: {e}"[:300]
                 self._g = None
                 self._done = None
                 return self.generate(logits, max_new, stop, temperature, top_p, pen,
-                                     [i for i in range(pm.numel()) if pm[i]] if pen != 1.0 else (),
-                                     [i for i in range(bm.numel()) if bm[i]], generator)
+                                     ids(pm) if pen != 1.0 else (), ids(bm), generator, hook)
+        if cap:
+            self._ban_ctx.fill_(-1)      # this turn's phrase ban, outside the graph (the graph reads these tensors)
+            self._ban_tok.fill_(self.model.cfg.vocab_size)
+        if cap and rows:
+            self._ban_ctx[:len(rows)].copy_(torch.tensor([c for c, _ in rows], dtype=torch.long))
+            self._ban_tok[:len(rows)].copy_(torch.tensor([t for _, t in rows], dtype=torch.long))
         self._pm.copy_(pm.view(1, -1))
         self._bm.copy_(bm.view(1, -1))
         self._u.copy_(torch.rand(self._u.shape, device=self.dev, generator=generator))
@@ -862,10 +971,34 @@ class Decoder:
         return toks
 
 
-QUANT_GEMV_ROWS = 8    # BF16Linear / Int8Linear: up to this many rows use the low-precision kernel (decode)
-
-
 # --- optional CPU speed modes (serving flag --quant); they change the logits slightly -----------------------------
+# Batch-1 decode on a CPU is memory-bound: every token streams all Linear weights (136M params) once. Storing them in
+# bf16 halves the bytes, int8 quarters them. The kernels take bf16 activations (fp32 accumulation inside); the
+# residual stream, norms, attention, softmax and the KV cache stay fp32. Every quant Linear has mm(xb): bf16 (rows, in)
+# -> bf16 (rows, out), the call _decode_fast makes.
+QUANT_GEMV_ROWS = 8    # BF16Linear: up to this many rows use the bf16 kernel (on AVX2 bf16 GEMM is ~3x slower than fp32)
+INT8_GEMV_ROWS = 128   # Int8Linear: up to this many rows use the int8 kernel; beyond, dequantize + fp32 GEMM (measured
+                       # crossover on a Ryzen 5950X: the kernel costs per row, the GEMM per weight byte)
+_SCRATCH_MAX = 16 << 20
+
+
+def _scratch(shape, dtype):
+    """A reused buffer for prefill's dequantized weights (no 10 MB malloc + page faults per call). Per thread."""
+    import threading
+    if not hasattr(_scratch, "tls"):
+        _scratch.tls = threading.local()
+    d = getattr(_scratch.tls, "d", None)
+    if d is None:
+        d = _scratch.tls.d = {}
+    key = (tuple(shape), dtype)
+    t = d.get(key)
+    if t is None:
+        t = torch.empty(shape, dtype=dtype)
+        if t.numel() * t.element_size() <= _SCRATCH_MAX:
+            d[key] = t
+    return t
+
+
 class BF16Linear(torch.nn.Module):
     """A Linear whose weight is stored in bf16: half the bytes to stream per token. The matmul runs on bf16 inputs
     (fp32 accumulation inside oneDNN), the output is returned in the input dtype."""
@@ -877,53 +1010,222 @@ class BF16Linear(torch.nn.Module):
         self.bias = None if lin.bias is None else torch.nn.Parameter(lin.bias.detach().to(torch.bfloat16),
                                                                       requires_grad=False)
 
+    def mm(self, xb):
+        return torch.nn.functional.linear(xb, self.weight, self.bias)
+
     def forward(self, x):
         if x.numel() // x.size(-1) > QUANT_GEMV_ROWS:   # prefill: fp32 GEMM on the upcast weight (no bf16 FMA on
             b = None if self.bias is None else self.bias.to(x.dtype)   # AVX2 CPUs: bf16 GEMM is ~3x slower)
-            return torch.nn.functional.linear(x, self.weight.to(x.dtype), b)
+            w = self.weight
+            return torch.nn.functional.linear(x, _scratch(w.shape, x.dtype).copy_(w), b)
         return torch.nn.functional.linear(x.to(torch.bfloat16), self.weight, self.bias).to(x.dtype)
 
 
 class Int8Linear(torch.nn.Module):
-    """Weight-only int8 Linear: int8 weights with one fp32 scale per output channel (symmetric, max-abs), fp32
-    activations (aten._weight_int8pack_mm dequantizes on the fly). A quarter of the fp32 bytes to stream per token;
-    activations are not quantized (dynamic activation quantization is lossy for this model's ReLU^2 MLP)."""
+    """Weight-only int8 Linear: int8 weights with one scale per output channel (symmetric, max-abs; the scale is
+    stored in bf16, the kernel's dtype, and the weights are rounded against that stored value), bf16 activations into
+    aten._weight_int8pack_mm (dequantizes on the fly, fp32 accumulation). A quarter of the fp32 bytes per token.
+    Activations are not quantized (dynamic activation quantization is lossy for this model's ReLU^2 MLP).
+    More than INT8_GEMV_ROWS rows (long prefill): dequantize into a scratch buffer + fp32 GEMM."""
 
     def __init__(self, lin: torch.nn.Linear):
         super().__init__()
         w = lin.weight.detach().float()
-        scale = (w.abs().amax(dim=1) / 127.0).clamp_min(1e-12)
+        scale = (w.abs().amax(dim=1) / 127.0).clamp_min(1e-12).to(torch.bfloat16)
+        q = torch.round(w / scale.float()[:, None]).clamp_(-127, 127).to(torch.int8)
         self.in_features, self.out_features = lin.in_features, lin.out_features
-        self.register_buffer("qweight", torch.round(w / scale[:, None]).clamp_(-127, 127).to(torch.int8).contiguous())
+        self.register_buffer("qweight", q.contiguous())
         self.register_buffer("scale", scale.contiguous())
         self.bias = None if lin.bias is None else torch.nn.Parameter(lin.bias.detach().float(), requires_grad=False)
 
     @property
-    def weight(self):   # dequantized view, for code that reads .weight (e.g. the fused GPU step; not used on CPU)
-        return self.qweight.float() * self.scale[:, None]
+    def weight(self):   # dequantized copy, for code that reads .weight (the fused GPU step; not used on CPU)
+        return self.qweight.float() * self.scale.float()[:, None]
+
+    def mm(self, xb):
+        y = torch.ops.aten._weight_int8pack_mm(xb, self.qweight, self.scale)
+        return y if self.bias is None else y + self.bias.to(y.dtype)
 
     def forward(self, x):
         shape = x.shape
-        if x.numel() // shape[-1] > QUANT_GEMV_ROWS:     # prefill: the int8 kernel is a gemv; dequantize + GEMM
-            return torch.nn.functional.linear(x, self.weight.to(x.dtype), self.bias)
-        y = torch.ops.aten._weight_int8pack_mm(x.reshape(-1, shape[-1]).float().contiguous(), self.qweight, self.scale)
-        if self.bias is not None:
-            y = y + self.bias
+        if x.numel() // shape[-1] > INT8_GEMV_ROWS:
+            w = torch.mul(self.qweight, self.scale.float()[:, None],
+                          out=_scratch(self.qweight.shape, torch.float32)).to(x.dtype)
+            return torch.nn.functional.linear(x, w, None if self.bias is None else self.bias.to(x.dtype))
+        y = self.mm(x.reshape(-1, shape[-1]).to(torch.bfloat16).contiguous())
         return y.view(*shape[:-1], self.out_features).to(x.dtype)
 
 
+class _FullMM(torch.nn.Module):
+    """mm() for a Linear left in full precision (quantize_cpu(head=False))."""
+
+    def __init__(self, lin):
+        super().__init__()
+        self.lin = lin
+
+    def mm(self, xb):
+        return torch.nn.functional.linear(xb.to(self.lin.weight.dtype), self.lin.weight, self.lin.bias)
+
+
+QUANT_CLASSES = {"int8": Int8Linear, "bf16": BF16Linear}
+
+
+def int8_kernel_ok() -> bool:
+    """Does this torch build run aten._weight_int8pack_mm on bf16 inputs (and get it right)? Checked once."""
+    if not hasattr(int8_kernel_ok, "ok"):
+        try:
+            g = torch.Generator().manual_seed(0)
+            w = torch.randint(-127, 128, (64, 64), dtype=torch.int8, generator=g)
+            s = torch.rand(64, generator=g).add_(0.5).to(torch.bfloat16)
+            x = torch.randn(2, 64, generator=g).to(torch.bfloat16)
+            y = torch.ops.aten._weight_int8pack_mm(x, w, s).float()
+            ref = x.float() @ (w.float() * s.float()[:, None]).t()
+            int8_kernel_ok.ok = bool(torch.allclose(y, ref, rtol=0.02, atol=0.02 * float(ref.abs().max())))
+        except Exception:  # noqa: BLE001  op missing / unsupported dtype on this build
+            int8_kernel_ok.ok = False
+    return int8_kernel_ok.ok
+
+
 def quantize_cpu(model: TinyAgentLM, mode: str, head: bool = True) -> TinyAgentLM:
-    """In place. mode "int8": weight-only int8 Linear layers (Int8Linear, per-channel scales, fp32 activations).
+    """In place. mode "int8": weight-only int8 Linear layers (Int8Linear, per-channel scales, bf16 activations).
     "bf16": Linear weights stored in bf16 (BF16Linear). Embeddings, Engram tables, norms, RoPE and the KV cache stay
-    as they are. head=False keeps the output head in full precision. Use an fp32 KV cache with these."""
+    as they are. head=False keeps the output head in full precision. Use an fp32 KV cache with these.
+    Also builds model._cpu_fast, the packed weights of the lean CPU decode step (_decode_fast, used by Decoder.step)."""
     if mode in (None, "", "none", "fp32"):
         return model
-    cls = {"int8": Int8Linear, "bf16": BF16Linear}.get(mode)
+    cls = QUANT_CLASSES.get(mode)
     if cls is None:
-        raise ValueError(f"unknown quant mode {mode!r} (none, int8, bf16)")
+        raise ValueError(f"unknown quant mode {mode!r} (none, {', '.join(QUANT_CLASSES)})")
+    if cls is Int8Linear and not int8_kernel_ok():
+        import warnings
+        warnings.warn("this PyTorch build has no CPU int8 kernel for bf16 inputs (aten._weight_int8pack_mm); "
+                      "using --quant bf16 instead")
+        mode, cls = "bf16", BF16Linear
+    fused = []
+    for blk in model.blocks:   # [q | k_local | k_global | v_local | v_global]: per-row formats, so fusing is exact
+        a = blk.attn
+        Hk, D = model.cfg.n_kv_heads, model.cfg.head_dim
+        wl = a.w_kv_local.weight.detach()
+        ks, vs = [wl[:Hk * D]], [wl[Hk * D:]]
+        if a.mode == "full":
+            wg = a.w_kv_global.weight.detach()
+            ks.append(wg[:Hk * D])
+            vs.append(wg[Hk * D:])
+        lin = torch.nn.Linear(model.cfg.d_model, 1, bias=False)
+        lin.weight = torch.nn.Parameter(torch.cat([a.w_q.weight.detach()] + ks + vs).float(), requires_grad=False)
+        fused.append(cls(lin))
     targets = [(name, mod) for name, mod in model.named_modules() if isinstance(mod, torch.nn.Linear)
                and (head or name != "head")]
     for name, mod in targets:
         parent = model.get_submodule(name.rsplit(".", 1)[0]) if "." in name else model
         setattr(parent, name.rsplit(".", 1)[-1], cls(mod))
+    model._cpu_fast = _CpuFast(model, fused)
+    model._quant = mode
     return model
+
+
+class _CpuFast:
+    """What _decode_fast needs besides the model: the fused QKV weights (one weight stream and one kernel call per
+    layer instead of 2-3; the q/k heads contiguous, so one norm and one RoPE matmul cover them), per-head norm
+    divisors, the RoPE helper matrices and a bf16 activation buffer. The fused weights duplicate w_q/w_kv_* (prefill
+    keeps using those): +12 MB in int8."""
+
+    def __init__(self, model: TinyAgentLM, fused):
+        c = model.cfg
+        H, Hk, D = c.n_heads, c.n_kv_heads, c.head_dim
+        self.qkv = fused
+        self.nqk, self.ndiv = [], []
+        for blk in model.blocks:
+            nk = 2 if blk.attn.mode == "full" else 1
+            self.nqk.append(H + Hk * nk)
+            # q heads: divide by |q| (= rms_norm(q) / sqrt(D): the attention's 1/sqrt(D) folded in);
+            # k heads: by |k| / sqrt(D) (= rms_norm(k), what the cache holds)
+            self.ndiv.append(torch.cat([torch.ones(H, 1), torch.full((Hk * nk, 1), D ** -0.5)]))
+        self.head = model.head if hasattr(model.head, "mm") else _FullMM(model.head)
+        self.inv_sqrt_d = c.d_model ** -0.5
+        half = D // 2
+        self.eye = torch.eye(D)
+        P = torch.zeros(D, D)
+        j = torch.arange(half)
+        P[j + half, j] = -1
+        P[j, j + half] = 1
+        self.P = P
+        self.act = getattr(type(fused[0]), "ACT_DTYPE", torch.bfloat16)   # what mm() takes (tests: float64)
+        self.hb = torch.empty(1, c.d_model, dtype=self.act)
+
+
+def _decode_fast(model, cache: KVCache, idx, L: int, fs: _CpuFast):
+    """_decode_one for a quantize_cpu model, with far fewer ops (at batch 1 on a CPU every op costs a few us of
+    dispatch, about as much as the weights take to stream): fused QKV, norms as x / |x| (one vector_norm), RoPE as one
+    64x64 matmul for all q/k heads, the token's K/V written into the cache first so attention reads the cache directly
+    (no K/V concatenation), each Linear fed from one bf16 buffer and added into the fp32 residual in place.
+    Same math as _decode_one up to float rounding (norm epsilon, summation order)."""
+    c = model.cfg
+    H, Hk, D, W = c.n_heads, c.n_kv_heads, c.head_dim, c.swa_window
+    rep = H // Hk
+    bf = fs.act
+    vnorm = torch.linalg.vector_norm
+    addrs = {}
+    if model.engram_modules():
+        max_n = max(c.engram_orders)
+        prev = cache.tokens[:1, max(0, L - (max_n - 1)):L]
+        if prev.size(1) < max_n - 1:
+            prev = torch.cat([prev.new_zeros(1, max_n - 1 - prev.size(1)), prev], dim=1)
+        cids = model.cid_map[torch.cat([prev, idx], dim=1)]
+        for i, b in enumerate(model.blocks):
+            if b.engram is not None:
+                addrs[i] = b.engram.addresses(cids)[:, max_n - 1:]
+    cache.tokens[0, L] = idx[0, 0]
+    slot = L % W
+    cache.lpos[0, slot] = L
+    lp = cache.lpos[0, :W]
+    ok = (lp >= 0) & (L - lp < W)                     # ring slots holding a position of this token's window
+    lbias = None if bool(ok.all()) else torch.zeros(W).masked_fill_(~ok, float("-inf"))
+    cs, sn = model.rope.cos[L], model.rope.sin[L]
+    R = fs.eye * torch.cat([cs, cs]) + fs.P * torch.cat([sn, sn])   # x @ R == RoPE(x) at position L
+    lk, lv, gk, gv = cache.lk[:, 0], cache.lv[:, 0], cache.gk[:, 0], cache.gv[:, 0]
+    lk_new, lv_new, gk_new, gv_new = lk[:, :, slot], lv[:, :, slot], gk[:, :, L], gv[:, :, L]
+    Vl, Vg_all = lv[:, :, :W], gv[:, :, :L + 1]
+    KlT, KgT_all = lk[:, :, :W].transpose(-1, -2), gk[:, :, :L + 1].transpose(-1, -2)
+    kdt = cache.gk.dtype
+    hb, inv = fs.hb, fs.inv_sqrt_d
+    x = model.embed.weight[idx[0]]                                               # (1, d), a copy
+    xdt = x.dtype
+    if R.dtype != xdt:
+        R = R.to(xdt)
+    group = -1
+    for li, blk in enumerate(model.blocks):
+        if blk.engram is not None:
+            x = x + blk.engram(x[None], addrs[li])[0]
+        torch.div(x, vnorm(x, dim=-1, keepdim=True).mul_(inv), out=hb)           # rms_norm(x), in bf16
+        heads = fs.qkv[li].mm(hb).view(-1, D)                                    # (nqk + nv, D), bf16
+        nqk = fs.nqk[li]
+        qk = heads[:nqk]                                                         # / an fp32 norm: fp32 result
+        qk = (qk / vnorm(qk, dim=-1, keepdim=True, dtype=xdt).mul_(fs.ndiv[li])) @ R   # normed + rotated q / k
+        q = qk[:H].view(Hk, rep, D)
+        lk_new[li].copy_(qk[H:H + Hk])
+        lv_new[li].copy_(heads[nqk:nqk + Hk])                                    # copy_ casts to the cache dtype
+        if blk.attn.mode == "full":
+            group += 1
+            gk_new[group].copy_(qk[H + Hk:nqk])
+            gv_new[group].copy_(heads[nqk + Hk:])
+            KgT, Vg = KgT_all[group], Vg_all[group]
+        if q.dtype != kdt:
+            q = q.to(kdt)
+        sl = torch.bmm(q, KlT[li])                                               # (Hk, rep, W) local
+        if lbias is not None:
+            sl.add_(lbias)
+        p = torch.softmax(torch.cat([torch.bmm(q, KgT), sl], dim=-1), dim=-1, dtype=torch.float32)
+        p = p.to(kdt)
+        y = torch.bmm(p[..., :L + 1], Vg).baddbmm_(p[..., L + 1:], Vl[li])        # (Hk, rep, D)
+        x.add_(blk.attn.w_o.mm(y.view(1, H * D).to(bf)))
+        torch.div(x, vnorm(x, dim=-1, keepdim=True).mul_(inv), out=hb)
+        u = blk.mlp.up.mm(hb)
+        torch.relu_(u)
+        x.add_(blk.mlp.down.mm(u.mul_(u)))
+    cache.lens[0] += 1
+    cache.lens_cpu[0] += 1
+    torch.div(x, vnorm(x, dim=-1, keepdim=True).mul_(inv), out=hb)
+    logits = fs.head.mm(hb).float()
+    sc = c.logit_softcap
+    return sc * torch.tanh(logits / sc)

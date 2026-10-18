@@ -302,8 +302,8 @@ class Moth:
         dtype = torch.float32 if a.device == "cpu" else torch.bfloat16
         # CPU: Engram tables stay bf16 and memory-mapped (~1 GB less RAM, identical outputs)
         self.model = load_model(a.model, device=a.device, dtype=dtype, low_mem=a.device == "cpu").eval()
-        quant = getattr(a, "quant", None) or "none"
-        if quant != "none":   # opt-in CPU speed modes (int8 / bf16 Linear weights): slightly different outputs
+        quant = self.quant = resolve_quant(a)
+        if quant != "none":   # CPU speed modes (CPU_QUANT is the default there): slightly different outputs than fp32
             if a.device != "cpu":
                 raise SystemExit("--quant is for --device cpu")
             from tiny_agent.generate import quantize_cpu
@@ -900,9 +900,21 @@ def make_handler(moth: Moth, token: str, hosts: tuple[str, ...] = ("127.0.0.1", 
     return H
 
 
+CPU_QUANT = "int8"   # --quant auto on the CPU (tiny_agent.generate.quantize_cpu; see release/README.md "Speed")
+
+
+def resolve_quant(a) -> str:
+    """--quant auto -> CPU_QUANT on the CPU, none (unquantized) on a GPU. A namespace without quant: none."""
+    q = getattr(a, "quant", None) or "none"
+    if q == "auto":
+        return CPU_QUANT if getattr(a, "device", "cpu") == "cpu" else "none"
+    return q
+
+
 def default_threads() -> int:
-    """At most 8: decode is memory-bound and flat from 4-8 threads on; prefill gains a little from 16 on an idle
-    machine and loses on a busy desktop (tests/bench_speed.py --threads 8,16)."""
+    """At most 8. On a 16-core 5950X with free cores, 16 threads are 10-30% faster for both int8 decode and long
+    prefill (so no separate prefill count), but more threads than free cores (a busy desktop, a CPU quota) cost a lot:
+    under a 4-CPU quota 8 threads halve int8 decode vs 4. 8 is the safe middle (tests/bench_speed.py --threads)."""
     return max(1, min(8, os.cpu_count() or 1))
 
 
@@ -921,10 +933,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--ctx-budget", type=int, default=None, help="max tokens of chat moth keeps in mind")
     ap.add_argument("--max-turn-tokens", type=int, default=200)
     ap.add_argument("--max-tool-rounds", type=int, default=3)
-    ap.add_argument("--quant", default="none", choices=["none", "int8", "bf16"],
-                    help="CPU speed mode for the Linear weights: bf16 or int8 (weight-only, per-channel): faster "
-                         "replies, slightly different wording")
-    ap.add_argument("--fast", action="store_const", const="bf16", dest="quant", help="same as --quant bf16")
+    ap.add_argument("--quant", default="auto", choices=["auto", "none", "int8", "bf16"],
+                    help=f"Linear weights on the CPU: auto (default) = {CPU_QUANT} on the CPU, none on a GPU; "
+                         "int8 (weight-only, per-channel) and bf16 are the fast modes; none = exact fp32 (slowest)")
+    ap.add_argument("--fast", action="store_const", const=CPU_QUANT, dest="quant",
+                    help=f"same as --quant {CPU_QUANT} (already the CPU default)")
     ap.add_argument("--threads", type=int, default=None, help="CPU threads (default: min(8, CPUs))")
     ap.add_argument("--no-graph", action="store_true", help="GPU: decode without device graphs (debugging)")
     ap.add_argument("--compile", action="store_true",

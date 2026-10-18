@@ -482,5 +482,27 @@ class HomePaths(unittest.TestCase):
                 self.assertEqual(self.home._resolve(p), os.path.join(self.home.root, p))
 
 
+class QuantDefault(unittest.TestCase):
+    """The CPU default is the int8 speed mode; GPUs stay unquantized; --quant none is exact fp32."""
+
+    def parse(self, *argv):
+        return serve.build_parser().parse_args(list(argv))
+
+    def test_defaults(self):
+        self.assertEqual(serve.CPU_QUANT, "int8")
+        a = self.parse()
+        self.assertEqual(a.quant, "auto")
+        self.assertEqual(a.device, "cpu")
+        self.assertEqual(serve.resolve_quant(a), "int8")
+        for dev in ("xpu", "cuda", "cuda:1"):
+            self.assertEqual(serve.resolve_quant(self.parse("--device", dev)), "none", dev)
+
+    def test_explicit_modes(self):
+        self.assertEqual(serve.resolve_quant(self.parse("--quant", "none")), "none")
+        self.assertEqual(serve.resolve_quant(self.parse("--quant", "bf16")), "bf16")
+        self.assertEqual(serve.resolve_quant(self.parse("--fast")), serve.CPU_QUANT)
+        self.assertEqual(serve.resolve_quant(SimpleNamespace(device="cpu")), "none")   # no quant attribute: as before
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -282,5 +282,118 @@ class FastDecode(unittest.TestCase):
             self.assertTrue(torch.isfinite(lg).all())
 
 
+class _Exact64(torch.nn.Module if torch is not None else object):
+    """A "quant" Linear that keeps float64 weights and takes float64 activations: runs _decode_fast's logic with no
+    rounding, so it can be held to _decode_one at float64 tolerance."""
+    ACT_DTYPE = torch.float64 if torch is not None else None
+
+    def __init__(self, lin):
+        super().__init__()
+        self.weight = torch.nn.Parameter(lin.weight.detach().double(), requires_grad=False)
+        self.bias = None
+
+    def mm(self, xb):
+        return torch.nn.functional.linear(xb, self.weight)
+
+    def forward(self, x):
+        return torch.nn.functional.linear(x, self.weight)
+
+
+@unittest.skipIf(torch is None, "needs torch")
+class CpuSpeedModes(unittest.TestCase):
+    """The CPU speed modes (quantize_cpu): the lean decode step (_decode_fast) == _decode_one, the int8 weights, the
+    topk nucleus sampler."""
+
+    def steps(self, m, n, dtype, steps=40):
+        """Prefill n tokens, then `steps` decode steps through _decode_fast and _decode_one on two copies of the
+        cache. 40 steps wrap the tiny model's 8-slot window several times; layers 0 and 4 are Full."""
+        c = G.KVCache(m, 1, 120, "cpu", dtype=dtype)
+        G.append(m, c, torch.randint(0, m.cfg.vocab_size, (1, n), generator=torch.Generator().manual_seed(5)), [n])
+        ref = copy.deepcopy(c)
+        fast, slow = G.Decoder(m, c, graph=False), G.Decoder(m, ref, graph=False)
+        slow.fast = False
+        g = torch.Generator().manual_seed(3)
+        worst = 0.0
+        for _ in range(steps):
+            t = int(torch.randint(0, m.cfg.vocab_size, (1,), generator=g))
+            worst = max(worst, float((fast.step(t) - slow.step(t)).abs().max()))
+        return c, ref, worst
+
+    def test_fast_step_matches_decode_one_float64(self):
+        G.QUANT_CLASSES["exact64"] = _Exact64
+        try:
+            for n in (1, 2, 5, 30):     # Engram padding (L < 2), ring not yet full, full and wrapped
+                m = G.quantize_cpu(tiny_model(torch.float64), "exact64")
+                c, ref, worst = self.steps(m, n, torch.float64)
+                self.assertLess(worst, 1e-5, n)          # logits are float32 + the fp32 softmax: ~1e-6
+                sa, sb = cache_state(c), cache_state(ref)
+                for k in sa:
+                    if sa[k].is_floating_point():
+                        torch.testing.assert_close(sa[k], sb[k], atol=F64_TOL, rtol=0, msg=lambda s, k=k: f"{k}: {s}")
+                    else:
+                        self.assertTrue(torch.equal(sa[k], sb[k]), k)
+        finally:
+            G.QUANT_CLASSES.pop("exact64")
+
+    def test_fast_step_close_for_bf16_int8(self):
+        """Real kernels: the two paths round differently (bf16 activations), so only close."""
+        for mode in ("bf16", "int8"):
+            m = G.quantize_cpu(tiny_model(torch.float32), mode)
+            self.assertIsNotNone(m._cpu_fast)
+            for n in (1, 30):
+                c, ref, worst = self.steps(m, n, torch.float32)
+                self.assertLess(worst, 0.5, (mode, n))
+                self.assertTrue(torch.equal(c.lpos, ref.lpos))
+                self.assertTrue(torch.equal(c.lens_cpu, ref.lens_cpu))
+
+    def test_int8_weights(self):
+        torch.manual_seed(0)
+        lin = torch.nn.Linear(64, 48, bias=False)
+        q = G.Int8Linear(lin)
+        self.assertEqual(q.qweight.dtype, torch.int8)
+        self.assertEqual(q.scale.dtype, torch.bfloat16)
+        w = lin.weight.detach()
+        # rounded against the stored bf16 scale: off by at most half a step (+ a hair where the rounded scale clips)
+        err = (q.weight - w).abs().amax(1)
+        self.assertTrue(bool((err <= q.scale.float() * 0.51 + w.abs().amax(1) * 2 ** -8).all()))
+        x = torch.randn(3, 64)
+        ref = x.bfloat16().float() @ q.weight.t()
+        torch.testing.assert_close(q(x), ref, atol=0.02, rtol=0.02)            # kernel: bf16 activations / output
+        xl = torch.randn(G.INT8_GEMV_ROWS + 5, 64)
+        torch.testing.assert_close(q(xl), xl @ q.weight.t(), atol=1e-5, rtol=0)  # long prefill: dequant + fp32 GEMM
+
+    def test_topk_sampler(self):
+        """CPU vocabularies above TOPK_SAMPLE_MIN: nucleus via topk. Same support and frequencies as the sort path,
+        bans hold, the penalty matches the where form, the caller's logits stay untouched."""
+        V = 8192
+        torch.manual_seed(1)
+        logits = torch.randn(1, V) * 1.5
+        logits[0, :30] += 6
+        pm = torch.zeros(V, dtype=torch.bool)
+        pm[torch.randperm(V)[:200]] = True
+        pm[:10] = True
+        bm = torch.zeros(V, dtype=torch.bool)
+        bm[3] = True
+        keep = logits.clone()
+        ref = torch.where(pm, torch.where(logits > 0, logits / 1.3, logits * 1.3), logits).masked_fill(bm, -float("inf"))
+        self.assertEqual(int(G.sample_top_p(logits, 0.0, 0.95, 1.3, pm, bm)), int(ref.argmax(-1)))
+        n = 6000
+        g = torch.Generator().manual_seed(2)
+        a = torch.stack([G.sample_top_p(logits, 0.8, 0.9, 1.3, pm, bm, generator=g) for _ in range(n)]).view(-1)
+        old = G.TOPK_SAMPLE_MIN
+        G.TOPK_SAMPLE_MIN = 10 ** 9
+        try:
+            b = torch.stack([G.sample_top_p(logits, 0.8, 0.9, 1.3, pm, bm, generator=g) for _ in range(n)]).view(-1)
+        finally:
+            G.TOPK_SAMPLE_MIN = old
+        self.assertTrue(torch.equal(logits, keep))
+        fa, fb = torch.bincount(a, minlength=V) / n, torch.bincount(b, minlength=V) / n
+        self.assertLess((fa - fb).abs().max().item(), 0.03)
+        self.assertEqual(int(fa[3]), 0)
+        sp, si = torch.softmax(ref / 0.8, -1).sort(dim=-1, descending=True)   # the nucleus, computed directly
+        nucleus = set(si[0, (sp.cumsum(-1) - sp < 0.9)[0]].tolist())
+        self.assertLessEqual(set(a.tolist()), nucleus)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -12,8 +12,9 @@
               conversation with a temp home; old = moth.serve with its pre-2026-10-18 _feed/_turn/_sample patched in
 Each measurement: 1 warm-up + --repeats timed runs, median. Prompts are fixed seeded random token ids.
 
-  python tests/bench_speed.py --device cpu --dtype fp32 --low-mem --threads 8,16      # serving default on CPU
-  python tests/bench_speed.py --device cpu --dtype fp32 --low-mem --quant int8         # optional speed modes
+  python tests/bench_speed.py --device cpu --dtype fp32 --low-mem --quant int8 --threads 8,16   # CPU serving default
+  python tests/bench_speed.py --device cpu --dtype fp32 --low-mem --threads 8,16   # exact fp32 (moth.serve --quant none)
+  python tests/bench_speed.py --device cpu --dtype fp32 --low-mem --quant bf16     # the other speed mode
   python tests/bench_speed.py --device xpu --dtype bf16                                # or --device cuda
   python tests/bench_speed.py --device cpu --dtype fp32 --low-mem --equiv 12           # old vs new outputs
 Prints one JSON line (prefix 'RESULT ') at the end.
@@ -371,6 +372,9 @@ def equivalence(a, model, prompt, lens, kv_dtype, home_root, dev):
             print(f"equiv {a.quant} vs fp32, greedy: {same_chats}/{a.equiv} conversations identical, "
                   f"{same_turns}/{turns} turns", flush=True)
         del ref
+    # old vs new with the same seeds: both sample with the sorted nucleus (the new CPU default for a 32k vocabulary,
+    # the topk nucleus, draws from the same distribution but consumes the generator differently)
+    G.TOPK_SAMPLE_MIN, topk_min = 10 ** 9, G.TOPK_SAMPLE_MIN
     for temp, name in ((0.0, "greedy"), (0.8, "sampled_seeded")):
         m = make_moth(a, model, os.path.join(home_root, f"eq-{name}"), temp)
         same_turns = turns = same_chats = 0
@@ -392,6 +396,7 @@ def equivalence(a, model, prompt, lens, kv_dtype, home_root, dev):
         if diffs:
             out[name]["first_diff"] = diffs[0]
         print(f"equiv {name}: {same_chats}/{a.equiv} conversations identical, {same_turns}/{turns} turns", flush=True)
+    G.TOPK_SAMPLE_MIN = topk_min
     print("equiv prefill max|diff| " + json.dumps(out["prefill_max_abs_diff"]) + " same argmax " +
           json.dumps(out["prefill_same_argmax"]), flush=True)
     return out

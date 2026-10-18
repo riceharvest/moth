@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import argparse
 
-from moth.serve import Moth, default_paths, strip_ansi
+from moth.serve import CPU_QUANT, Moth, default_paths, default_threads, strip_ansi
 
 DIM, LAMP, OFF = "\033[2m", "\033[33m", "\033[0m"
 
@@ -27,9 +27,14 @@ def main():
     ap.add_argument("--ctx-budget", type=int, default=None, help="max tokens of chat moth keeps in mind")
     ap.add_argument("--max-turn-tokens", type=int, default=200)
     ap.add_argument("--max-tool-rounds", type=int, default=3)
+    ap.add_argument("--quant", default="auto", choices=["auto", "none", "int8", "bf16"],
+                    help=f"as moth.serve: auto = {CPU_QUANT} on the CPU; none = exact fp32")
+    ap.add_argument("--threads", type=int, default=None, help="CPU threads (default: min(8, CPUs))")
     a = ap.parse_args()
     from moth import weights
     weights.ensure_default(a.model)   # pip install, first run: download the model files
+    import torch
+    torch.set_num_threads(a.threads or default_threads())
     moth = Moth(a)
     print(f"{DIM}moth is awake. home: {moth.home.root}  (/reset, /home, /quit){OFF}")
     while True:
