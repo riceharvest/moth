@@ -59,7 +59,7 @@ jobs:
           # build: ubuntu-22.04 so the AppImage runs on older glibc too; smoke: a fresh, current runner
           rows = [dict(name="windows", build="windows-latest", smoke="windows-latest"),
                   dict(name="macos", build="macos-latest", smoke="macos-latest"),
-                  dict(name="linux", build="ubuntu-22.04", smoke="ubuntu-latest")]
+                  dict(name="linux", build="ubuntu-22.04", smoke="ubuntu-24.04")]
           want = os.environ["WANT"]
           print("matrix=" + json.dumps({"include": [r for r in rows if want in ("all", r["name"])]}))
           EOF

@@ -160,7 +160,8 @@ class Smoke:
             state.unlink()
 
     def firstrun_start(self) -> bool:
-        p = self.launch([self.a.app], "firstrun.log", MOTH_APP_SMOKE="start", MOTH_MODEL_DIR=str(Path(self.a.model)))
+        p = self.launch([self.a.app], "firstrun.log", MOTH_APP_SMOKE="start",
+                        MOTH_MODEL_DIR=str(Path(self.a.model).resolve()))
         time.sleep(5)
         self.shot("firstrun.png")
         t0, h = time.monotonic(), None
@@ -169,8 +170,11 @@ class Smoke:
             if h:
                 break
             time.sleep(1)
+        if not h:
+            self.shot("firstrun-stuck.png")
         ok = self.check("first-run Start -> the pet woke the frozen server: /api/health", bool(h),
-                        f"{h} after {time.monotonic() - t0:.0f} s" if h else self.tail(self.home / ".moth" / "pet.log"))
+                        f"{h} after {time.monotonic() - t0:.0f} s" if h else
+                        self.tail(self.home / ".moth" / "pet.log") + "\n" + self.tail(self.out / "firstrun.log"))
         if ok:
             self.results["timings_ms"]["firstrun_start_to_health"] = round((time.monotonic() - t0) * 1000)
         try:

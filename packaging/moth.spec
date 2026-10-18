@@ -17,22 +17,26 @@ VERSION = open(os.path.join(ROOT, "moth", "VERSION")).read().strip()
 DEV = {"add_hermes_pool", "build_sft", "eval", "gen_dialogs", "interview", "judge_mcp", "metrics", "pairwise",
        "probes", "rejudge", "sft"}
 mods = sorted(f[:-3] for f in os.listdir(os.path.join(ROOT, "moth")) if f.endswith(".py") and f[:-3] not in DEV)
-hidden = [f"moth.{m}" for m in mods if m != "__init__"] + collect_submodules("tiny_agent") + [
+# subpackages too (moth/backends/ ...), but not integrations/ (data: the hooks run those files from source)
+subs = sorted(f"moth.{d}" for d in os.listdir(os.path.join(ROOT, "moth"))
+              if os.path.isfile(os.path.join(ROOT, "moth", d, "__init__.py")) and d != "integrations")
+hidden = [f"moth.{m}" for m in mods if m != "__init__"] + [m for d in subs for m in collect_submodules(d)] + \
+    collect_submodules("tiny_agent") + [
     "moth_firstrun", "moth_hook", "PySide6.QtCore", "PySide6.QtGui", "PySide6.QtWidgets", "PySide6.QtSvg"]
 
-# data next to the modules, where moth looks for it (HERE-relative paths): integrations/ keeps its .py files (the
-# hooks run them, `moth hook` copies the Pi / OpenCode / Hermes adapters from there)
+# data next to the modules, where moth looks for it (paths relative to each module): every non-Python file under
+# moth/ but the research data pyproject.toml also leaves out, and integrations/ whole (the hooks run its .py files
+# from source; `moth hook` copies the Pi / OpenCode / Hermes adapters from there)
 SKIP_DIRS = {"__pycache__", "candidates"}
+SKIP_FILES = {"agent_pool.json", "bible_lines_r3.json", "test_integrations.py", ".DS_Store"}
 datas = []
-for sub in ("static", "assets", "integrations"):
-    for d, dirs, files in os.walk(os.path.join(ROOT, "moth", sub)):
-        dirs[:] = [x for x in dirs if x not in SKIP_DIRS]
-        for f in files:
-            if f.endswith(".pyc") or f == "test_integrations.py" or f == ".DS_Store":
-                continue
-            datas.append((os.path.join(d, f), os.path.relpath(d, ROOT)))
-for f in ("VERSION", "file_pool.json"):
-    datas.append((os.path.join(ROOT, "moth", f), "moth"))
+for d, dirs, files in os.walk(os.path.join(ROOT, "moth")):
+    dirs[:] = [x for x in dirs if x not in SKIP_DIRS]
+    code = os.path.relpath(d, ROOT).replace("\\", "/").startswith("moth/integrations")
+    for f in files:
+        if f in SKIP_FILES or f.endswith(".pyc") or (f.endswith(".py") and not code):
+            continue
+        datas.append((os.path.join(d, f), os.path.relpath(d, ROOT)))
 for f in ("LICENSE", "release/NOTICE", "release/LICENSE-LFM"):
     datas.append((os.path.join(ROOT, f), "licenses"))
 

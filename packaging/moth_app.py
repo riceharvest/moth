@@ -152,6 +152,8 @@ def main() -> int:
     if argv[:1] == ["hook-run"]:
         return hook_run(argv[1:])
     _quiet_streams()
+    if os.environ.get("MOTH_MODEL_DIR"):   # absolute, for the pet and server started from other folders
+        os.environ["MOTH_MODEL_DIR"] = os.path.abspath(os.path.expanduser(os.environ["MOTH_MODEL_DIR"]))
     if argv[:1] == ["-m"] and len(argv) > 1:
         run_module(argv[1], argv[2:])
         return 0

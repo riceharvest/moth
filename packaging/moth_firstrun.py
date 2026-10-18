@@ -73,11 +73,23 @@ def main() -> int:
 
         def say(self, text: str = ""):
             bridge.log.emit(text)
+            print(text, flush=True)   # ~/.moth/app.log when opened from the Start menu / Finder
 
         def line(self, mark: str, text: str):
             if mark == "✗":
                 self.errors.append(text)
-            super().line(mark, text)
+            self.say(f"  {mark} {text}")   # Qt draws ✓ ✗ everywhere (doctor._mark falls back to ASCII for consoles)
+
+        def memory(self):
+            """setup's check, except below ~3 GB free off Linux: there the pet starts moth anyway (moth/launch.py
+            checks free memory only where /proc/meminfo says it), and macOS's free + inactive estimate is low."""
+            super().memory()
+            gb = setup.ram_gb()
+            if not self.ram_ok and not sys.platform.startswith("linux") and gb is not None and gb >= setup.MIN_RUN_GB:
+                self.ram_ok = True
+                if self.left and self.left[-1].startswith("free memory"):
+                    self.left.pop()
+                self.say("    starting anyway: moth itself needs about 1 GB once it's loaded")
 
         def ask(self, question: str, default: bool) -> bool:
             q = question.strip()
