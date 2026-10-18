@@ -40,7 +40,7 @@ from moth import forget as F  # noqa: E402
 from moth import hooks as H  # noqa: E402
 
 INTEG = ROOT / "moth" / "integrations"
-REAL_HOME = Path(os.path.expanduser("~"))
+REAL_HOME = Path(os.environ.get("MOTH_TEST_REAL_HOME") or os.path.expanduser("~"))   # (conftest.py)
 
 
 # --- guard: the user's real configs must not change --------------------------------------------------------------

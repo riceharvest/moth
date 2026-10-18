@@ -174,5 +174,32 @@ class MainBrowser(unittest.TestCase):
         self.assertIn("show_in_harness on|off", out.getvalue())
 
 
+
+class TestHarness(unittest.TestCase):
+    """Guards for the test setup itself."""
+
+    @unittest.skipUnless("MOTH_TEST_REAL_HOME" in os.environ, "only under pytest (conftest.py)")
+    def test_tests_run_in_a_scratch_home(self):
+        """conftest.py: nothing a test starts can write into the real ~/.moth (a stale serve-<port>.pid was left
+        there once by a test run)."""
+        self.assertNotEqual(os.path.realpath(os.path.expanduser("~")),
+                            os.path.realpath(os.environ["MOTH_TEST_REAL_HOME"]))
+
+    def test_fake_moth_imports_serve_cheaply(self):
+        """tests/e2e/fake_moth.py loads moth/serve.py with torch and the model modules faked (the e2e workflow, which
+        runs on every push touching serve.py, installs no torch). serve.py's other top-level imports must stay light:
+        no torch, numpy, tokenizers, huggingface_hub, safetensors or sympy really imported, in a few seconds."""
+        code = ("import sys, time; sys.path.insert(0, sys.argv[1]); t = time.monotonic(); import fake_moth; "
+                "s = fake_moth.load_serve(); took = time.monotonic() - t; assert s.make_handler and s.Log; "
+                "heavy = {'torch', 'numpy', 'tokenizers', 'huggingface_hub', 'safetensors', 'sympy', 'PySide6'}; "
+                "print(sorted(heavy & {m.split('.')[0] for m in sys.modules}), round(took, 2))")
+        p = subprocess.run([sys.executable, "-c", code, str(ROOT / "tests" / "e2e")], cwd=ROOT, capture_output=True,
+                           text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        heavy, took = p.stdout.rsplit(" ", 1)
+        self.assertEqual(heavy, "[]", p.stdout)
+        self.assertLess(float(took), 10.0, p.stdout)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
