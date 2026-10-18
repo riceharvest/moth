@@ -1,7 +1,8 @@
 """Where moth's weights come from, and fetching them on first run of a pip install.
 
 Three ways moth can be installed (mode()):
-  hf   a Hugging Face download: model.safetensors next to code/ (code/moth/weights.py)
+  hf   a Hugging Face download: model.safetensors next to code/ (code/moth/weights.py), or one whose weights
+       haven't finished downloading (hf_layout; serve then says how to finish it)
   dev  this project's checkout: runs/ and data/ next to the package
   pip  `pip install moth-companion` (or uv tool / pipx): only the code is installed. The model files
        (model.safetensors, config.json, tokenizer.json) are downloaded from the Hub on first run into
@@ -27,9 +28,54 @@ REVISION_FILE = ".moth-version"   # same file and format as moth/update.py
 SIZE_HINT = "about 860 MB"
 
 
+# what a Hugging Face download of moth has next to code/ besides the weights: an interrupted `hf download` leaves
+# these behind (huggingface_hub moves model.safetensors into place only once it is whole; the small files land first)
+HF_MARKS = ("model.safetensors", REVISION_FILE, ".cache/huggingface/download/code/moth/VERSION.metadata",
+            ("config.json", "tokenizer.json"))
+
+
+def hf_layout(repo: str) -> bool:
+    """repo is a Hugging Face download of moth: code/moth/ plus model.safetensors next to code/, or the marks of a
+    download whose weights never finished (HF_MARKS; a tuple: all of those). moth/update.py's is_download is this
+    test. A dev checkout or the home folder has no code/moth/."""
+    if not os.path.isdir(os.path.join(repo, "code", "moth")):
+        return False
+    return any(all(os.path.isfile(os.path.join(repo, *f.split("/"))) for f in (m if isinstance(m, tuple) else (m,)))
+               for m in HF_MARKS)
+
+
+def complete(folder: str) -> bool:
+    """config.json plus a model.safetensors whose size matches its header (a synced folder may be mid-copy, an
+    interrupted download cut off)."""
+    import struct
+    st = os.path.join(folder, "model.safetensors")
+    if not (os.path.isfile(os.path.join(folder, "config.json")) and os.path.isfile(st)):
+        return False
+    try:
+        with open(st, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            if not 2 <= n <= 100 << 20:   # a header, not a garbage length
+                return False
+            head = json.loads(f.read(n))
+        end = max(v["data_offsets"][1] for k, v in head.items() if k != "__metadata__")
+        return os.path.getsize(st) == 8 + n + end
+    except Exception:  # noqa: BLE001  short, garbage, no tensors: not complete
+        return False
+
+
+def incomplete_message(folder: str) -> str:
+    """What to tell a user whose Hugging Face download of moth (folder) has no usable weights yet."""
+    gone = missing(folder)
+    what = (f"{', '.join(gone)} missing" if gone else "model.safetensors is cut off")
+    return (f"{folder} is a Hugging Face download of moth whose weights didn't finish downloading ({what}). Finish "
+            f"it (hf download {repo()} --local-dir \"{folder}\" resumes it), or run `python -m moth update` from its "
+            "code/ folder, which completes it in place. Nothing was downloaded anywhere else.")
+
+
 def mode() -> str:
-    if os.path.exists(os.path.join(os.path.dirname(ROOT), "model.safetensors")):
-        return "hf"
+    repo_dir = os.path.dirname(ROOT)
+    if os.path.exists(os.path.join(repo_dir, "model.safetensors")) or hf_layout(repo_dir):
+        return "hf"   # (also a download still missing its weights: never "pip", which would fetch them elsewhere)
     if os.path.isfile(DEV_TOKENIZER):   # a positive marker: an editable install of the checkout stays dev
         return "dev"
     return "pip"
@@ -129,8 +175,15 @@ def drop_orphans(folder: str, min_age: float = 300.0) -> int:
 
 
 def ensure_default(model_dir: str) -> None:
-    """serve / cli after parsing: fetch the weights only in pip mode and only when --model is the default folder."""
-    if mode() == "pip" and os.path.realpath(model_dir) == os.path.realpath(cache_dir()):
+    """serve / cli after parsing: fetch the weights only in pip mode and only when --model is the default folder.
+    A Hugging Face download whose weights didn't finish (--model left at the download folder) exits with how to
+    finish it, instead of failing to load or fetching a second copy elsewhere."""
+    m = mode()
+    if m == "hf":
+        repo_dir = os.path.dirname(ROOT)
+        if os.path.realpath(model_dir) == os.path.realpath(repo_dir) and not complete(repo_dir):
+            raise SystemExit("moth: " + incomplete_message(repo_dir))
+    elif m == "pip" and os.path.realpath(model_dir) == os.path.realpath(cache_dir()):
         ensure(model_dir)
 
 

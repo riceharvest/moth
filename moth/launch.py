@@ -35,7 +35,6 @@ import json
 import os
 import shlex
 import signal
-import struct
 import subprocess
 import sys
 import time
@@ -62,23 +61,14 @@ class LaunchError(Exception):
 # --- weights and paths ----------------------------------------------------------------------------------------
 def complete(folder: str) -> bool:
     """config.json plus a model.safetensors whose size matches its header (a synced folder may be mid-copy)."""
-    st = os.path.join(folder, "model.safetensors")
-    if not (os.path.isfile(os.path.join(folder, "config.json")) and os.path.isfile(st)):
-        return False
-    try:
-        with open(st, "rb") as f:
-            n = struct.unpack("<Q", f.read(8))[0]
-            head = json.loads(f.read(n))
-        end = max(v["data_offsets"][1] for k, v in head.items() if k != "__metadata__")
-        return os.path.getsize(st) == 8 + n + end
-    except Exception:  # noqa: BLE001  short, garbage, no tensors: not complete
-        return False
+    return weights.complete(folder)
 
 
 def hf_repo(code: str = CODE) -> str | None:
-    """The download folder when this is the Hugging Face layout (weights next to code/), else None."""
+    """The download folder when this is the Hugging Face layout (weights next to code/, or a download whose weights
+    haven't finished: weights.hf_layout), else None."""
     repo = os.path.dirname(code)
-    return repo if os.path.exists(os.path.join(repo, "model.safetensors")) else None
+    return repo if os.path.exists(os.path.join(repo, "model.safetensors")) or weights.hf_layout(repo) else None
 
 
 def install_mode(code: str = CODE) -> str:
@@ -107,6 +97,8 @@ def server_paths(model: str | None = None, code: str = CODE, mode: str | None = 
     elif repo:
         d.update(model=repo, tokenizer=os.path.join(repo, "tokenizer.json"),
                  home=os.path.join(home, ".moth", "home"), log=os.path.join(home, ".moth", "serve.log"))
+        if not model and not complete(repo):   # an interrupted `hf download`: never fetch a second copy elsewhere
+            raise LaunchError(weights.incomplete_message(repo))
     else:
         d.update(model=None, tokenizer=os.path.join(code, "data", "tiny-agent-112m", "tokenizer.json"),
                  home=os.path.join(code, "live", "home"), log=os.path.join(code, "live", "serve.log"))

@@ -359,6 +359,7 @@ class UpdateTest(unittest.TestCase):
     def test_not_a_download(self):
         (self.root / "model.safetensors").unlink()
         (self.root / U.REVISION_FILE).unlink()   # no weights and no sign of a download: leave the folder alone
+        (self.root / "config.json").unlink()     # (config.json + tokenizer.json next to code/moth/ would be one)
         code, out = self.run_cli("--yes")
         self.assertEqual(code, 1)
         self.assertIn("isn't a Hugging Face download", out)
@@ -763,6 +764,76 @@ class PipModeTest(unittest.TestCase):
         self.assertIn("stop moth first", out)
         running.assert_called_with(U.ROOT)   # serve's pidfile names the install, not the cache
         self.assertEqual(self.files(), {f: V1[f] for f in W.FILES})
+
+
+
+class InterruptedHfDownloadTest(unittest.TestCase):
+    """`hf download` killed before model.safetensors finished: serve / cli / the pet recognise the Hugging Face layout
+    (weights.hf_layout, the same test as update.is_download) and say how to finish it; never pip mode, which would
+    fetch a second copy into ~/.cache."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.repo = self.tmp / "moth-112m"
+        (self.repo / "code" / "moth").mkdir(parents=True)
+        (self.repo / "config.json").write_text("{}")
+        (self.repo / "tokenizer.json").write_text("{}")
+        self.root = unittest.mock.patch.object(W, "ROOT", str(self.repo / "code"))
+        self.root.start()
+        self.no_fetch = unittest.mock.patch.object(W, "ensure", side_effect=AssertionError("downloaded elsewhere"))
+        self.no_fetch.start()
+
+    def tearDown(self):
+        self.no_fetch.stop()
+        self.root.stop()
+        shutil.rmtree(self.tmp)
+
+    def safetensors(self, cut: int = 0):
+        head = json.dumps({"w": {"dtype": "F32", "shape": [4], "data_offsets": [0, 16]}}).encode()
+        data = len(head).to_bytes(8, "little") + head + bytes(16)
+        (self.repo / "model.safetensors").write_bytes(data[:len(data) - cut])
+
+    def test_missing_weights(self):
+        self.assertTrue(W.hf_layout(str(self.repo)))
+        self.assertTrue(U.is_download(str(self.repo)))
+        self.assertEqual(W.mode(), "hf")
+        with self.assertRaises(SystemExit) as ex:
+            W.ensure_default(str(self.repo))
+        msg = str(ex.exception.code)
+        self.assertIn("model.safetensors missing", msg)
+        self.assertIn("python -m moth update", msg)
+        self.assertIn(f'--local-dir "{self.repo}"', msg)
+        W.ensure_default(str(self.tmp / "elsewhere"))   # --model pointed elsewhere: not this folder's business
+
+    def test_cut_off_weights_then_complete(self):
+        self.safetensors(cut=5)
+        self.assertFalse(W.complete(str(self.repo)))
+        with self.assertRaises(SystemExit) as ex:
+            W.ensure_default(str(self.repo))
+        self.assertIn("cut off", str(ex.exception.code))
+        self.safetensors()
+        self.assertTrue(W.complete(str(self.repo)))
+        W.ensure_default(str(self.repo))   # whole: nothing to say
+
+    def test_only_huggingface_metadata_left(self):
+        (self.repo / "config.json").unlink()
+        self.assertFalse(W.hf_layout(str(self.repo)))    # code/ and a tokenizer.json alone aren't enough
+        meta = self.repo / ".cache" / "huggingface" / "download" / "code" / "moth" / "VERSION.metadata"
+        meta.parent.mkdir(parents=True)
+        meta.write_text("x")
+        self.assertTrue(W.hf_layout(str(self.repo)) and U.is_download(str(self.repo)))
+
+    def test_pet_says_so(self):
+        from moth import launch as L
+        self.assertEqual(L.install_mode(str(self.repo / "code")), "hf")
+        with self.assertRaises(L.LaunchError) as ex:
+            L.server_paths(code=str(self.repo / "code"))
+        self.assertIn("didn't finish downloading", str(ex.exception))
+
+    def test_dev_checkout_and_home_are_not_downloads(self):
+        self.assertFalse(W.hf_layout(str(ROOT)))
+        self.assertFalse(W.hf_layout(str(ROOT.parent)))
+        self.assertFalse(W.hf_layout(os.path.expanduser("~")))
 
 
 if __name__ == "__main__":

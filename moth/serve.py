@@ -125,12 +125,12 @@ def default_paths() -> dict:
     """Weights next to code/ (the Hugging Face repo layout) or this project's runs/ and data/."""
     root = os.path.dirname(HERE)
     repo = os.path.dirname(root)
-    if os.path.exists(os.path.join(repo, "model.safetensors")):
+    from moth import weights   # stdlib only
+    if weights.mode() == "hf":   # also a download still missing its weights: main() says how to finish it
         return {"model": repo, "tokenizer": os.path.join(repo, "tokenizer.json"),
                 "home": os.path.join(os.path.expanduser("~"), ".moth", "home"),
                 "pool": os.path.join(HERE, "file_pool.json")}
-    from moth import weights   # pip install: weights in ~/.cache/moth/<repo>/, fetched in main() (not on --help)
-    if weights.mode() == "pip":
+    if weights.mode() == "pip":   # pip install: weights in ~/.cache/moth/<repo>/, fetched in main() (not on --help)
         cache = weights.cache_dir()
         return {"model": cache, "tokenizer": os.path.join(cache, "tokenizer.json"),
                 "home": os.path.join(os.path.expanduser("~"), ".moth", "home"),

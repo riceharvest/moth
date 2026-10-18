@@ -109,12 +109,10 @@ def weight_siblings(siblings) -> list:
 
 
 def is_download(root: str) -> bool:
-    """A Hugging Face download of moth: code/moth/ plus the weights next to it (serve.default_paths()'s test), or the
-    marks of one whose weights never finished downloading. Keeps the dev checkout (and ~) safe."""
-    if not os.path.isdir(os.path.join(root, "code", "moth")):
-        return False
-    return any(os.path.isfile(os.path.join(root, *p.split("/"))) for p in
-               ("model.safetensors", REVISION_FILE, ".cache/huggingface/download/code/moth/VERSION.metadata"))
+    """A Hugging Face download of moth: code/moth/ plus the weights next to it, or the marks of one whose weights
+    never finished downloading (weights.hf_layout, the same test serve.default_paths() and the pet use, so they
+    send such a folder here instead of downloading elsewhere). Keeps the dev checkout (and ~) safe."""
+    return weights.hf_layout(root)
 
 
 def _same_dir(a, b) -> bool:
