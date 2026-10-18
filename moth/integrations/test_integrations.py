@@ -431,7 +431,9 @@ class JsAdapters(Base):
                         self.quiet(*self.drive(harness, self.ok.url))
                     finally:
                         os.environ.pop("MOTH_SHOW_IN_HARNESS", None)
-                    self.assertEqual(self.ok.texts, expect)
+                    # each post is its own unawaited fetch, so two of them (Pi's pi-final and pi-retried) can land
+                    # in either order on a busy machine: which posts arrived matters, not their order
+                    self.assertEqual(sorted(self.ok.texts), sorted(expect))
                     self.assertEqual(self.ok.sources, [self.SOURCE[harness]] * len(expect))
                     self.assertEqual(self.ok.metas, [self.META[harness]] * len(expect))
 
@@ -440,7 +442,7 @@ class JsAdapters(Base):
             with self.subTest(harness):
                 self.slow.texts.clear()
                 self.quiet(*self.drive(harness, self.slow.url))   # fetch aborted at 1 s: no unhandled rejection
-                self.assertEqual(self.slow.texts, expect)
+                self.assertEqual(sorted(self.slow.texts), sorted(expect))   # (in any order, as above)
                 self.quiet(*self.drive(harness, closed_url()))
                 self.quiet(*self.drive(harness, "not a url"))
 
