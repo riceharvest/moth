@@ -15,12 +15,14 @@ model weights (about 860 MB) aren't in the installer: moth downloads them once, 
 Each installer is built and tested by `.github/workflows/installers.yml` on GitHub's own runners (Windows, macOS on
 Apple silicon, Ubuntu). For now the installers exist only as workflow artifacts. They'll be attached to the release.
 
-| | file | size | installed |
-|---|---|---|---|
-| Windows 10/11, x64 | `moth-<version>-windows-x64-setup.exe` | ~230 MB | ~700 MB |
-| macOS 12+, Apple silicon | `moth-<version>-macos-arm64.dmg` | ~170 MB | ~500 MB |
-| Linux x86_64 (glibc 2.35+) | `moth-<version>-x86_64.AppImage` | ~230 MB | runs in place |
-| Linux x86_64, no FUSE | `moth-<version>-linux-x86_64.tar.gz` | ~255 MB | ~750 MB |
+| | file | size |
+|---|---|---|
+| Windows 10/11, x64 | `moth-<version>-windows-x64-setup.exe` | 183 MB (about 620 MB installed) |
+| macOS 12+, Apple silicon | `moth-<version>-macos-arm64.dmg` | 192 MB |
+| Linux x86_64 (glibc 2.35+) | `moth-<version>-x86_64.AppImage` | 239 MB (runs in place) |
+| Linux x86_64, no FUSE | `moth-<version>-linux-x86_64.tar.gz` | 263 MB |
+
+(Sizes for 0.3.0 with torch 2.14.1 CPU, PySide6 6.12.0 and PyInstaller 6.22.3.)
 
 The installers aren't code-signed yet, so Windows and macOS warn the first time you open them. See
 [Unsigned: the warnings and how to get past them](#unsigned-the-warnings-and-how-to-get-past-them) below.
@@ -180,12 +182,15 @@ What signing would take (nothing has been bought):
 3 seconds. It starts in a fraction of the time the full moth program takes (that one carries torch and Qt). Measured
 in CI on each OS (`packaging/smoke.py`), as the hook command is written, through the harness's shell:
 
-| | cold (first run) | typical |
-|---|---|---|
-| Windows | see CI | see CI |
-| macOS | see CI | see CI |
-| Linux tarball | see CI | see CI |
-| Linux AppImage (FUSE mount on every run) | see CI | see CI |
+| | how the agent runs it | first run | typical |
+|---|---|---|---|
+| Windows | Claude Code through Git Bash | 279 ms | 135 ms |
+| Windows | Codex through PowerShell (mostly PowerShell's own start) | 287 ms | 264 ms |
+| macOS (Apple silicon) | through bash / sh | 104–259 ms | 88–122 ms |
+| Linux tarball | through bash / sh | 66 ms | 66 ms |
+| Linux AppImage (a FUSE mount on every run) | through bash / sh | 114 ms | 114 ms |
+
+The full moth program would take 265–375 ms per hook. A hook in a Python install takes about 25 ms.
 
 `moth hooks` reports these hooks as installed. `moth unhook` removes them, and so does the Windows uninstaller. If
 you also have a Python install of moth, whichever one ran `moth hook` last owns the hook.

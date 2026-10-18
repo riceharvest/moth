@@ -21,6 +21,8 @@ NAMES = {"claude-code": "Claude Code", "codex": "Codex CLI", "hermes": "Hermes",
          "dsh": "dsh"}
 CREDIT = ("silkmoth icon: DataBase Center for Life Science (DBCLS), CC BY 4.0 · moth is Apache-2.0 · "
           "<a href='https://github.com/riceharvest/moth'>github.com/riceharvest/moth</a>")
+SHORT_FAIL = ("couldn't download the weights: they aren't on Hugging Face yet (they come with the release), or "
+              "you're offline. Have the files? Use a folder on this computer…")
 NOT_PUBLISHED = ("moth's weights couldn't be downloaded. The model isn't on Hugging Face yet (it comes with the "
                  "release), or this computer is offline. If you have the files (model.safetensors, config.json, "
                  "tokenizer.json), pick their folder with “Use a folder on this computer…”.")
@@ -205,6 +207,11 @@ def main() -> int:
 
     busy = {"job": None}
 
+    def fit():
+        """A word-wrapped label in a layout keeps its old height on macOS: size it for its text, then the window."""
+        wstatus.setMinimumHeight(wstatus.heightForWidth(max(wstatus.width(), 400)))
+        w.adjustSize()
+
     def refresh():
         d = moth_app.model_dir()
         if moth_app.ready():
@@ -293,8 +300,8 @@ def main() -> int:
                 bar.hide()
                 log.appendPlainText(NOT_PUBLISHED)
                 refresh()
-                wstatus.setText(f"<span style='color:#b3261e'>✗ {NOT_PUBLISHED}</span>")
-                w.adjustSize()   # the longer text: grow instead of clipping it (macOS)
+                wstatus.setText(f"<span style='color:#b3261e'>✗ {SHORT_FAIL}</span>")
+                fit()
                 return
         refresh()
         if job == "start" and (s.started or "moth running" in s.had):
