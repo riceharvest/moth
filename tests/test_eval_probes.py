@@ -168,7 +168,9 @@ def test_agent_metrics():
                          ("lol", "deploy_config.py sounds tasty")])]
     m = metrics.compute(rs)
     assert m["agent: bug on non-bug"] == (0.5, 2)   # the bug chat's replies are excluded
-    assert m["agent: explain/advice"][0] == 0.5   # "promote it" (advice) + copying deploy/config (summary)
+    # "promote it" is advice; copying deploy/config (2 words) no longer counts as a summary (gist-first: >= 3 words);
+    # that reply is caught as a code echo below instead
+    assert m["agent: explain/advice"][0] == 0.25
     assert m["agent: code echo"][0] == 0.25
 
 
@@ -219,7 +221,7 @@ def test_judge_all_with_fake_ask():
         seen.append(prompt)
         return 'sure: {"reason": "ok", "cute": 5, "charm": 4, "character": 3, "coherence": 4, "grounding": 5, "back_and_forth": 2}'
     judge_all(rs, None, ask=ask)
-    assert rs[0]["judge"]["back_and_forth"] == 2.0 and rs[0]["judge"]["v"] == 2 and rs[0]["judge"]["cute"] == 5.0
+    assert rs[0]["judge"]["back_and_forth"] == 2.0 and rs[0]["judge"]["v"] == 3 and rs[0]["judge"]["cute"] == 5.0
     assert "cute (the main score)" in seen[0]
     with tempfile.TemporaryDirectory() as d:
         rep = report(rs, d, "fake")

@@ -1,10 +1,12 @@
 """Filter teacher chats and turn them into SFT token rows.
 
   python -m moth.build_sft results/r3/a.jsonl [more.jsonl] --out data/sft [--cap-file r2_train.jsonl:0.08,...]
+      [--labels results/r4/a.labels.jsonl,...]
 
-Walks each chat to its first bad moth reply (assistant-speak, a crutch line, a repeated motif, a complex command,
-an explained agent message, ...) or made-up "what X" question, and keeps the part BEFORE that exchange if it still
-has >= 2 moth replies. Lowercases replies. Writes data/sft/{train,val}.pt: lists of (ids, loss_mask) where the mask
+Walks each chat to its first bad reply (assistant-speak, a crutch line, a repeated motif, unprompted identity talk
+past the first, a complex command, an explained agent message, an OFF-gist label from moth.gist, ...) or made-up
+"what X" question, and keeps the part BEFORE that exchange if it still has >= 2 replies. Each chat is encoded with
+its own card's student system prompt (cards.student_system; chats without a card: the moth card). Lowercases replies. Writes data/sft/{train,val}.pt: lists of (ids, loss_mask) where the mask
 covers moth's turns (tool calls and replies), not the system/user/tool tokens. Prints the effective mix first.
 """
 from __future__ import annotations
@@ -25,7 +27,9 @@ sys.path.insert(0, TA)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tiny_agent.chat import render  # noqa: E402
 from moth.agent import AGENT_TAG, clean_agent_message  # noqa: E402
-from moth.persona import FOLDERS, SYSTEM_STUDENT  # noqa: E402
+from moth.cards import MOTH_CARD, student_system  # noqa: E402
+from moth.gist import identity_ref, load_labels  # noqa: E402
+from moth.persona import FOLDERS, SYSTEM_STUDENT  # noqa: E402,F401
 
 MAX_WORDS = 40
 BANNED = ("as an ai", "assistant", "how can i help", "let me know", "feel free", "i'm here to help",
@@ -53,7 +57,7 @@ def clean_reply(t: str) -> str | None:
 
 
 def known_names(d: dict) -> set[str]:
-    names = set(FOLDERS)
+    names = set((d.get("card") or {}).get("folders") or FOLDERS)
     for p in list(d["home"]) + list(d.get("home_after") or {}):
         parts = p.split("/")
         names.update(parts)
@@ -103,11 +107,13 @@ TECHY = re.compile(r"\b[a-z]\w*_\w+\b|\w\(\)|\b\w+\.(?:py|js|ts|tsx|json|csv|md|
                    r"\b(?:ruff|mypy|pytest|npm|pip|git|github|docker|eslint|webpack|cargo|kubectl|ci|lint|linter|"
                    r"endpoints?|commits?|regex|api|json|csv|yaml|http|https|redis|schema|parser|tuple|repo)\b|"
                    r"\btests? (?:all )?(?:pass|passed|passes|passing)\b|\b(?:all )?\d+ tests\b")
-EXPLAINS = re.compile(r"\bmeans\b|\bmeasures?\b|\bthe agent (?:is |was )?say(?:ing|s)\b|\bit(?:'s| is) saying\b|"
-                      r"\bbasically\b|\bso it\b")
+# explaining the details, not acknowledging the outcome: "it fixed it!" / "so it works now?" / "i think it says it's
+# done" are gist-first reactions now (r3's list cut those too)
+EXPLAINS = re.compile(r"\bmeans\b|\bmeasures?\b|\bbasically\b|\bin other words\b|\bwhich is (?:a|an|the|where|how)\b")
 DODGE = re.compile(r"\bcan(?:'t|not) (?:understand|read|follow)\b|\bdon'?t (?:understand|get it)\b")
 BUG = re.compile(r"\bbugs?\b|\bgrand ?ma\b")   # the grandma lore belongs to messages that say "bug"
 MAX_AGENT_WORDS = 25
+MAX_IDENTITY_REFS = 1   # unprompted mentions of what it is / where it lives per chat (target ~5% of replies overall)
 MIN_REPEAT_WORDS = 2   # a human saying "ok" or "what" twice is fine
 MAX_SAME_REPLY = 15
 
@@ -196,6 +202,10 @@ def reply_problem(t: str, ctx: dict) -> str | None:
         if ctx["identity"] >= MAX_IDENTITY:
             return "identity"
         ctx["identity"] += 1
+    if identity_ref(t, ctx["card"], user + " " + ctx["tool_text"]):
+        if ctx["id_refs"] >= MAX_IDENTITY_REFS:
+            return "identity_heavy"
+        ctx["id_refs"] += 1
     # a motif word the friend (or a file moth just read, or the chat's topic) brought up is on topic:
     # "what glow?" -> "the glow is ...", a chat about streetlights
     here = user + " " + ctx["tool_text"] + " " + ctx["topic"]
@@ -211,16 +221,22 @@ def reply_problem(t: str, ctx: dict) -> str | None:
     return None
 
 
-def keep(d: dict, why: collections.Counter) -> list[dict] | None:
-    """The chat's usable messages: everything before the exchange holding its first problem (if >= 2 moth replies
-    remain), lowercased replies; None if the whole chat goes. Counts `<reason>:cut` / `<reason>:drop` in why."""
+def keep(d: dict, why: collections.Counter, labels: list[dict] | None = None) -> list[dict] | None:
+    """The chat's usable messages: everything before the exchange holding its first problem (if >= 2 replies
+    remain), lowercased replies; None if the whole chat goes. Counts `<reason>:cut` / `<reason>:drop` in why.
+    labels: moth.gist labels of this chat (one per reply with content, in order); an OFF one ends the usable part.
+    None = not labelled (unknown, no cut): gen_dialogs calls keep() mid-chat, before any label exists."""
     names = known_names(d)
     msgs = d["messages"]
     out = []
     seen_text = ""
     ctx = {"is_agent": chat_type(d) == "agent", "user": "", "agent_msg": "", "after_agent": False, "bug_said": False,
            "tool_text": "", "topic": str(d.get("topic") or ""), "n_replies": 0, "identity": 0,
-           "motif": collections.Counter(), "motif_replies": 0}
+           "motif": collections.Counter(), "motif_replies": 0, "card": d.get("card") or MOTH_CARD, "id_refs": 0}
+    if labels is not None and len(labels) != sum(bool(m.get("content")) for m in msgs if m["role"] == "assistant"):
+        why["labels_mismatch"] += 1
+        labels = None
+    orig_j = -1         # index of the current reply among the chat's original replies (= the label index)
     prev_reply = None   # moth's last reply, for "what X"
     start = 0           # index in out of the user turn that opened the current exchange
     reason = None
@@ -260,6 +276,10 @@ def keep(d: dict, why: collections.Counter) -> list[dict] | None:
             if reason:
                 break
             if m.get("content"):
+                orig_j += 1
+                if labels is not None and not labels[orig_j]["on"]:
+                    reason = "off_gist"
+                    break
                 t = clean_reply(m["content"])
                 if t is None:
                     reason = "style"
@@ -366,22 +386,32 @@ def stitchable(item: dict) -> bool:
 
 
 def mix_report(items: list[dict]) -> dict:
-    """The build's own sanity numbers over kept chats: per type, and per moth reply."""
+    """The build's own sanity numbers over kept chats: per type, and per reply."""
     types = collections.Counter(it["type"] for it in items)
     n = ident = qback = motif_any = 0
+    idref = collections.Counter()
+    nt = collections.Counter()
+    cards = collections.Counter("moth" if (it.get("card") or MOTH_CARD)["id"] == "moth" else
+                                "blank" if (it.get("card") or {}).get("id") == "blank" else "pool" for it in items)
     motif = collections.Counter()
     wx = wx_ok = 0
     for it in items:
-        prev = None
+        prev, last_user = None, ""
         for m in it["messages"]:
             if m["role"] == "user" and prev is not None and not m["content"].startswith(AGENT_TAG):
                 x = what_x(m["content"])
                 if x is not None:
                     wx += 1
                     wx_ok += x_in(x, prev)
+            if m["role"] == "user":
+                last_user = m["content"]
+            if m["role"] == "tool":
+                last_user += " " + " ".join(m["results"])
             if m["role"] == "assistant" and m.get("content"):
                 t = m["content"].replace("’", "'")
                 n += 1
+                nt[it["type"]] += 1
+                idref[it["type"]] += identity_ref(t, it.get("card") or MOTH_CARD, last_user)
                 ident += bool(IDENTITY.search(t))
                 qback += "?" in t
                 hits = [k for k, r in MOTIFS.items() if r.search(t)]
@@ -393,12 +423,14 @@ def mix_report(items: list[dict]) -> dict:
             "identity_rate": round(ident / max(n, 1), 4), "question_back_rate": round(qback / max(n, 1), 4),
             "motif_any_rate": round(motif_any / max(n, 1), 4),
             "motif_rates": {k: round(motif[k] / max(n, 1), 4) for k in MOTIFS},
-            "what_x_turns": wx, "what_x_contingent": round(wx_ok / max(wx, 1), 4)}
+            "what_x_turns": wx, "what_x_contingent": round(wx_ok / max(wx, 1), 4),
+            "identity_ref_rate": round(sum(idref.values()) / max(n, 1), 4),
+            "identity_ref_by_type": {k: round(idref[k] / max(nt[k], 1), 4) for k in nt}, "cards": dict(cards)}
 
 
-def encode(tok: Tokenizer, msgs: list[dict]) -> tuple[list[int], list[int]]:
+def encode(tok: Tokenizer, msgs: list[dict], card: dict | None = None) -> tuple[list[int], list[int]]:
     ids, mask = [], []
-    full = [{"role": "system", "content": SYSTEM_STUDENT}] + msgs
+    full = [{"role": "system", "content": student_system(card)}] + msgs
     for m in full:
         text = render([m])
         if m["role"] == "assistant":
@@ -437,7 +469,7 @@ def uses_eval_agent_msg(d: dict, keys: set[str]) -> bool:
 
 
 def filter_chats(paths: list[str], why: collections.Counter, cutoff: dict | None = None, held: set | None = None,
-                 eval_keys: set | None = None):
+                 eval_keys: set | None = None, labels: dict | None = None):
     """keep() over every chat of every file -> (kept items, keep-rate table by original moth-reply count)."""
     items, by_len = [], collections.defaultdict(collections.Counter)
     for path in paths:
@@ -459,13 +491,19 @@ def filter_chats(paths: list[str], why: collections.Counter, cutoff: dict | None
             orig = n_replies(d["messages"])
             b = by_len[(typ, bucket(orig))]
             b["in"] += 1
-            msgs = keep(d, why)
+            lab = None if labels is None else labels.get(d["seed"])
+            if labels is not None:
+                why["labelled_chats"] += lab is not None
+                if lab is not None:
+                    why["labelled_replies"] += len(lab)
+                    why["on_gist_replies"] += sum(x["on"] for x in lab)
+            msgs = keep(d, why, lab)
             if msgs is None:
                 continue
             b["kept"] += 1
             b["cut"] += n_replies(msgs) < orig
             items.append({"seed": d["seed"], "type": typ, "src": src, "scenario": d.get("scenario", ""),
-                          "messages": msgs, "home": d["home"]})
+                          "messages": msgs, "home": d["home"], "card": d.get("card")})
     return items, by_len
 
 
@@ -495,6 +533,9 @@ def main():
     ap.add_argument("--exclude-seeds", default=None, help="file of seeds to leave out (held-out probe chats)")
     ap.add_argument("--exclude-agent-msgs", default=None,
                     help="JSON list of held-out eval agent messages: drop chats whose [the agent said] turn is one")
+    ap.add_argument("--labels", default="",
+                    help="comma-separated moth.gist labels.jsonl files (seeds unique across inputs, as the fan-out "
+                         "seed ranges guarantee): cut each chat at its first OFF-gist reply; report the ON rate")
     ap.add_argument("--cap-file", default="",
                     help="name.jsonl:FRAC,...: chats from that file make up at most FRAC of the kept chats "
                          "(after filtering), e.g. r2_train.jsonl:0.08,r2_long.jsonl:0.02")
@@ -508,7 +549,8 @@ def main():
     held = {int(x) for x in open(a.exclude_seeds).read().split()} if a.exclude_seeds else set()
     why = collections.Counter()
     eval_keys = eval_agent_keys(a.exclude_agent_msgs) if a.exclude_agent_msgs else set()
-    items, by_len = filter_chats(a.inputs, why, cutoff, held, eval_keys)
+    labels = load_labels(a.labels.split(",")) if a.labels else None
+    items, by_len = filter_chats(a.inputs, why, cutoff, held, eval_keys, labels)
     rng = random.Random(0)
     items, cap_info = apply_caps(items, caps, rng)
     rows, kept, same = [], [], collections.Counter()
@@ -518,7 +560,7 @@ def main():
             why["repeated_reply:drop"] += 1
             continue
         same.update(replies)
-        ids, mask = encode(tok, it["messages"])
+        ids, mask = encode(tok, it["messages"], it.get("card"))
         if len(ids) > a.max_len:
             why["too_long:drop"] += 1
             continue
@@ -532,21 +574,27 @@ def main():
     # with depth. Chain train talk chats (never val ones) into one session so later replies sit deep in context.
     # Talk chats only and each at most once: stitched chats with different homes/names taught moth to ignore
     # what was said earlier.
+    # One card per session (the system prompt is the card's): the pool is grouped by card, groups in random order.
     pool = [k for k in range(nv, len(kept)) if stitchable(kept[k])]
     rng.shuffle(pool)
+    cid = lambda k: (kept[k].get("card") or MOTH_CARD).get("id")   # noqa: E731
+    gkey = {c: rng.random() for c in sorted({cid(k) for k in pool})}
+    pool.sort(key=lambda k: gkey[cid(k)])
     sessions = []
     while len(sessions) < a.sessions and len(pool) >= 2:
         msgs, ids_mask, used = [], None, 0
         target = rng.randint(1500, a.max_len)   # fill toward a random depth, so replies land all over 0..max_len
-        while pool:
-            cand = encode(tok, msgs + kept[pool[-1]]["messages"])
+        card = kept[pool[-1]].get("card")
+        while pool and cid(pool[-1]) == (card or MOTH_CARD).get("id"):
+            cand = encode(tok, msgs + kept[pool[-1]]["messages"], card)
             if len(cand[0]) > target:
                 break
             msgs, ids_mask, used = msgs + kept[pool.pop()]["messages"], cand, used + 1
         if used >= 2:
             sessions.append(ids_mask)
-        elif pool:
+        elif pool and used == 0:
             pool.pop()   # a chat too long to pair at this target: skip it
+        # used == 1: its card has no partner left that fits; that chat stays a normal row
     rows += sessions
 
     # the build's own sanity report: what the model will actually see
@@ -565,6 +613,11 @@ def main():
     print(f"  effective mix: types {rep['types']}, files {dict(src)}, "
           f"+{len(sessions)} stitched sessions (mean {sum(len(r[0]) for r in sessions) / max(len(sessions), 1):.0f} "
           f"tokens, from {sum(stitchable(k) for k in kept[nv:])} stitchable talk chats)")
+    if labels is not None:
+        print(f"  gist labels: {why['labelled_chats']}/{n_in} chats labelled; ON {why['on_gist_replies']}/"
+              f"{why['labelled_replies']} replies ({why['on_gist_replies'] / max(why['labelled_replies'], 1):.1%})")
+    print(f"  cards {rep['cards']}; unprompted identity refs {rep['identity_ref_rate']:.1%} of kept replies "
+          f"({', '.join(f'{k} {v:.1%}' for k, v in rep['identity_ref_by_type'].items())}; target ~5%, max 10%)")
     print(f"  moth replies {rep['replies']} ({rep['replies_per_chat']}/chat): identity {rep['identity_rate']:.1%}, "
           f"question back {rep['question_back_rate']:.1%}, any motif {rep['motif_any_rate']:.1%} "
           f"({', '.join(f'{k} {v:.1%}' for k, v in rep['motif_rates'].items())}); "

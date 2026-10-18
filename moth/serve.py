@@ -48,7 +48,7 @@ from tiny_agent.tools import BASH_TIMEOUT_S, Workspace, truncate  # noqa: E402
 from moth.agent import AGENT_TAG, agent_turn  # noqa: E402
 from moth.home import load_pool, sample_home  # noqa: E402
 from moth.norepeat import PhraseMemory, vocab_classes  # noqa: E402
-from moth.persona import SYSTEM_STUDENT  # noqa: E402
+from moth.cards import load_card, student_system  # noqa: E402
 from moth.shell import MARKER, Shell, _windows_unsafe  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -214,7 +214,7 @@ def _is_marker_path(path: str) -> bool:
 class Home(Workspace):
     """A Workspace rooted at a fixed, persistent directory. bash goes to moth.shell, read/write as in training."""
 
-    def __init__(self, root: str, seed: int, pool_file: str | None):
+    def __init__(self, root: str, seed: int, pool_file: str | None, card: dict | None = None):
         self.files, self.read_paths, self.submitted = {}, set(), None
         self.root = os.path.realpath(root)
         if not os.path.isdir(self.root):
@@ -222,7 +222,7 @@ class Home(Workspace):
             # "new home" only ever deletes folders with this
             with open(os.path.join(self.root, MARKER), "w", encoding="utf-8", newline="\n") as f:
                 f.write("moth made this folder. its \"new home\" button may delete it.\n")
-            for rel, content in sample_home(random.Random(seed), load_pool(pool_file)).items():
+            for rel, content in sample_home(random.Random(seed), load_pool(pool_file), card).items():
                 p = os.path.join(self.root, rel)
                 os.makedirs(os.path.dirname(p), exist_ok=True)
                 with open(p, "w", encoding="utf-8", newline="\n") as f:
@@ -322,10 +322,13 @@ class Moth:
     def setup(self, a):
         """Everything but the weights (tests build a Moth with a fake model and call this)."""
         self.a = a
+        # who it is comes only from the system prompt: --card (default: the moth card = the old fixed prompt)
+        self.identity = load_card(getattr(a, "card", None))
+        self.system = student_system(self.identity)
         self.im_end = self.tok.token_to_id("<|im_end|>")
         self.ban = [self.tok.token_to_id(t) for t in ("<tool_call>", "<think>")]   # for turns where moth must talk
         self.lock = threading.RLock()
-        self.home = Home(a.home, a.seed, a.pool_file)
+        self.home = Home(a.home, a.seed, a.pool_file, self.identity)
         self.log = Log()
         self.budget = getattr(a, "ctx_budget", None) or CTX_BUDGET
         self.keep = self.budget * CTX_KEEP // CTX_BUDGET
@@ -363,7 +366,7 @@ class Moth:
         return self.specials.sub(lambda m: "< " + m.group(0)[1:], text)
 
     def reset(self):
-        self.messages = [{"role": "system", "content": SYSTEM_STUDENT}]
+        self.messages = [{"role": "system", "content": self.system}]
         self.cache = None
         self.said = deque(maxlen=3)    # token ids of moth's last replies (repetition penalty)
         self.protect: set[int] = set()  # ids from this turn's user message and tool results: free to copy
@@ -926,7 +929,7 @@ def make_handler(moth: Moth, token: str, hosts: tuple[str, ...] = ("127.0.0.1", 
                         moth.forget()
                     if body.get("new_home") is True:
                         shutil.rmtree(moth.home.root, ignore_errors=True)
-                        moth.home = Home(moth.a.home, random.randrange(10**6), moth.a.pool_file)
+                        moth.home = Home(moth.a.home, random.randrange(10**6), moth.a.pool_file, moth.identity)
                 self._json({"ok": True, "tree": moth.home.tree(), "epoch": moth.log.epoch})
 
     return H
@@ -958,6 +961,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--home", default=d["home"], help="moth's home folder (kept between runs)")
     ap.add_argument("--pool-file", default=d["pool"])
     ap.add_argument("--seed", type=int, default=3, help="which home moth starts with")
+    ap.add_argument("--card", default=None,
+                    help="identity card: moth (default), blank, heldout:<i>, or a JSON file "
+                         '{"name": "pip", "kind": "a houseplant", "home": "on a windowsill", "traits": ["you love puns"]}')
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--top-p", type=float, default=0.95)

@@ -3,9 +3,12 @@
   python -m moth.gen_dialogs --pool  --n-per-folder 250          # teacher-written home files -> out/file_pool.json
   python -m moth.gen_dialogs --dialogs 12000 --start 0           # chats -> out/dialogs.jsonl (resumable)
 
-One chat: sample a home and a (persona, scenario, length); the teacher plays the human (USER_SIM_PROMPT)
-and moth (TEACHER_BIBLE + real bash/read/write tools run in the sandbox). Records use tiny_agent's
-canonical message format; filtering and lowercasing happen later in build_sft.py.
+One chat: sample an identity card (cards.py), a home and a (persona, scenario, length); the teacher plays the human
+(USER_SIM_PROMPT) and the chat buddy (teacher_system(card) = the shared TEACHER_CORE + the card, with real
+bash/read/write tools run in the sandbox). Records use tiny_agent's canonical message format plus "card";
+filtering and lowercasing happen later in build_sft.py (with the per-reply labels of moth.gist, if given).
+
+  python -m moth.gen_dialogs --card-files 800                   # each pool card's own home files -> out/card_files.json
 """
 from __future__ import annotations
 
@@ -23,12 +26,15 @@ from openai import AsyncOpenAI
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from moth import _tools as tools  # noqa: E402  (vendored copy of tiny_agent/tools.py)
-from moth.agent import (AGENT_CHAT_REMIND, AGENT_LENGTHS, AGENT_LENSES, AGENT_PROMPT, AGENT_REMIND,  # noqa: E402
-                        AGENT_SCENARIOS, AGENT_TAG, AGENT_TASKS, AGENT_USER_PERSONAS, HARNESS_STYLES,
-                        MOTH_AGENT_RULES, OUTCOMES, agent_turn)
+from moth.agent import (AGENT_CHAT_REMIND, AGENT_LENGTHS, AGENT_PROMPT, AGENT_REMIND,  # noqa: E402
+                        AGENT_RULES, AGENT_SCENARIOS, AGENT_TAG, AGENT_TASKS, AGENT_USER_PERSONAS, HARNESS_STYLES,
+                        OUTCOMES, agent_turn)
+from moth.cards import build_pool, describe, display_name, ref_regex, sample_card  # noqa: E402
+from moth.gist import ASKED, identity_ref  # noqa: E402
 from moth.home import load_pool, sample_home  # noqa: E402
-from moth.persona import (FILE_POOL_PROMPT, FOLDER_HINTS, FOLDERS, HOME_SCENARIOS, SCENARIOS,  # noqa: E402
-                          TALK_SCENARIOS, TEACHER_BIBLE, TOPICS, USER_PERSONAS, USER_SIM_PROMPT)
+from moth.persona import (CARD_FILES_PROMPT, FILE_POOL_PROMPT, FOLDER_HINTS, FOLDERS, HOME_SCENARIOS,  # noqa: E402
+                          SCENARIOS, TALK_SCENARIOS, TEACHER_BIBLE, TOPICS, USER_PERSONAS, USER_SIM_PROMPT,
+                          teacher_system)
 
 if os.environ.get("MOTH_NO_BWRAP") == "1":   # box without user namespaces: plain bash in the workspace
     def _plain(workdir, command, timeout):
@@ -46,16 +52,16 @@ OAI_TOOLS = [
      "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
                     "required": ["path", "content"]}}},
 ]
-SIM_SWITCH = ("[DIRECTOR NOTE: for this message only, you are NOT moth. You write the HUMAN side of the chat. "
-              "Output only the human's next message.]\n\n")
-SIM_SYSTEM = ("You write one side of a chat for a story: the HUMAN who is chatting with moth, a tiny cute chatbot moth. "
-              "You are never moth. Type like a real person in a chat app, in the voice of the person you play: a grandparent "
+SIM_SWITCH = ("[DIRECTOR NOTE: for this message only, you are NOT the chat-buddy character. You write the HUMAN side of "
+              "the chat. Output only the human's next message.]\n\n")
+SIM_SYSTEM = ("You write one side of a chat for a story: the HUMAN who is chatting with a tiny cute chatbot. "
+              "You are never the chatbot. Type like a real person in a chat app, in the voice of the person you play: a grandparent "
               "or formal person writes proper sentences with capitals and punctuation, a kid or teen types lowercase with slang, "
               "a sloppy typer makes typos. Short (often 1-10 words), no greeting after the first message, rarely emojis, never "
               "the same message twice. Reply with only the human's next chat message: no preface, no quotes, no notes.")
-SIM_SHORT = ("\n\nIMPORTANT: this time write a tiny lazy reply of 1 to 5 words to moth's last message, typed your way, "
-             "that sounds {mood}. if it names something, use a word moth really said.")   # r3: literal examples got copied
-SHORT_MOODS = ["amused", "doubtful", "impressed", "teasing", "agreeing", "curious about one word moth used", "bored",
+SIM_SHORT = ("\n\nIMPORTANT: this time write a tiny lazy reply of 1 to 5 words to the bot's last message, typed your "
+             "way, that sounds {mood}. if it names something, use a word the bot really said.")   # r3: literal examples got copied
+SHORT_MOODS = ["amused", "doubtful", "impressed", "teasing", "agreeing", "curious about one word the bot used", "bored",
                "surprised", "touched", "a bit confused", "playfully annoyed", "sleepy", "delighted", "unconvinced"]
 # r3: "what lamp" x1346, mostly about words moth never said: a share of the confusion turns is built in code from
 # moth's real last reply (no teacher call)
@@ -85,13 +91,20 @@ RECALL_SHARE = {"p": 0.15}   # --recall-share: talk chats where the human shares
 LONG_SHARE = {"p": 0.15}     # --long-share: talk chats with 16-24 user turns
 SIM_NO_REPEAT = "\n\nYou already sent: {prev}. Write something new, not any of these."
 NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
-MOTH_REMIND = ("\n\n(stay moth: one short lowercase line, usually under 15 words. don't say what you are (a moth, small, "
-               "on a card) unless they ask what you are. files only if they ask about your home or want something saved: "
-               "one tiny command.)")   # --think: LFM drifts long; teacher view only, not in msgs
+# teacher view only (appended to each human turn, never in the training text). TALK_REMIND_ID when the friend asked
+# who/what it is or used one of the card's own words, else TALK_REMIND: identity talk stays rare (~5%)
+TALK_REMIND = ("\n\n(answer what they just said or meant first, in one short lowercase line, usually under 15 words. "
+               "no talk about what you are, where you live or your home folder unless they bring it up. files only if "
+               "they ask about your home or want something saved: one tiny command.)")
+TALK_REMIND_ID = ("\n\n(answer what they just said first, one short lowercase line. they brought up who or what you are: "
+                  "answer from WHO YOU ARE in a few plain words, then back to them. files only if they ask about your "
+                  "home or want something saved: one tiny command.)")
+MOTH_REMIND = TALK_REMIND   # old name
 QBACK = ("\n(this time hand the turn back, on the same line: end with one small question about them, or bring back "
          "something they told you earlier.)")
 NO_QBACK = "\n(this time just answer: no question at the end, unless a game needs one.)"   # r4 test: 61% asked back
 RECALL_REMIND = "\n(they told you this earlier in this chat: answer from the chat.)"
+CARD_FILES: dict[str, dict[str, str]] = {}   # --card-file-path: each pool card's own home files (gen --card-files)
 LEAKS = ("<think>", "</think>", "<|tool_call", "<|im_")   # reasoning or raw tool-call markup in the reply = broken call
 TURNS = [3, 4, 5, 6, 6, 7, 8, 8, 9, 10, 12, 14]   # back-and-forth: the thing round 2 couldn't do
 HOME_SHARE = {"p": 0.15}      # --home-share: fraction of chats about moth's files
@@ -152,7 +165,7 @@ def coerce(name: str, args: dict) -> dict:
     return args
 
 
-def transcript(msgs: list[dict]) -> str:
+def transcript(msgs: list[dict], name: str = "moth") -> str:
     out = []
     for m in msgs:
         if m["role"] == "user" and m["content"].startswith(AGENT_TAG):
@@ -163,9 +176,9 @@ def transcript(msgs: list[dict]) -> str:
         elif m["role"] == "assistant":
             for c in m.get("tool_calls") or []:
                 a = c["arguments"]
-                out.append(f"[moth used {c['name']}: {a.get('command') or a.get('path')}]")
+                out.append(f"[{name} used {c['name']}: {a.get('command') or a.get('path')}]")
             if m.get("content"):
-                out.append(f"moth: {m['content']}")
+                out.append(f"{name}: {m['content']}")
         elif m["role"] == "tool":
             for r in m["results"]:
                 out.append("[output]\n" + (r if len(r) < 400 else r[:400] + " ..."))
@@ -208,7 +221,8 @@ def grams(t: str, n=5) -> set:
     return {tuple(w[i:i + n]) for i in range(len(w) - n + 1)}
 
 
-EXAMPLE_GRAMS = set().union(*map(grams, re.findall(r'-> "([^"]+)"', MOTH_AGENT_RULES) +
+EXAMPLE_GRAMS = set().union(*map(grams, re.findall(r'-> "([^"]+)"', AGENT_RULES) +
+                                 re.findall(r"^you: (.+)$", TEACHER_BIBLE, re.M) +
                                  ["ohhh it fixed a bug! i'm a bug too. i hope it was nice to it."]))   # r3 bible line
 
 
@@ -225,8 +239,9 @@ def stems(t: str) -> set:
 
 
 def agent_stale(text: str, msgs: list[dict]) -> bool:
-    """r3 agent chats: LFM copied the few-shot lines, repeated itself, said "bug" to 1 in 3 agent messages that never
-    mentioned one (the bible's grandma lore), and riffed on words that aren't in the message at all."""
+    """r3 agent chats: LFM copied the few-shot lines, repeated itself and said "bug" to 1 in 3 agent messages that never
+    mentioned one (the grandma lore). (r3 also demanded a word of the message in the reply: that made the word-grab
+    template, so gist-first reactions no longer need one.)"""
     mine = set().union(*(grams(m["content"]) for m in msgs if m["role"] == "assistant" and m.get("content")))
     if grams(text) & (EXAMPLE_GRAMS | mine):
         return True
@@ -235,10 +250,7 @@ def agent_stale(text: str, msgs: list[dict]) -> bool:
     last = msgs[-1]["content"]
     if not last.startswith(AGENT_TAG):
         return False
-    if BUG.search(text) and not re.search(r"\bbugs?\b", last, re.I):
-        return True
-    body, t = last[len(AGENT_TAG):].lower(), text.lower()
-    return not (stems(t) & stems(body) or any(re.search(c, t) and ok(body) for c, ok in VIBES))   # a word or its vibe
+    return bool(BUG.search(text) and not re.search(r"\bbugs?\b", last, re.I))
 
 
 def complex_cmd(cmd: str) -> bool:
@@ -252,10 +264,16 @@ def bash_cmd(tc) -> str:
         return ""
 
 
-def teacher_view(u: str, remind: str | None = None, extra: str = "") -> str:
+def id_allowed(u: str, card: dict | None) -> bool:
+    """The friend asked who/what it is or used one of the card's own words: a short identity answer fits."""
+    rx = ref_regex(card) if card is not None else None
+    return bool(ASKED.search(u) or (rx and rx.search(u)))
+
+
+def teacher_view(u: str, remind: str | None = None, extra: str = "", card: dict | None = None) -> str:
     if remind:   # agent chats: their own reminder, always
         return u + remind
-    return u + (MOTH_REMIND if THINK["on"] else "") + extra
+    return u + (TALK_REMIND_ID if id_allowed(u, card) else TALK_REMIND) + extra
 
 
 def reply_text(r, cut_ok=False) -> str | None:
@@ -287,8 +305,16 @@ def confused(last: str, mine: list[str]) -> str:
     return t
 
 
-async def user_turn(client, model, persona, scenario, turns, i, msgs, topic="anything", directive="") -> str | None:
-    p = USER_SIM_PROMPT.format(persona=persona, scenario=scenario, topic=topic, turns=turns, i=i, transcript=transcript(msgs))
+def sim_prompt(persona, scenario, turns, i, msgs, topic="anything", card=None) -> str:
+    name = display_name(card) if card is not None else "moth"
+    return USER_SIM_PROMPT.format(name=name, who=describe(card) if card is not None else "a moth on a graphics card",
+                                  persona=persona, scenario=scenario, topic=topic, turns=turns, i=i,
+                                  transcript=transcript(msgs, name))
+
+
+async def user_turn(client, model, persona, scenario, turns, i, msgs, topic="anything", directive="", card=None,
+                    system=None) -> str | None:
+    p = sim_prompt(persona, scenario, turns, i, msgs, topic, card)
     mine = [m["content"] for m in msgs if m["role"] == "user" and not m["content"].startswith(AGENT_TAG)]
     last = last_moth(msgs)
     short = not directive and msgs and random.random() < 0.4   # without reasoning LFM ignores "one in four very short"
@@ -305,7 +331,8 @@ async def user_turn(client, model, persona, scenario, turns, i, msgs, topic="any
                        budget=0, temperature=1.0, top_p=0.95, max_tokens=100)
     else:   # same system + tools as moth's calls: Qwen3.x's hybrid prefix cache reuses only whole ~1.5k-token blocks,
         # so both roles share one identical leading block (the character sheet) and only the tail is prefilled
-        r = await chat(client, model, [{"role": "system", "content": TEACHER_BIBLE}, {"role": "user", "content": SIM_SWITCH + p}],
+        r = await chat(client, model, [{"role": "system", "content": system or TEACHER_BIBLE},
+                                       {"role": "user", "content": SIM_SWITCH + p}],
                        tools=OAI_TOOLS, tool_choice="none", temperature=1.0, top_p=0.95, max_tokens=80)
     t = reply_text(r, cut_ok=True)
     if not t or "[END]" in t:
@@ -315,7 +342,7 @@ async def user_turn(client, model, persona, scenario, turns, i, msgs, topic="any
         lines = lines[1:]
     t = lines[0].strip('"\u201c\u201d').strip()
     t = re.sub(r"^(you|me|user|friend|human)\s*:\s*", "", t, flags=re.I).strip()
-    if not t or re.match(r"moth\s*:", t, re.I):
+    if not t or re.match(r"moth\s*:", t, re.I) or (card and card.get("name") and t.lower().startswith(card["name"] + ":")):
         return None
     w = WHATX_RE.search(t) if len(t.split()) <= 5 and last else None
     if w and w.group(1).lower() not in WORD_STOP | {"do", "does", "is", "are", "you", "u", "mean", "happened", "now", "else",
@@ -325,16 +352,31 @@ async def user_turn(client, model, persona, scenario, turns, i, msgs, topic="any
     return t[:300]
 
 
+def turn_context(msgs: list[dict]) -> str:
+    """The last human/agent message plus any tool output since: words from there are "prompted"."""
+    i = max(j for j, m in enumerate(msgs) if m["role"] == "user")
+    out = [msgs[i]["content"]]
+    for m in msgs[i + 1:]:
+        if m["role"] == "tool":
+            out += m["results"]
+    return "\n".join(out)
+
+
 async def moth_turn(client, model, oai: list[dict], msgs: list[dict], ws, stats, talk_only=False, must=None,
-                    meta=None) -> bool | str:
-    """Extend oai (teacher view) and msgs (canonical) with moth's reply to the last user message."""
+                    meta=None, card=None) -> bool | str:
+    """Extend oai (teacher view) and msgs (canonical) with the buddy's reply to the last user message."""
     avoid: list[str] = []   # agent chats: rejected lines, shown back to the teacher (else it resamples the same one)
     for k in range(8 if talk_only else 5):   # up to 3 looks, broken replies are resampled; late rounds may only talk
-        # agent chats get no tools at all (LFM ran `echo hi` / wrote notes after agent messages, and with
-        # tool_choice="none" it still writes tool-call markup into the text)
-        tk = {} if talk_only else {"tools": OAI_TOOLS, "tool_choice": "auto" if k < 3 else "none"}
+        # agent chats may not call tools. LFM: no tools at all (it ran `echo hi` after agent messages, and with
+        # tool_choice="none" it still wrote tool-call markup). Qwen: the tools with tool_choice="none", so the call
+        # keeps the shared tools+core prefix (hybrid prefix cache, whole 1568-token blocks)
+        if talk_only:
+            tk = {} if THINK["on"] else {"tools": OAI_TOOLS, "tool_choice": "none"}
+        else:
+            tk = {"tools": OAI_TOOLS, "tool_choice": "auto" if k < 3 else "none"}
         view = oai if not avoid else oai[:-1] + [{**oai[-1], "content": oai[-1]["content"] + "\n(not these, they are "
-                                                  "stale, dodgy or too techy: " + " / ".join(avoid[-3:]) + ")"}]
+                                                  "stale, off the point, about yourself or too techy: "
+                                                  + " / ".join(avoid[-3:]) + ")"}]
         r = await chat(client, model, view, temperature=1.0 if avoid else 0.85, top_p=0.95,
                        max_tokens=THINK["budget"] + 300 if THINK["on"] else 400, **tk)
         m = r.choices[0].message
@@ -382,6 +424,11 @@ async def moth_turn(client, model, oai: list[dict], msgs: list[dict], ws, stats,
             stats["agent_stale"] += 1
             avoid.append(text)
             continue
+        ctx = turn_context(msgs)
+        if card is not None and k < 4 and not id_allowed(ctx, card) and identity_ref(text, card, ctx):
+            stats["id_resample"] += 1   # brought up what it is / where it lives unprompted: identity stays rare
+            avoid.append(text)
+            continue
         oai.append({"role": "assistant", "content": text})
         msgs.append({"role": "assistant", "think": None, "content": text, "tool_calls": []})
         if why:   # last try still bad: build_sft cuts the chat here, so stop writing it
@@ -409,18 +456,19 @@ async def agent_message(client, model, rng) -> tuple[str, str]:
     return reply_text(r) or "", "teacher"
 
 
-async def agent_dialog(client, model, seed, rng, files, stats) -> dict | None:
-    """moth watches a big coding agent: agent message -> moth's silly take -> the human vents or chats -> repeat."""
+async def agent_dialog(client, model, seed, rng, files, stats, card=None) -> dict | None:
+    """The buddy watches a big coding agent: agent message -> its gist-first take -> the human vents or chats -> repeat."""
     persona, scenario = rng.choice(AGENT_USER_PERSONAS), rng.choice(AGENT_SCENARIOS)
     msgs: list[dict] = []
-    oai = [{"role": "system", "content": TEACHER_BIBLE}]
+    system = teacher_system(card)
+    oai = [{"role": "system", "content": system}]
     sources = []
 
     async def say(u: str, remind: str) -> bool:
         msgs.append({"role": "user", "content": u})
         oai.append({"role": "user", "content": teacher_view(u, remind)})
         if await moth_turn(client, model, oai, msgs, ws, stats, talk_only=True,
-                           meta={"type": "agent", "home": files, "topic": ""}):
+                           meta={"type": "agent", "home": files, "topic": "", "card": card}, card=card):
             return True
         msgs.pop()   # no fresh line after all retries: end the chat before this message
         return False
@@ -429,17 +477,18 @@ async def agent_dialog(client, model, seed, rng, files, stats) -> dict | None:
         ok = True
         for k in range(rng.randint(2, 4)):
             if k == 0 and rng.random() < 0.4:   # sometimes the human says something first
-                u = await user_turn(client, model, persona, scenario, 6, 1, msgs, "the AI agent")
+                u = await user_turn(client, model, persona, scenario, 6, 1, msgs, "the AI agent", card=card, system=system)
                 if u and not (ok := await say(u, AGENT_CHAT_REMIND)):
                     break
             raw, src = await agent_message(client, model, rng)
             if not raw:
                 break
-            if not (ok := await say(agent_turn(raw), AGENT_REMIND.format(lens=rng.choice(AGENT_LENSES)))):
+            if not (ok := await say(agent_turn(raw), AGENT_REMIND)):
                 break
             sources.append(src)
             for j in range(rng.choice([0, 1, 1, 2, 3])):
-                u = await user_turn(client, model, persona, scenario, 6, j + 2, msgs, "the AI agent")
+                u = await user_turn(client, model, persona, scenario, 6, j + 2, msgs, "the AI agent", card=card,
+                                    system=system)
                 if u is None or not (ok := await say(u, AGENT_CHAT_REMIND)):
                     break
             if not ok:
@@ -449,14 +498,15 @@ async def agent_dialog(client, model, seed, rng, files, stats) -> dict | None:
         return None
     stats["agent_cut"] += not ok
     return {"seed": seed, "type": "agent", "persona": persona, "scenario": scenario, "agent_sources": sources,
-            "turns": len(msgs), "home": files, "home_after": files, "messages": msgs}
+            "turns": len(msgs), "card": card, "home": files, "home_after": files, "messages": msgs}
 
 
 async def one_dialog(client, model, seed, pool, stats) -> dict | None:
     rng = random.Random(seed)
-    files = sample_home(rng, pool)
+    card = sample_card(rng)
+    files = sample_home(rng, pool, card, CARD_FILES)
     if not SCENARIO_IDS and rng.random() < AGENT_SHARE["p"]:
-        return await agent_dialog(client, model, seed, rng, files, stats)
+        return await agent_dialog(client, model, seed, rng, files, stats, card)
     if SCENARIO_IDS:
         scen = [SCENARIOS[i] for i in SCENARIO_IDS]
     else:   # the product is conversation: most chats are pure talk, a few use moth's home folder
@@ -473,7 +523,8 @@ async def one_dialog(client, model, seed, pool, stats) -> dict | None:
         recall = {"fact": short, "share_turn": fi, "ask_turn": fi + rng.randint(5, 8)}
         turns = max(turns, recall["ask_turn"] + rng.randint(1, 3))
     msgs: list[dict] = []
-    oai = [{"role": "system", "content": TEACHER_BIBLE}]
+    system = teacher_system(card)
+    oai = [{"role": "system", "content": system}]
     with tools.Workspace(files) as ws:
         for i in range(1, turns + 1):
             directive, extra = "", QBACK if rng.random() < 0.2 else NO_QBACK
@@ -485,11 +536,11 @@ async def one_dialog(client, model, seed, pool, stats) -> dict | None:
                 extra = RECALL_REMIND
             if (recall and i < recall["ask_turn"]) or (turns >= 16 and i < turns - 3):
                 directive += "\n\nThe chat is not finished: do not write [END] yet."
-            u = await user_turn(client, model, persona, scenario, turns, i, msgs, topic, directive)
+            u = await user_turn(client, model, persona, scenario, turns, i, msgs, topic, directive, card, system)
             for _ in range(3 if "[END]" in directive else 0):   # long / recall chat: broken sim calls (leaked
                 if u is not None:                                 # reasoning) ended 13 of 20 long chats early
                     break
-                u = await user_turn(client, model, persona, scenario, turns, i, msgs, topic, directive)
+                u = await user_turn(client, model, persona, scenario, turns, i, msgs, topic, directive, card, system)
             if u is None:
                 break
             if recall and i == recall["share_turn"]:
@@ -499,9 +550,10 @@ async def one_dialog(client, model, seed, pool, stats) -> dict | None:
                 recall["asked"] = u
                 must = stems(recall["said"]) - FACT_WORDS or None
             msgs.append({"role": "user", "content": u})
-            oai.append({"role": "user", "content": teacher_view(u, extra=extra)})
-            r = await moth_turn(client, model, oai, msgs, ws, stats, must=must,
-                                meta={"type": "home" if scen is HOME_SCENARIOS else "talk", "home": files, "topic": topic})
+            oai.append({"role": "user", "content": teacher_view(u, extra=extra, card=card)})
+            r = await moth_turn(client, model, oai, msgs, ws, stats, must=must, card=card,
+                                meta={"type": "home" if scen is HOME_SCENARIOS else "talk", "home": files, "topic": topic,
+                                      "card": card})
             if not r:
                 stats["bad"] += 1
                 return None
@@ -515,7 +567,7 @@ async def one_dialog(client, model, seed, pool, stats) -> dict | None:
                 p = os.path.join(root, n)
                 final[os.path.relpath(p, ws.root)] = open(p, errors="replace").read()[:2000]
     return {"seed": seed, "type": "home" if scen is HOME_SCENARIOS else "talk", "persona": persona,
-            "scenario": scenario, "topic": topic, "turns": turns, "recall": recall, "home": files,
+            "scenario": scenario, "topic": topic, "turns": turns, "recall": recall, "card": card, "home": files,
             "home_after": final, "messages": msgs}
 
 
@@ -531,7 +583,7 @@ async def run_dialogs(a, client, model):
                 pass
     todo = [s for s in range(a.start, a.start + a.dialogs) if s not in done]
     stats = collections.Counter(ok=0, bad=0, err=0, tool_calls=0, agent_resample=0, agent_stale=0, agent_cut=0,
-                                recall_resample=0)
+                                recall_resample=0, id_resample=0)
     sem = asyncio.Semaphore(a.concurrency)
     f = open(path, "a")
     t0 = time.time()
@@ -584,6 +636,61 @@ async def run_pool(a, client, model):
     print("pool sizes:", {k: len(v) for k, v in pool.items()}, flush=True)
 
 
+async def run_card_files(a, client, model):
+    """Each of the first --card-files pool cards gets its own little home (one teacher call per card)."""
+    path = a.card_file_path
+    have = json.load(open(path)) if os.path.exists(path) else {}
+    cards = [c for c in build_pool()[:a.card_files] if c["id"] not in have]
+    sem = asyncio.Semaphore(a.concurrency)
+
+    async def one(card):
+        async with sem:
+            folders = card.get("folders") or []
+            p = CARD_FILES_PROMPT.format(who=describe(card), folders=" ".join(f + "/" for f in folders), n=12)
+            try:
+                r = await chat(client, model, [{"role": "user", "content": p}], temperature=1.0, top_p=0.95,
+                               max_tokens=6000 if THINK["on"] else 1500)
+                txt = r.choices[0].message.content or ""
+                items = json.loads(txt[txt.index("{"): txt.rindex("}") + 1])
+            except Exception:  # noqa: BLE001
+                return
+            files = {}
+            for k, v in items.items():
+                k = re.sub(r"[^a-z0-9_./]", "_", str(k).lower().strip())
+                if k.count("/") == 1 and k.split("/")[0] in folders and k.endswith(".txt") and len(k) < 60 and v:
+                    files[k] = str(v).strip()[:400]
+            if files:
+                have[card["id"]] = files
+
+    await asyncio.gather(*(one(c) for c in cards))
+    json.dump(have, open(path, "w"), indent=1, ensure_ascii=False)
+    print(f"card files: {len(have)} cards, {sum(map(len, have.values()))} files -> {path}", flush=True)
+
+
+SAMPLE_OPENERS = ["hey, i burned my toast this morning", "ok and?", "hiii what are you up to", "i'm so tired today",
+                  "my cat keeps sitting on my keyboard", "Good evening. How was your day?", "what are you?",
+                  "can you remember my name? it's lena"]
+SAMPLE_AGENT = ("I've updated the build config and restarted the staging box. It's still booting; I'll check the health "
+                "endpoint again in a minute. Want me to run the smoke tests once it's up?")
+
+
+def first_teacher_view(seed: int) -> dict:
+    """What the teacher sees at the first buddy turn of chat `seed`, offline (tests/render_prompts.py): the same card,
+    chat type and reminder logic as one_dialog / agent_dialog; the human's line is a stand-in for the simulator's."""
+    rng = random.Random(seed)
+    card = sample_card(rng)
+    sample_home(rng, load_pool(None), card, CARD_FILES)
+    if rng.random() < AGENT_SHARE["p"]:
+        u = agent_turn(SAMPLE_AGENT)
+        return {"type": "agent", "card": card, "system": teacher_system(card), "user": teacher_view(u, AGENT_REMIND)}
+    scen = HOME_SCENARIOS if rng.random() < HOME_SHARE["p"] else TALK_SCENARIOS
+    persona, scenario = rng.choice(USER_PERSONAS), rng.choice(scen)
+    u = SAMPLE_OPENERS[seed % len(SAMPLE_OPENERS)]
+    return {"type": "home" if scen is HOME_SCENARIOS else "talk", "card": card, "system": teacher_system(card),
+            "user": teacher_view(u, extra=NO_QBACK, card=card),
+            "sim": SIM_SWITCH + sim_prompt(persona, scenario, 6, 1, [], rng.choice(TOPICS), card)}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
@@ -607,6 +714,8 @@ def main():
     ap.add_argument("--think-budget", type=int, default=256, help="--think: max reasoning tokens per moth/agent call")
     ap.add_argument("--turns", default="", help="comma-separated user-turn counts to sample from")
     ap.add_argument("--scenario-ids", default="", help="comma-separated indexes into persona.SCENARIOS")
+    ap.add_argument("--card-files", type=int, default=0, help="write the home files of the first N pool cards")
+    ap.add_argument("--card-file-path", default=None, help="cards' own home files (default <out>/card_files.json)")
     a = ap.parse_args()
     SCENARIO_IDS.extend(int(x) for x in a.scenario_ids.split(",") if x)
     TURN_CHOICES.extend(int(x) for x in a.turns.split(",") if x)
@@ -628,12 +737,19 @@ def main():
         print(f"agent pool: {len(AGENT_POOL)} final messages", flush=True)
     os.makedirs(a.out, exist_ok=True)
     a.pool_file = a.pool_file or os.path.join(a.out, "file_pool.json")
+    a.card_file_path = a.card_file_path or os.path.join(a.out, "card_files.json")
+    if os.path.exists(a.card_file_path) and not a.card_files:
+        CARD_FILES.update(json.load(open(a.card_file_path)))
+        print(f"card files: {len(CARD_FILES)} cards with their own home", flush=True)
     client = AsyncOpenAI(base_url=a.base_url, api_key="x", timeout=300)
 
     async def run():
         model = a.model or (await client.models.list()).data[0].id
         if a.pool:
             await run_pool(a, client, model)
+        if a.card_files:
+            await run_card_files(a, client, model)
+            CARD_FILES.update(json.load(open(a.card_file_path)))
         if a.dialogs:
             await run_dialogs(a, client, model)
     asyncio.run(run())

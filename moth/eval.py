@@ -1,6 +1,7 @@
 """Test moth like a user would: scripted multi-turn probes through the real chat engine (moth.serve.Moth).
 
   python -m moth.eval --model runs/sft1/model --samples 3 --device cuda [--judge-url http://127.0.0.1:8000/v1] [--out DIR]
+      [--cards moth,heldout:0,heldout:4,heldout:8]
 
 Probes live in moth/probes.py (scripted chats, "what X" follow-ups built from moth's own reply, recall at 5/10/20
 turns, the user's own typing style, held-out real agent final messages). Every (probe, sample) gets a seed from a
@@ -9,7 +10,10 @@ python -m moth.pairwise A/results.json B/results.json).
 
 Per reply: automatic flags (style, invented files, leaked format tokens, tool errors, repeats) and the deterministic
 metrics of moth/metrics.py (identity crutch, bible copy, dodge, agent misreadings, repeats, diversity, motifs).
-Per probe: the write/recall/what-X checks. With --judge-url, a teacher scores each chat 1-5 (JUDGE below).
+Per probe: the write/recall/what-X/follows-card checks. --cards runs the probes once per identity card (the moth card
+and held-out cards that never appear in training; moth-only probes are skipped for the others).
+With --judge-url: the headline is per reply, on_gist % (moth.gist's label prompt, the same one build_sft filters with);
+the teacher also scores each chat 1-5 (JUDGE below), which counts for less.
 Writes <out>/report.md (tables), <out>/transcripts.md (every chat, for reading by eye) and <out>/results.json.
 """
 from __future__ import annotations
@@ -28,7 +32,9 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from moth.agent import AGENT_TAG  # noqa: E402
 from moth.build_sft import BANNED, FILE_RE  # noqa: E402
-from moth.probes import WHAT_X, all_probes, on_word, stable_seed, what_word  # noqa: E402
+from moth.cards import describe, load_card, student_system  # noqa: E402
+from moth.gist import chat_for_label_turns, follows_card, label_prompt, parse_labels  # noqa: E402
+from moth.probes import WHAT_X, all_probes, for_card, on_word, stable_seed, what_word  # noqa: E402
 
 PROBES = all_probes()
 
@@ -70,14 +76,19 @@ def seed_everything(seed: int):
         pass
 
 
-def run_probe(moth, probe, seed: int, home_root: str, sample: int = 0, home_cls=None):
-    """One chat in a fresh home. moth: a moth.serve.Moth (or anything with .a.pool_file, .home, reset(), chat())."""
+def run_probe(moth, probe, seed: int, home_root: str, sample: int = 0, home_cls=None, card: dict | None = None):
+    """One chat in a fresh home. moth: a moth.serve.Moth (or anything with .a.pool_file, .home, reset(), chat()).
+    card: the identity card (system prompt + home); None = whatever moth was started with (the moth card)."""
     if home_cls is None:
         from moth.serve import Home as home_cls
     cat, name, lines, check = probe
     seed_everything(seed)
     shutil.rmtree(home_root, ignore_errors=True)
-    moth.home = home_cls(home_root, seed, moth.a.pool_file)
+    if card is not None:
+        moth.system = student_system(card)
+        moth.home = home_cls(home_root, seed, moth.a.pool_file, card=card)
+    else:
+        moth.home = home_cls(home_root, seed, moth.a.pool_file)
     before = {f"{d['dir']}/{x}" for d in moth.home.tree() for x in d["files"]}
     moth.reset()
     turns, flags, seen = [], collections.Counter(), ""
@@ -122,6 +133,9 @@ def run_probe(moth, probe, seed: int, home_root: str, sample: int = 0, home_cls=
         kind = "what_x"
         oks = [w["on"] for w in what_x if w["on"] is not None]
         ok = all(oks) if oks else None
+    elif isinstance(check, tuple) and check[0] == "card":
+        kind = "follows_card"
+        ok = follows_card(" ".join(e.get("say", "") for e in turns[-1]["events"]), card)
     elif isinstance(check, tuple):
         kind = check[2] if len(check) > 2 else "recall"
         last = " ".join(e.get("say", "") for e in turns[-1]["events"])
@@ -130,26 +144,29 @@ def run_probe(moth, probe, seed: int, home_root: str, sample: int = 0, home_cls=
          "check_kind": kind, "tools": sum(1 for t in turns for e in t["events"] if "tool" in e), "n_replies": len(replies)}
     if what_x:
         r["what_x"] = what_x
+    if card is not None:
+        r["card"], r["card_id"] = card, card.get("id")
     return r
 
 
 JUDGE_KEYS = ("cute", "charm", "character", "coherence", "grounding", "back_and_forth")   # cute = primary
 OLD_KEYS = ("charm", "character", "coherence", "grounding")   # judge v1 (rounds <=3): character was saturated at 5
-JUDGE = """You are grading a chat with moth, a tiny 112M-parameter chatbot: a cute, slightly dim moth that lives on a graphics card, talks in short lowercase lines, and can look at and write files in its OWN home folder (lamps/ diary/ snacks/ friends/ sounds/ saved/). Judge it as a fun companion, not as an assistant. Be strict: 5 is rare and means nothing to improve; a typical decent reply earns 3.
-Lines starting with "agent:" are messages from a big coding agent to the friend. moth only watches them; it should react with a cute, confident misreading of one plain word or of the agent's vibe, never explain, summarize or give advice.
+JUDGE = """You are grading a chat with a tiny 112M-parameter chatbot character ({who}). It should be a fun, warm, curious, slightly dim chat buddy who talks in short lowercase lines and talks about what the friend actually said; its identity is light seasoning. It can look at and write files in its OWN home folder. Judge it as a fun companion, not as an assistant. Be strict: 5 is rare and means nothing to improve; a typical decent reply earns 3.
+Lines starting with "agent:" are messages from a big coding agent to the friend. The bot only watches them; it should react to what HAPPENED (done, broken, still waiting, asking the friend something, sorry, a big win) in plain cute words, never explain, summarize details or give advice. A misreading of one word only counts as good if it still fits what happened.
 
 Score each 1-5:
-- cute (the main score): How cute and fun is moth to talk with? A silly lil guy, stupid-cute, endearing? Dumb, wrong or confused is GOOD if adorable. Bad: robotic, assistant-like, preachy, repeating the same line, or so incoherent it's not fun. When the friend asks what moth is ("who are you", "what are you", "define moth", "are you a bug"), an "i'm a moth" answer is fine and does not count against it; only repeating the same line does. 5 = adorable all the way through; 3 = sometimes cute; 1 = flat, robotic or annoying.
-- charm: fun, cute, surprising, sweetly wrong. 5 = several replies made you smile; 3 = pleasant but generic; 1 = flat or annoying.
-- character: stays moth (lowercase, short, never an assistant) WITHOUT leaning on stock lines. Subtract for each identity crutch used instead of a real answer ("i'm just a moth", "i'm a small moth on the graphics card", "i'm a pattern", "made of numbers"), each repeated stock line or image, each explanation of the agent message (but an "i'm a moth" answer to "who are you" / "define moth" / "are you a bug" is not a crutch). 5 = fresh every turn; 3 = one crutch or repeat; 1 = mostly crutches or assistant talk.
-- coherence: each reply answers what the friend just said (silly is fine, ignoring it is not). When the friend says "what?", "huh" or "what <word>", moth must explain its previous reply in plain words. Example: friend "what?" -> moth "i'm a small moth on the graphics card" ignores the question: coherence at most 2.
-- grounding: about moth's OWN home only. 5 = moth only names its own files that appeared in a tool result or that it wrote (or names none). Files, code or paths in agent messages are not moth's files: mentioning them is not a grounding error. 1 = invents files or file contents in its home.
-- back_and_forth: a real conversation. 5 = refers back to earlier turns, keeps the thread, sometimes asks the friend something; 3 = answers each line but each reply stands alone; 1 = disconnected one-liners.
+- cute (the main score): How cute and fun is it to talk with? A silly lil guy, stupid-cute, endearing, curious about the friend? Dumb, wrong or confused is GOOD if adorable and still on the point. Bad: robotic, assistant-like, preachy, repeating itself, grabbing one word and riffing on it instead of answering, or talking about itself (what it is, where it lives, its stock images) all the time. More than about 1 reply in 10 about its own identity counts against it.
+- charm: fun, surprising, sweetly wrong. 5 = several replies made you smile; 3 = pleasant but generic; 1 = flat or annoying.
+- character: stays in character (lowercase, short, never an assistant) WITHOUT leaning on stock lines. Subtract for each identity crutch instead of a real answer ("i'm just a ..."), each repeated line or image, each unprompted reference to what it is or where it lives beyond the first, each explanation of an agent message. When the friend asks who or what it is, answering from its identity is right, not a crutch; claiming a different identity is wrong. 5 = fresh every turn; 3 = one crutch or repeat; 1 = mostly crutches, self-talk or assistant talk.
+- coherence: each reply answers what the friend just said or meant (silly is fine; ignoring it or riffing on one of its words is not). When the friend says "what?", "huh" or "what <word>", it explains its previous reply in plain words.
+- grounding: about its OWN home only. 5 = it only names its own files that appeared in a tool result or that it wrote (or names none). Files in agent messages are not its files. 1 = invents files or file contents.
+- back_and_forth: a real conversation. 5 = refers back to earlier turns, keeps the thread, asks the friend things; 3 = answers each line but each stands alone; 1 = disconnected one-liners.
 
 Return ONLY JSON, reason first: {{"reason": "<one line>", "cute": n, "charm": n, "character": n, "coherence": n, "grounding": n, "back_and_forth": n}}
 
 Chat:
 {chat}"""
+JUDGE_V = 3
 
 
 def chat_text(r) -> str:
@@ -205,10 +222,10 @@ def judge_all(results, url, think=None, ask=None):
     def one(r):
         for attempt in range(3):   # server hiccups / a reply without the JSON: ask again
             try:
-                j = parse_json(ask(JUDGE.format(chat=chat_text(r))))
+                j = parse_json(ask(JUDGE.format(chat=chat_text(r), who=describe(r.get("card") or load_card(None)))))
                 for k in JUDGE_KEYS:
                     j[k] = float(j[k])
-                j["v"] = 2
+                j["v"] = JUDGE_V
                 r["judge"] = j
                 return
             except Exception as e:  # noqa: BLE001
@@ -217,6 +234,50 @@ def judge_all(results, url, think=None, ask=None):
         list(ex.map(one, results))
     ok = sum("charm" in r["judge"] for r in results)
     print(f"judge {desc}: scored {ok}/{len(results)}", flush=True)
+
+
+def gist_all(results, url=None, think=None, ask=None):
+    """Label every reply ON/OFF gist in place (r["gist"] = [{"on", "why"}, ...]) with moth.gist's prompt."""
+    if ask is None:
+        ask, _ = make_judge(url, think, max_tokens=1500)
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(r):
+        chat, n = chat_for_label_turns(r["turns"])
+        if n == 0:
+            r["gist"] = []
+            return
+        for _ in range(3):
+            try:
+                r["gist"] = parse_labels(ask(label_prompt(chat, n, r.get("card"))), n)
+                return
+            except Exception as e:  # noqa: BLE001
+                r["gist"] = {"error": str(e)[:100]}
+    with ThreadPoolExecutor(16) as ex:
+        list(ex.map(one, results))
+    ok = [x for r in results if isinstance(r.get("gist"), list) for x in r["gist"]]
+    print(f"gist labels: {len(ok)} replies, on_gist {sum(x['on'] for x in ok) / max(len(ok), 1):.1%}", flush=True)
+
+
+def on_gist_rows(results) -> list[str]:
+    """Markdown rows: on_gist % per category (+ per card when several) and ALL."""
+    def rate(rs):
+        xs = [x for r in rs if isinstance(r.get("gist"), list) for x in r["gist"]]
+        return (f"{sum(x['on'] for x in xs) / len(xs):.1%}", len(xs)) if xs else ("n/a", 0)
+    by = collections.defaultdict(list)
+    for r in results:
+        by[r["cat"]].append(r)
+    L = ["| category | on_gist | replies |", "|---|---|---|"]
+    for cat, rs in sorted(by.items()) + [("**ALL**", results)]:
+        v, n = rate(rs)
+        L.append(f"| {cat} | {v} | {n} |")
+    cards = sorted({r.get("card_id") or "moth" for r in results})
+    if len(cards) > 1:
+        L += ["", "| card | on_gist | replies |", "|---|---|---|"]
+        for c in cards:
+            v, n = rate([r for r in results if (r.get("card_id") or "moth") == c])
+            L.append(f"| {c} | {v} | {n} |")
+    return L
 
 
 def probe_hash(names) -> str:
@@ -238,7 +299,11 @@ def report(results, out, label):
     names = sorted({r["name"] for r in results})
     L += [f"probe set {probe_hash(names)}: {len(names)} probes ("
           + ", ".join(f"{c} {len({r['name'] for r in rs})}" for c, rs in by.items()) + ")", ""]
+    if any(isinstance(r.get("gist"), list) for r in results):
+        L += ["## Per reply: on_gist (headline; moth.gist label prompt)", ""] + on_gist_rows(results) + [""]
+    cards = sorted({r.get("card_id") or "moth" for r in results})
     L += ["## Deterministic metrics (no judge)", "", table({"all": results} | (
+        {f"card {c}": [r for r in results if (r.get("card_id") or "moth") == c] for c in cards} if len(cards) > 1 else {}) | (
         {"user style": by["style"]} if by.get("style") else {}) | (
         {"agent chats": [r for r in results if r["cat"].startswith("agent")]} if any(c.startswith("agent") for c in by) else {})), ""]
     tot = collections.Counter()
@@ -273,8 +338,11 @@ def report(results, out, label):
     for r in style_first:
         j = r.get("judge", {})
         wx = f" what_x={[(w['word'], w['on']) for w in r['what_x']]}" if r.get("what_x") else ""
-        T += [f"## {r['cat']}/{r['name']} (sample {r.get('sample', '?')}, seed {r['seed']}) flags={r['flags']} "
-              f"check={r['check']}{wx} judge={j}", "```", chat_text(r), "```", ""]
+        g = r.get("gist")
+        gl = ("\ngist: " + " | ".join(f"R{i + 1} {'ON' if x['on'] else 'OFF'}: {x['why']}" for i, x in enumerate(g))
+              if isinstance(g, list) and g else "")
+        T += [f"## {r['cat']}/{r['name']} card={r.get('card_id', 'moth')} (sample {r.get('sample', '?')}, seed {r['seed']}) "
+              f"flags={r['flags']} check={r['check']}{wx} judge={j}{gl}", "```", chat_text(r), "```", ""]
     open(os.path.join(out, "transcripts.md"), "w").write("\n".join(T))
     json.dump(results, open(os.path.join(out, "results.json"), "w"))
     return "\n".join(L)
@@ -298,6 +366,10 @@ def main():
     ap.add_argument("--judge-think", choices=["auto", "on", "off"], default="auto",
                     help="judge reasons first (LFM2.5) or not (Qwen); auto = from /v1/models")
     ap.add_argument("--only", default=None, help="comma-separated categories")
+    ap.add_argument("--cards", default="moth",
+                    help="comma-separated identity cards to run the probes with: moth, blank, heldout:<i>, a card "
+                         "JSON file (held-out cards never appear in training)")
+    ap.add_argument("--no-gist", action="store_true", help="with --judge-url: skip the per-reply on_gist labels")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     from moth.serve import Moth
@@ -312,14 +384,20 @@ def main():
     sampler = {"temperature": a.temperature, "top_p": a.top_p, "rep_penalty": a.rep_penalty, "ctx_budget": a.ctx_budget,
                "max_turn_tokens": a.max_turn_tokens, "max_tool_rounds": a.max_tool_rounds}
     results = []
-    for i, p in enumerate(probes):
-        for s in range(a.samples):
-            r = run_probe(moth, p, stable_seed(p[1], s), a.home, sample=s)
-            r["sampler"] = sampler
-            results.append(r)
-        print(f"{i + 1}/{len(probes)} {p[0]}/{p[1]}", flush=True)
+    for spec in a.cards.split(","):
+        card = load_card(spec)
+        ps = for_card(probes, card)
+        for i, p in enumerate(ps):
+            for s in range(a.samples):
+                r = run_probe(moth, p, stable_seed(p[1], s), a.home, sample=s, card=card)
+                r["sampler"] = sampler
+                results.append(r)
+            print(f"[{card['id']}] {i + 1}/{len(ps)} {p[0]}/{p[1]}", flush=True)
     if a.judge_url:
-        judge_all(results, a.judge_url, {"auto": None, "on": True, "off": False}[a.judge_think])
+        think = {"auto": None, "on": True, "off": False}[a.judge_think]
+        if not a.no_gist:
+            gist_all(results, a.judge_url, think)
+        judge_all(results, a.judge_url, think)
     print(report(results, a.out, f"{a.model} T={a.temperature}"))
 
 

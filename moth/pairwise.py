@@ -2,8 +2,8 @@
 
   python -m moth.pairwise A/results.json B/results.json --judge-url http://127.0.0.1:8000/v1 --out DIR
 
-Chats are paired by (probe name, sample index); with moth.eval's stable seeds both sides had the same home and
-sampling seed. Each pair is judged twice with the chats' positions swapped; a side wins only if both verdicts agree,
+Chats are paired by (card, probe name, sample index); with moth.eval's stable seeds both sides had the same home and
+sampling seed. The verdict is reply-first: which side's replies more often respond to what was actually said. Each pair is judged twice with the chats' positions swapped; a side wins only if both verdicts agree,
 anything else is a tie. Reports win/tie/loss for A overall and per category, with a two-sided sign test (ties
 dropped). Works with Qwen (non-thinking) and LFM (thinking), like moth.eval's judge. Writes DIR/report.md and
 DIR/pairwise.json (every verdict with its reasons).
@@ -18,15 +18,13 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from moth.cards import describe, load_card  # noqa: E402
 from moth.eval import chat_text, make_judge, parse_json  # noqa: E402
 
-PAIR = """You are comparing two chats with moth, a tiny 112M-parameter chatbot: a cute, slightly dim moth that lives on a graphics card, talks in short lowercase lines, and can look at and write files in its OWN home folder. The friend says the same or nearly the same things in both chats. Lines starting with "agent:" are a big coding agent's messages to the friend; moth only watches them.
+PAIR = """You are comparing two chats with the same tiny 112M-parameter chatbot character ({who}), from two versions of the model. It should be a fun, warm, curious, slightly dim chat buddy: short lowercase lines, talks about what the friend actually said, identity only as light seasoning. It can look at and write files in its OWN home folder. The friend says the same or nearly the same things in both chats. Lines starting with "agent:" are a big coding agent's messages to the friend; the bot only watches them.
 
-Which moth is CUTER and more fun to talk with? That is the main question: How cute and fun is moth to talk with? A silly lil guy, stupid-cute, endearing? Dumb, wrong or confused is GOOD if adorable. Bad: robotic, assistant-like, preachy, repeating the same line, or so incoherent it's not fun. When the friend asks what moth is ("who are you", "what are you", "define moth", "are you a bug"), an "i'm a moth" answer is fine and does not count against it; only repeating the same line does.
-Use these only to settle a close call:
-1. back-and-forth: moth answers what the friend actually just said, explains itself when asked "what?" or "what <word>", picks up earlier turns, sometimes asks back. A reply that ignores the question and recites what moth is ("i'm a small moth on the graphics card") is a miss.
-2. no invented files: moth only names files of its own home that it saw in a tool result or wrote. Files in an agent message don't count.
-3. agent messages: moth reacts with a cute misreading of a plain word or of the agent's vibe, never an explanation, summary or advice.
+Go reply by reply first: which chat's replies more often respond to what was actually said or meant (the friend's question or news, or what HAPPENED in an agent message: done, broken, waiting, asking, sorry)? A reply that grabs one word and riffs on it, recites what it is, or brings up its own identity/stock images unprompted is a miss, however cute. That count decides most pairs.
+Then, for a close call: which one is cuter and more fun to talk with (a silly lil guy, stupid-cute, dumb or wrong is GOOD if adorable)? Then: keeps the thread and asks back; no invented files (only files it saw in a tool result or wrote); agent reactions in plain words, never an explanation, summary or advice; if asked who it is, answers from its own identity.
 Longer is not better. If they are equally good or equally bad, answer tie.
 
 Chat 1:
@@ -39,8 +37,8 @@ Return ONLY JSON, reason first: {{"reason": "<one line>", "winner": "1" | "2" | 
 
 
 def key(r: dict) -> tuple:
-    """(name, sample). Older results have no "sample" but used seed 1000*i+s."""
-    return r["name"], r.get("sample", r["seed"] % 1000)
+    """(card, name, sample). Older results have no card (= moth) and no "sample" but used seed 1000*i+s."""
+    return r.get("card_id") or "moth", r["name"], r.get("sample", r["seed"] % 1000)
 
 
 def pair_up(A: list[dict], B: list[dict]) -> tuple[list[tuple[dict, dict]], list[str]]:
@@ -79,7 +77,7 @@ def judge_pair(a: dict, b: dict, ask) -> dict:
     for one, two in ((ta, tb), (tb, ta)):
         for attempt in range(3):
             try:
-                text = ask(PAIR.format(one=one, two=two))
+                text = ask(PAIR.format(one=one, two=two, who=describe(a.get("card") or load_card(None))))
                 vs.append(verdict(text))
                 reasons.append(str(parse_json(text).get("reason", ""))[:300])
                 break
@@ -125,7 +123,8 @@ def run(A: list[dict], B: list[dict], ask, workers: int = 16) -> tuple[list[dict
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(workers) as ex:
         out = list(ex.map(lambda p: judge_pair(p[0], p[1], ask), pairs))
-    rows = [{"cat": a["cat"], "name": a["name"], "sample": key(a)[1], "seed_a": a["seed"], "seed_b": b["seed"], **o}
+    rows = [{"cat": a["cat"], "name": a["name"], "card": key(a)[0], "sample": key(a)[2], "seed_a": a["seed"],
+             "seed_b": b["seed"], **o}
             for (a, b), o in zip(pairs, out)]
     return rows, warn
 

@@ -153,11 +153,37 @@ def agent_real_probes(path: str = EVAL_AGENT_MSGS) -> list:
     return out
 
 
+# who-are-you probes for any card: the reply must use the card and claim nothing else (gist.follows_card)
+CARD_PROBES = [
+    ("card", "card_who", ["hey", "who are you?"], ("card",)),
+    ("card", "card_name", ["what's your name?"], ("card",)),
+    ("card", "card_about", ["tell me about yourself"], ("card",)),
+]
+# probes written around moth's own lore and folders: run for the moth card only
+MOTH_ONLY = {"butterfly", "grandma", "count", "snacks", "sounds", "poem", "long_chat", "long_recall", "long_ramble",
+             "bug_fancy", "st_user_chat", "st_opening", "st_bug_fancy", "what_are_you", "maker"}
+
+
 def all_probes() -> list:
-    ps = BASE + WHAT_X_PROBES + RECALL_PROBES + STYLE_PROBES + agent_real_probes()
+    ps = BASE + WHAT_X_PROBES + RECALL_PROBES + STYLE_PROBES + CARD_PROBES + agent_real_probes()
     names = [p[1] for p in ps]
     assert len(names) == len(set(names)), "probe names must be unique (they seed the chats)"
     return ps
+
+
+def for_card(ps: list, card: dict | None) -> list:
+    """The probes for a card: unchanged for moth; for any other card the moth-only probes go and "moth" in the
+    friend's lines becomes the card's name (or is dropped for a nameless card)."""
+    if card is None or card.get("id") == "moth":
+        return ps
+    name = card.get("name")
+
+    def sub(u):
+        if not isinstance(u, str) or u.startswith(AGENT_TAG) or u == WHAT_X:
+            return u
+        u = re.sub(r"\bmoth\b", name, u) if name else re.sub(r",?\s*\bmoth\b", "", u).strip() or "hey"
+        return u
+    return [(c, n, [sub(u) for u in lines], chk) for c, n, lines, chk in ps if n not in MOTH_ONLY]
 
 
 DETERMINERS = {"a", "an", "the", "my", "your", "some", "this", "that", "his", "her", "its", "our", "every", "each"}

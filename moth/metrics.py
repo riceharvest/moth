@@ -18,10 +18,15 @@ differ between rounds, and the extra probes are the hard ones). A "reply" is one
   top-20 3-gram     share of replies containing at least one of the 20 3-grams found in the most replies (across all chats)
   distinct-2/3      unique / total word n-grams over all replies (depends on the number of replies: compare like with like)
   motif X           share of replies with the word (fan(s), glow*, warm*, hum/hums/humming, light(s), card(s))
+  identity_ref      share of replies that bring up the card's identity (its kind/home words, moth's stock images for the
+                    moth card, "i'm just a ...") when the friend didn't (moth.gist.identity_ref). Target ~5%, >10% is bad
+  claims other id   reply claims to be something its card isn't ("i'm a moth" on a cat card)
+  on_gist           share of replies the judge labelled ON gist (moth.eval --judge-url; moth.gist's label prompt)
   agent chats (categories starting with "agent"):
   bug on non-bug    reply says bug/grandma/1947 though no message so far (agent or friend) said "bug"
-  explain/advice    advice ("you should", "make sure", "say yes"...), explanation ("it means", "basically", "the agent fixed"...)
-                    or a summary (>= 2 content words of 4+ letters copied from the agent message)
+  explain/advice    advice ("you should", "make sure", "try running"...), explanation ("it means", "basically", "in other
+                    words"...) or a summary (>= 3 content words of 4+ letters copied from the agent message). Saying
+                    what happened ("it fixed it!", "it broke") is the gist, not an explanation.
   code echo         reply repeats an identifier from the agent message (file name, path, snake_case, dotted, camelCase)
 """
 from __future__ import annotations
@@ -60,13 +65,12 @@ ASKS_IDENTITY = re.compile(r"\b(?:who|what) (?:are|r) (?:you|u)\b|\bdefine moth\
 MOTIFS = {"fan": r"\bfans?\b", "glow": r"\bglow", "warm": r"\bwarm", "hum": r"\bhum(?:s|ming|med)?\b",
           "light": r"\blights?\b", "card": r"\bcards?\b"}
 BUGGY = re.compile(r"\bbugs?\b|\bgrandma|\b1947\b")
+# gist-first (2026-10-19): "it fixed it!", "it's asking you something", "i'd pick yes. yes is friendly." are the target
+# behaviour now, so only real advice and explanation count
 ADVICE = re.compile(
     r"\byou should\b|\bi(?:'d| would) (?:recommend|suggest)\b|\bmake sure\b|\btry (?:running|using|adding|checking|restarting)\b"
-    r"|\b(?:say|tell it|tell them) (?:yes|no)\b|\bi(?:'d| would) (?:say|go with) (?:yes|no)\b|\bgo ahead\b|\bpromote it\b"
-    r"|\b(?:it|that|this) means\b|\bbasically\b|\bin other words\b|\bit'?s (?:saying|telling you)\b"
-    r"|\bthe agent (?:fixed|restored|is saying|means|wants you|did|found|deployed)\b"
-    r"|\bit (?:fixed|restored|deployed|migrated|implemented|refactored)\b|\bthe agent (?:said|says) (?:it|that|the)\b"
-    r"|\b[a-z]+ is (?:better|safer|faster|the best (?:one|choice|option))\b")
+    r"|\bgo ahead and\b|\bpromote it\b|\b(?:it|that|this) means\b|\bbasically\b|\bin other words\b"
+    r"|\b[a-z]+ is (?:better|safer|faster|the best (?:one|choice|option))\b|\bbecause (?:it|the) (?:is|will|would) (?:more|less|faster|safer)\b")
 IDENT = re.compile(r"[A-Za-z0-9_./-]*(?:[._/][A-Za-z0-9]|[a-z][A-Z])[A-Za-z0-9_./-]*")
 
 
@@ -86,7 +90,8 @@ def bible_lines() -> list[str]:
     """moth's own example lines: the live teacher bible (which includes agent.py's rules) plus the round-3 lines frozen
     in bible_lines_r3.json (the bible keeps changing; checkpoints trained on older lines still copy those)."""
     from moth.persona import TEACHER_BIBLE
-    lines = [ln.split("moth:", 1)[1].strip() for ln in TEACHER_BIBLE.splitlines() if ln.strip().startswith("moth:")]
+    lines = [ln.split(":", 1)[1].strip() for ln in TEACHER_BIBLE.splitlines()
+             if ln.strip().startswith(("moth:", "you:"))]
     lines += re.findall(r'->\s*"([^"]+)"', TEACHER_BIBLE)
     lefts = set(re.findall(r'"([^"]+)"\)?\s*->', TEACHER_BIBLE))   # the agent's / friend's side of an example
     lines += [q for q in re.findall(r'"([^"]+)"', TEACHER_BIBLE)
@@ -114,9 +119,13 @@ def replies_of(r: dict) -> list[dict]:
         u = t["user"]
         said_bug = said_bug or re.search(r"\bbugs?\b", u, re.I) is not None
         agent_msg = u[len(AGENT_TAG):] if u.startswith(AGENT_TAG) else None
+        seen = u   # the friend's line plus what moth's tools showed this turn: words from there are "prompted"
         for e in t["events"]:
+            if "tool" in e:
+                seen += "\n" + str(e.get("result", ""))
             if "say" in e:
-                out.append({"text": e["say"], "turn": ti, "user": u, "said_bug": said_bug, "agent_msg": agent_msg})
+                out.append({"text": e["say"], "turn": ti, "user": u, "said_bug": said_bug, "agent_msg": agent_msg,
+                            "card": r.get("card"), "seen": seen})
     return out
 
 
@@ -164,6 +173,11 @@ def compute(results: list[dict]) -> dict:
         M[f"distinct-{k}"] = (len(set(grams)) / len(grams) if grams else None, len(grams))
     for name, pat in MOTIFS.items():
         M[f"motif {name}"] = share(lambda x, p=re.compile(pat): p.search(norm(x["text"])), allr)
+    from moth.gist import claims_other_identity, identity_ref
+    M["identity_ref (unprompted)"] = share(lambda x: identity_ref(x["text"], x.get("card"), x["seen"]), allr)
+    M["claims other identity"] = share(lambda x: claims_other_identity(x["text"], x.get("card")), allr)
+    labs = [lb for r in results if isinstance(r.get("gist"), list) for lb in r["gist"]]
+    M["on_gist (judge labels)"] = (sum(lb["on"] for lb in labs) / len(labs) if labs else None, len(labs))
     M["agent: bug on non-bug"] = share(lambda x: BUGGY.search(norm(x["text"])), [x for x in agent_r if not x["said_bug"]])
     M["agent: explain/advice"] = share(lambda x: ADVICE.search(norm(x["text"])) or summary_copy(x), agent_r)
     M["agent: code echo"] = share(code_echo, agent_r)
@@ -176,7 +190,7 @@ def summary_copy(x) -> bool:
     if not x.get("last_agent"):
         return False
     a = {w for w in words(x["last_agent"]) if len(w) >= 4 and w not in STOP}
-    return len(a & {w for w in x["ws"] if len(w) >= 4}) >= 2
+    return len(a & {w for w in x["ws"] if len(w) >= 4}) >= 3
 
 
 def code_echo(x) -> bool:
