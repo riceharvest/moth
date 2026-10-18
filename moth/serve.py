@@ -378,8 +378,12 @@ class Moth:
             self.reset()
             self.log.clear()
             # what the last turn left behind (rebuilt at the next turn anyway): the phrase-ban hook (reaction n-grams,
-            # words of user messages), the reactions' penalty ids, and the decoder that still holds the old KV cache
-            self._hook, self._carry, self._dec = None, set(), None
+            # words of user messages) and the reactions' penalty ids; in the decoder (kept: it serves the same reused
+            # KV cache, and a new one would re-capture its graphs) only its per-turn buffers, cleared in place
+            self._hook, self._carry = None, set()
+            dec = getattr(self, "_dec", None)
+            if dec is not None:
+                dec.clear_turn_state()
             if everything:
                 self.phrases.clear()
             with self.wake:

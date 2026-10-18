@@ -438,7 +438,7 @@ class Sessions(unittest.TestCase):
         self.assertIsNotNone(m._hook)
         m.forget(everything=True)                      # `moth forget` on a running moth: the phrases go too
         self.assertEqual((len(m.phrases), len(m.messages), m.phrases.recent()), (0, 1, set()))
-        self.assertEqual((m._hook, m._carry, getattr(m, "_dec", None)), (None, set(), None))   # nothing derived left
+        self.assertEqual((m._hook, m._carry), (None, set()))   # nothing derived left
         m.phrases = serve.PhraseMemory(0)              # --phrase-memory 0: off
         m.agent_said("Fixed it again.", "claude-code", "A")
         self.assertIsNone(m._hook)
@@ -519,6 +519,41 @@ class HomePaths(unittest.TestCase):
                 self.assertIsNone(self.home._resolve(p), p)
             else:
                 self.assertEqual(self.home._resolve(p), os.path.join(self.home.root, p))
+
+
+class ForgetKeepsTheDecoder(unittest.TestCase):
+    def test_forget_keeps_decoder_and_graphs_clears_ban_table(self):
+        """forget() (new chat and `moth forget`) keeps moth's Decoder and its captured step (a new one would re-capture
+        the device graphs, and recompile with --compile, after every "new chat"); only the per-turn buffers go: the
+        phrase-ban table, the masks and the sampled tokens. CPU-forced: graph="static" runs the captured step uncaptured."""
+        import threading
+
+        import torch
+        sys.path.insert(0, os.path.join(ROOT, "tests"))
+        from test_fast_infer import tiny_model
+        from tiny_agent import generate as G
+        from moth.norepeat import BanHook
+        model = tiny_model(torch.float64, seed=3)
+        kv = G.KVCache(model, 1, 256, "cpu", dtype=torch.float64)
+        logits = G.append(model, kv, torch.tensor([[5, 6, 7, 8, 9, 10]]), [6])
+        dec = G.Decoder(model, kv, graph="static")
+        dec.generate(logits.clone(), 12, model.cfg.vocab_size - 1, 0.0, 0.95, pen=1.3, pen_ids=[11, 12],
+                     logits_hook=BanHook({(5, 6): [7], (8, 9): [10, 11]}, 3))
+        self.assertTrue(bool((dec._ban_ctx >= 0).any()) and bool(dec._pm.any()))
+        g, key, ctx = dec._g, dec._key, dec._ban_ctx
+        m = SimpleNamespace(lock=threading.RLock(), wake=threading.Condition(), log=serve.Log(), sessions={},
+                            phrases=serve.PhraseMemory(4), _hook=object(), _carry={1}, _dec=dec, reset=lambda: None)
+        m.phrases.add([5, 6, 7])
+        serve.Moth.forget(m, everything=True)
+        self.assertIs(m._dec, dec)                                   # the same Decoder ...
+        self.assertIs(dec._g, g)                                     # ... and the same captured step, nothing rebuilt
+        self.assertEqual(dec._key, key)
+        self.assertIs(dec._ban_ctx, ctx)                             # buffers cleared in place (the graph reads them)
+        self.assertTrue(bool((dec._ban_ctx == -1).all()))
+        self.assertTrue(bool((dec._ban_tok == model.cfg.vocab_size).all()))
+        self.assertFalse(bool(dec._pm.any() or dec._bm.any() or dec._out.any()))
+        self.assertEqual((len(m.phrases), m._hook, m._carry), (0, None, set()))
+        G.Decoder(model, G.KVCache(model, 1, 8, "cpu", dtype=torch.float64), graph=False).clear_turn_state()   # eager: no-op
 
 
 class QuantDefault(unittest.TestCase):

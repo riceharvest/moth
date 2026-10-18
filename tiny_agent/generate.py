@@ -900,6 +900,20 @@ class Decoder:
         self._i.zero_()
         self._g = g.replay
 
+    def clear_turn_state(self):
+        """Forget what the last turn left in the device-graph buffers (moth.serve's Moth.forget): the phrase-ban
+        table (reaction n-grams), the penalty / ban masks and the sampled tokens. In place, so the captured graphs
+        stay valid and nothing is rebuilt; every turn refills these anyway, so decoding is unchanged. Eager-only
+        decoders (CPU) hold none of it."""
+        if self._key is None or getattr(self, "_ban_ctx", None) is None:
+            return
+        with torch.no_grad():
+            self._ban_ctx.fill_(-1)
+            self._ban_tok.fill_(self.model.cfg.vocab_size)
+            self._pm.zero_()
+            self._bm.zero_()
+            self._out.zero_()
+
     @property
     def mode(self) -> str:
         """What generate() runs: "graph" (captured), "static" (uncaptured device loop) or "eager"."""
