@@ -9,7 +9,8 @@
 // Assistant messages with stopReason "error" / "aborted" are skipped; only `text` blocks count (no thinking).
 // Session and label, so moth can tell several sessions apart: ctx.sessionManager.getSessionId() and the basename of
 // ctx.cwd (ExtensionContext in types.d.ts), read from agent_settled's ctx.
-// Posting is fire-and-forget: fetch with a 1 s timeout, never awaited, every rejection swallowed, nothing printed.
+// Posting is fire-and-forget: node:http with a hard 1 s bound (destroyed then), never awaited, errors swallowed,
+// nothing printed.
 // Display (interactive only, ctx.hasUI): after posting, poll moth's lines (GET /api/says) every 0.5 s for up to
 // WAIT_MS and put moth's newest line in a widget (ctx.ui.setWidget, above the editor). The poll asks only for moth's
 // reactions to THIS session (`source=pi&session=<id>`, the id just posted), so with several agents running the
@@ -32,6 +33,8 @@
 // Env: MOTH_URL (default http://127.0.0.1:4747); the token is read from ~/.moth/token (MOTH_TOKEN_FILE overrides);
 // MOTH_SHOW_IN_HARNESS / MOTH_CONFIG_FILE as above.
 import { readFileSync } from "node:fs";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -79,11 +82,17 @@ function body(text, source, session, label) {   // session / label only when kno
 
 export function post(text, session, label) {
   try {
-    fetch(MOTH, {
-      method: "POST", headers: headers(), body: body(text, "pi", session, label),
-      signal: AbortSignal.timeout(1000),
-    }).catch(() => {});
-  } catch (e) { /* no fetch / bad URL: drop it */ }
+    const data = Buffer.from(body(text, "pi", session, label));
+    const req = (MOTH.startsWith("https:") ? httpsRequest : httpRequest)(MOTH, {
+      method: "POST", agent: false, headers: { ...headers(), "Content-Length": data.length },
+    }, (res) => res.resume());
+    // a hard 1 s bound: destroy() also ends a connect still in flight (Windows retries a refused loopback connect
+    // for ~2 s, and fetch's abort signal didn't always cut that short), so a one-shot `pi -p` never waits longer
+    const timer = setTimeout(() => req.destroy(), 1000);
+    req.on("close", () => clearTimeout(timer));
+    req.on("error", () => {});
+    req.end(data);
+  } catch (e) { /* bad URL: drop it */ }
 }
 
 export function lastText(messages) {
