@@ -1,0 +1,5 @@
+# LF everywhere, also in Windows checkouts: the shell tests compare bytes, and the JS adapters are copied as-is
+* text=auto eol=lf
+*.png binary
+*.svg text eol=lf
+*.safetensors binary

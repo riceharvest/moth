@@ -1,0 +1,6 @@
+{
+  "description": "moth's latest line above the prompt (polls the local moth server) and a field to talk to moth, kept out of Claude's context",
+  "modules": [
+    "./register.tsx"
+  ]
+}

@@ -1,0 +1,112 @@
+moth (darioooooo0o/moth-112m)
+Copyright 2026 @imdariotoo
+
+The code and weights in this repository are licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This file lists the third-party models, datasets, art and fonts used to make moth, with their licenses.
+
+
+BASE MODEL
+----------
+tiny-agent-112m
+  Source:  https://huggingface.co/darioooooo0o/tiny-agent-112m
+  License: Apache-2.0
+  Role:    moth is fine-tuned from its "base" checkpoint. Same author as moth. The code in code/tiny_agent/
+           comes from the tiny-agent project. For its pretraining data, see the tiny-agent-112m model card.
+
+
+TEACHER AND JUDGE MODELS
+------------------------
+moth's training chats, and the little files in its home folder pool (code/moth/file_pool.json), were generated
+with the two models below. None of their weights are included here.
+
+LFM2.5-24B-A2B (FP8 checkpoint), by Liquid AI, Inc.
+  Source:  https://huggingface.co/LiquidAI/LFM2.5-24B-A2B-FP8
+  License: LFM Open License v1.0 (full text in LICENSE-LFM)
+  Role:    round-3 teacher. It wrote the round-3 training chats, playing both moth and the human, and wrote some
+           of the coding-agent messages moth reacts to.
+  Note:    Section 5 of the LFM Open License conditions commercial-use rights on annual revenue below
+           US$10,000,000. That condition may apply to commercial users of moth. Commercial users should review
+           LICENSE-LFM.
+
+Qwen3.8-27B, by the Qwen team (Alibaba Cloud), served as the INT4 quantization by Red Hat AI
+  Source:  https://huggingface.co/Qwen/Qwen3.8-27B
+           https://huggingface.co/RedHatAI/Qwen3.8-27B-INT4
+  License: Apache-2.0
+  Role:    round-2 teacher (wrote the round-2 training chats), and the judge for the evaluations, including
+           the live interviewer run through Hermes Agent.
+
+
+DATASETS (coding-agent final messages)
+--------------------------------------
+moth's "agent companion" training used real final messages from public coding-agent traces: the last message
+an agent wrote to its user at the end of a run.
+
+Changes made: each message was cleaned before use. Markdown was stripped (code blocks replaced by "[code]",
+inline code, tables, headings, emphasis and links removed), whitespace was collapsed, and long messages were
+truncated to their first 110 and last 45 words. The cleaned messages were used as prompts: the teacher model
+wrote moth's reactions to them, and those chats became training data. The raw messages are not part of the
+model.
+
+Exception: code/data/eval_agent_msgs.json redistributes 40 messages unmodified, each with its source dataset
+and row index (30 from lambda/hermes-agent-reasoning-traces, 7 from nvidia/Nemotron-SWE-v1, 3 from
+nebius/SWE-rebench-openhands-trajectories). The evaluation scripts use them as test prompts.
+
+Nemotron-SWE-v1, by NVIDIA
+  Source:  https://huggingface.co/datasets/nvidia/Nemotron-SWE-v1
+  License: CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/)
+  Changes: messages modified as described above and used as prompts; 7 included unmodified in
+           code/data/eval_agent_msgs.json.
+
+SWE-rebench-openhands-trajectories, by Nebius
+  Source:  https://huggingface.co/datasets/nebius/SWE-rebench-openhands-trajectories
+  License: CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/)
+  Changes: messages modified as described above and used as prompts; 3 included unmodified in
+           code/data/eval_agent_msgs.json.
+
+hermes-agent-reasoning-traces, by Lambda
+  Source:  https://huggingface.co/datasets/lambda/hermes-agent-reasoning-traces
+  License: Apache-2.0
+  Changes: messages modified as described above and used as prompts; 30 included unmodified in
+           code/data/eval_agent_msgs.json.
+
+
+ARTWORK (desktop pet, Petdex sprite sheet, chat page icon)
+---------------------------------------------------------
+The moth that the desktop pet (code/moth/pet.py) shows, the sprite sheet that `python -m moth.pet
+--export-petdex` writes, and the chat page's header icon and favicon (code/moth/static/index.html) all use the
+art below. It is not covered by this repository's Apache-2.0 license. The original SVG and a full credit list are
+in code/moth/assets/ (CREDITS.md).
+
+202206 Silkmoth adult female icon, by DataBase Center for Life Science (DBCLS), doi:10.7875/togopic.2022.231
+  Source:  https://commons.wikimedia.org/wiki/File:202206_Silkmoth_adult_female_icon.svg
+  License: CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/)
+  Changes: the pet renders the SVG and cuts it along the body into two wings and the body (a clip polygon that
+           follows the body's outline). Its wing-flap, resting and dozing frames squash the wings toward the body
+           and turn them a few degrees. The frames are scaled and leaned toward the flight direction, and the
+           Petdex export packs them into the Petdex 8x9 grid. The page inlines the SVG with rounded coordinates
+           and fill attributes in place of classes, clips it into the same three parts so CSS can flap the wings,
+           and uses a 64x64 PNG rendering as its favicon. Nothing was drawn new. The original SVG is included
+           unmodified (code/moth/assets/silkmoth_adult_female_icon.svg).
+
+
+FONTS (chat page)
+-----------------
+The chat page (code/moth/static/index.html) embeds two fonts as base64 @font-face data, so it loads nothing from
+the network. They are not covered by this repository's Apache-2.0 license. The license texts are in
+code/moth/assets/fonts/, and code/moth/assets/CREDITS.md has the exact build commands.
+
+Fraunces, Copyright 2018 The Fraunces Project Authors (https://github.com/undercasetype/Fraunces)
+  Source:  https://github.com/google/fonts/tree/main/ofl/fraunces
+  License: SIL Open Font License 1.1 (code/moth/assets/fonts/OFL-Fraunces.txt)
+  Changes: instanced to wght 400-600 and opsz 9-144 (SOFT 0, WONK 1), subset to Latin, hinting removed, woff2.
+
+JetBrains Mono, Copyright 2020 The JetBrains Mono Project Authors (https://github.com/JetBrains/JetBrainsMono)
+  Source:  https://github.com/google/fonts/tree/main/ofl/jetbrainsmono
+  License: SIL Open Font License 1.1 (code/moth/assets/fonts/OFL-JetBrainsMono.txt)
+  Changes: instanced to wght 400-600, subset to Latin plus arrows, box drawing and shapes, hinting removed, woff2.
+
+COMPUTE
+-------
+Teacher data generation, round-3 fine-tuning and evaluation ran on RTX 5090s provided by CloudRift
+(https://cloudrift.ai) through research credits.

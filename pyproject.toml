@@ -1,0 +1,67 @@
+# pip install moth-companion  ->  the `moth` and `moth-pet` commands. The model files are not in the package:
+# moth/weights.py downloads them from the Hugging Face Hub on first run (into ~/.cache/moth/<repo>/).
+# Build:  uv build   (wheel + sdist into dist/; both are restricted to the package files below)
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "moth-companion"
+dynamic = ["version"]
+description = "moth: a tiny local companion chatbot that thinks it's a moth, and keeps you company while your coding agent works"
+readme = "release/PYPI.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "release/NOTICE", "release/LICENSE-LFM", "moth/assets/CREDITS.md", "moth/assets/fonts/OFL-*.txt"]
+keywords = ["companion", "chatbot", "tiny-model", "coding-agent", "desktop-pet", "local"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Environment :: Console",
+    "Topic :: Games/Entertainment",
+]
+dependencies = [
+    "torch>=2.5",
+    "tokenizers",
+    "safetensors",
+    "numpy",
+    "huggingface_hub",
+]
+
+[project.optional-dependencies]
+pet = ["PySide6"]
+
+[project.scripts]
+moth = "moth.__main__:main"
+moth-pet = "moth.pet:main"
+
+[project.urls]
+Homepage = "https://huggingface.co/darioooooo0o/moth-112m"
+Documentation = "https://huggingface.co/darioooooo0o/moth-112m#readme"
+
+[tool.hatch.version]
+path = "moth/VERSION"
+pattern = "(?P<version>\\S+)"
+
+# What ships: the runtime modules (the same set release/build.sh puts in the Hub repo's code/, plus any new module
+# by default), static/, assets/ (not the candidates/ art that wasn't picked), integrations/**, file_pool.json,
+# VERSION. Not: research/dev-only scripts and data (agent pool, judges, pairwise), caches.
+[tool.hatch.build]
+exclude = [
+    "__pycache__",
+    "*.pyc",
+    ".DS_Store",
+    "moth/assets/candidates",
+    "moth/agent_pool.json",
+    "moth/bible_lines_r3.json",
+    "moth/interview.py",
+    "moth/judge_mcp.py",
+    "moth/pairwise.py",
+    "moth/rejudge.py",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["moth", "tiny_agent"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["moth", "tiny_agent", "release/PYPI.md", "release/NOTICE", "release/LICENSE-LFM", "LICENSE"]

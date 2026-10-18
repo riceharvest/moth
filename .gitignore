@@ -1,0 +1,59 @@
+# moth's code repo: code, tests and the small data the tests read. Weights, training data, runs and logs stay local.
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+.venv/
+venv/
+node_modules/
+.DS_Store
+
+# local data: everything but the frozen eval messages (tests/test_eval_probes.py reads them; release/build.sh ships them)
+/data/*
+!/data/eval_agent_msgs.json
+# the HF release folder build.sh assembles (862 MB of weights), training runs, eval results, live state, logs
+/release/hf/
+/runs/
+/results/
+/evals/
+/live/
+/logs/
+/out/
+*.log
+# ops scripts for rented boxes (hosts, ledgers): not part of moth
+/runbook/
+# the raw agent-message pool (13 MB, derived from third-party datasets; build.sh doesn't ship it either)
+/moth/agent_pool.json
+# pet art that was considered and not picked (build.sh skips it too)
+/moth/assets/candidates/
+
+# personal / machine-specific, never part of the repo
+/TRY_MOTH.md
+/try_moth.sh
+/video/
+/evals_*.log
+.moth*
+*.bak*
+*.orig
+*.swp
+*~
+.env
+.env.*
+.ipynb_checkpoints/
+.mypy_cache/
+dist/
+build/
+*.egg-info/
+# weights, checkpoints and data dumps live on the Hub / locally, never in git
+*.safetensors
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.gguf
+*.jsonl
+*.npy
+*.npz
+*.parquet
+*.tar*
+*.zip

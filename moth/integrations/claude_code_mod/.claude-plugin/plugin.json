@@ -1,0 +1,9 @@
+{
+  "name": "moth",
+  "version": "0.1.0",
+  "description": "moth, the tiny local companion: its latest line in a band above the prompt, with a field to talk to it that Claude never sees. Display only: the Stop hook (moth/integrations/claude_code.py) is what tells moth about each turn.",
+  "author": {
+    "name": "riceharvest"
+  },
+  "types": "./types/index.d.ts"
+}

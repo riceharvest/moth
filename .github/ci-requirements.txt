@@ -1,0 +1,12 @@
+# Test dependencies for .github/workflows/test.yml. torch is installed before this file (CPU index on Linux/Windows);
+# the tests never load weights, but test_eval_probes imports moth.build_sft, which imports torch.
+# test_engine also needs the real tokenizer.json: the workflow fetches just that file.
+tokenizers
+safetensors
+numpy
+huggingface_hub
+# PySide6 6.12.0 on CPython 3.11 aborts in the GC at interpreter exit after test_pet's several offscreen pet runs in
+# one process (all tests pass, exit 134; 6.11.2 is fine, 3.12 is fine). Drop the cap once a newer 6.12.x fixes it.
+PySide6<6.12; python_version < "3.12"
+PySide6; python_version >= "3.12"
+pytest
