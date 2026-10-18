@@ -7,6 +7,7 @@ FAKE_SERVE_EXIT=N: exit with N instead of listening (a server that dies while wa
 """
 import json
 import os
+import socketserver
 import subprocess
 import sys
 import time
@@ -45,8 +46,14 @@ def main():
             self.end_headers()
             self.wfile.write(b)
 
-    srv = ThreadingHTTPServer(("127.0.0.1", port), H)
-    srv.daemon_threads = True
+    class Server(ThreadingHTTPServer):   # as moth.serve.Server: no reverse-DNS lookup between bind() and listen()
+        daemon_threads = True
+
+        def server_bind(self):
+            socketserver.TCPServer.server_bind(self)
+            self.server_name, self.server_port = "127.0.0.1", self.server_address[1]
+
+    srv = Server(("127.0.0.1", port), H)
     print(f"fake moth is awake on {port}", flush=True)
     srv.serve_forever()   # never cleans up the grandchild itself: stopping the process group must
 

@@ -408,9 +408,42 @@ def codex_notify(text: str | None) -> tuple[re.Match | None, list[str]]:
     m = NOTIFY.search(_toml_top(text))
     if not m:
         return None, []
-    items = [json.loads(s) if s.startswith('"') else s[1:-1]
+    items = [_toml_basic(s[1:-1]) if s.startswith('"') else s[1:-1]
              for s in re.findall(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'', m.group("body"))]
     return m, items
+
+
+_TOML_ESC = {"b": "\b", "t": "\t", "n": "\n", "f": "\f", "r": "\r", "e": "\x1b", '"': '"', "\\": "\\"}
+
+
+def _toml_basic(body: str) -> str:
+    """The value of a TOML basic string ("..." without the quotes). Not json.loads: TOML also has \\e and \\UXXXXXXXX,
+    and a hand-written invalid escape (a raw Windows path like "C:\\Users\\me\\x.py") must not crash `moth hooks`: then
+    the text is taken as it is, which is what the person meant."""
+    out, i = [], 0
+    while i < len(body):
+        c = body[i]
+        if c != "\\":
+            out.append(c)
+            i += 1
+            continue
+        k = body[i + 1:i + 2]
+        if k in _TOML_ESC:
+            out.append(_TOML_ESC[k])
+            i += 2
+        elif k in ("u", "U"):
+            n = 4 if k == "u" else 8
+            hexd = body[i + 2:i + 2 + n]
+            try:
+                if len(hexd) != n:
+                    raise ValueError
+                out.append(chr(int(hexd, 16)))
+            except ValueError:
+                return body
+            i += 2 + n
+        else:
+            return body
+    return "".join(out)
 
 
 def codex_config() -> str:
@@ -515,7 +548,10 @@ def _dsh_name(m: re.Match) -> str:
     if n.startswith("'"):
         return n[1:-1].replace("''", "'")
     if n.startswith('"'):
-        return json.loads(n)
+        try:
+            return json.loads(n)
+        except ValueError:   # a YAML escape JSON lacks, or a raw Windows path: the text as written
+            return n[1:-1]
     return n
 
 

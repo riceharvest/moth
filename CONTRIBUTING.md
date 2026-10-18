@@ -33,6 +33,7 @@ python -m pytest -q -rs tests/test_config.py        # `python -m moth config`, b
 python -m pytest -q -rs tests/test_pet.py           # desktop pet: flight, bubbles, poller, launcher, Qt offscreen
 python -m pytest -q -rs tests/test_shell.py         # moth's pure-Python shell
 python -m pytest -q -rs tests/test_eval_probes.py   # eval probes, metrics, pairwise (fake moth)
+python -m pytest -q -rs tests/test_cli_tools.py     # moth hooks / doctor / autostart / forget in a temp HOME
 python -m pytest -q -rs moth/integrations/test_integrations.py   # harness adapters + serve's HTTP handler
 ```
 
@@ -41,7 +42,8 @@ Every file also runs on its own without pytest (`python tests/test_shell.py`).
 Some parts skip where their inputs are missing, and `-rs` says why:
 
 - `test_shell.py`: the replay against the recorded training bash (needs the local `results/r3/b.jsonl`), and the
-  differential test against real bash (needs a working `bwrap`, Linux only).
+  differential test against real bash (needs a working `bwrap`, Linux only; on Ubuntu 24.04 also
+  `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`, as CI does).
 - `test_pet.py`: the Qt tests without PySide6 (or its native libraries), the signal tests off POSIX, the
   parent-death test off Linux.
 

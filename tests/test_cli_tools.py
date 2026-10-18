@@ -79,13 +79,24 @@ def sha(path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-FAKE_HERMES = r'''#!{py}
-import os, re, sys
+FAKE_HERMES = r'''import os, re, sys
 cfg = os.path.join(os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"), "config.yaml")
 with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "hermes.log"), "a") as f:
     f.write(" ".join(sys.argv[1:]) + "\n")
 text = open(cfg).read() if os.path.exists(cfg) else "plugins:\n  enabled: []\n"
-if sys.stdin is not None and not sys.stdin.closed and sys.stdin.isatty():
+
+
+def terminal():
+    if sys.stdin is None or sys.stdin.closed or not sys.stdin.isatty():
+        return False
+    if os.name != "nt":
+        return True
+    import ctypes, msvcrt   # Windows: NUL is a character device, so isatty() says yes; a console has a mode
+    mode = ctypes.c_ulong()
+    return bool(ctypes.windll.kernel32.GetConsoleMode(msvcrt.get_osfhandle(sys.stdin.fileno()), ctypes.byref(mode)))
+
+
+if terminal():
     sys.exit("a prompt would hang here: moth must run hermes without a terminal on stdin")
 if sys.argv[1:3] == ["plugins", "enable"]:
     text = text.replace("  enabled: []\n", "  enabled:\n").replace("  enabled:\n", "  enabled:\n    - " + sys.argv[-1] + "\n", 1)
@@ -126,9 +137,16 @@ class TempHome(unittest.TestCase):
         return p
 
     def fake_bin(self, name: str, body: str | None = None):
-        p = self.bin / name
-        p.write_text(body or "#!/bin/sh\nexit 0\n")
-        p.chmod(0o755)
+        """A program `name` on PATH running the Python `body` (default: exit 0). POSIX: a script with a shebang to
+        this interpreter. Windows: name.cmd (found through PATHEXT, as npm's shims are) calling _name.py."""
+        body = body or "raise SystemExit(0)\n"
+        if os.name == "nt":
+            (self.bin / f"_{name}.py").write_text(body)
+            (self.bin / f"{name}.cmd").write_text(f'@"{sys.executable}" "%~dp0_{name}.py" %*\r\n')
+        else:
+            p = self.bin / name
+            p.write_text(f"#!{sys.executable}\n{body}")
+            p.chmod(0o755)
 
     def run_cli(self, mod, *args, stdin_eof: bool = True):
         out = io.StringIO()
@@ -321,7 +339,7 @@ class Codex(TempHome):
         self.assertEqual(rc, 0, out)
         text = self.toml.read_text()
         self.assertTrue(text.startswith("# my codex\nnotify = ["), text)   # top level: before any [table]
-        self.assertIn(str(INTEG / "codex.py"), text)
+        self.assertEqual(H.codex_notify(text)[1], [sys.executable, str(INTEG / "codex.py")])   # escaped as TOML
         self.assertIn('[projects."/x"]\ntrust_level = "trusted"\n', text)
         if sys.version_info >= (3, 11):
             import tomllib
@@ -337,7 +355,7 @@ class Codex(TempHome):
 
     def test_both_present_is_flagged_and_unhook_removes_both(self):
         self.hook("codex", "--yes")
-        self.toml.write_text(f'notify = ["python3", "{INTEG / "codex.py"}"]\n' + self.TOML)
+        self.toml.write_text(f'notify = {json.dumps(["python3", str(INTEG / "codex.py")])}\n' + self.TOML)   # valid TOML
         st = H.status("codex")
         self.assertEqual(st["state"], "error")
         self.assertIn("BOTH", st["detail"])
@@ -355,6 +373,80 @@ class Codex(TempHome):
         self.assertIn("one notify slot", out)
         rc, out = self.unhook("codex", "--yes")
         self.assertIn('notify = ["notify-send", "codex"]', self.toml.read_text())
+
+
+class WindowsPathsInConfigs(TempHome):
+    """Every OS: an install under a Windows path (backslashes, a space) is written into JSON / TOML escaped, read back
+    exactly, and removed again. A hand-written TOML with raw backslashes (invalid escapes) doesn't crash `moth hooks`."""
+
+    PY = r"C:\Program Files\Python312\python.exe"
+    INTEG = r"C:\Users\Me Q\moth\integrations"
+    TOML = '# my codex\nmodel = "gpt-5"\n'
+
+    def setUp(self):
+        super().setUp()
+        self.patches = [unittest.mock.patch.object(sys, "executable", self.PY),
+                        unittest.mock.patch.object(H, "INTEGRATIONS", self.INTEG)]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in reversed(self.patches):
+            p.stop()
+        super().tearDown()
+
+    def script(self, name: str) -> str:
+        return os.path.join(self.INTEG, name)
+
+    def test_claude_code_settings_json(self):
+        orig = {"model": "opus"}
+        p = self.write(".claude/settings.json", json.dumps(orig))
+        rc, out = self.hook("claude-code", "--yes")
+        self.assertEqual(rc, 0, out)
+        cmd = json.loads(p.read_text())["hooks"]["Stop"][0]["hooks"][0]["command"]   # valid JSON, path escaped
+        self.assertEqual(H.moth_script_in(cmd, "claude_code.py"), self.script("claude_code.py"))
+        if os.name != "nt":
+            import shlex
+            self.assertEqual(shlex.split(cmd), [self.PY, self.script("claude_code.py")])
+        rc, out = self.unhook("claude-code", "--yes")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(json.loads(p.read_text()), orig)
+
+    def test_codex_legacy_notify_toml(self):
+        self.write(".codex/hooks.json", "{}")
+        toml = self.write(".codex/config.toml", self.TOML)
+        rc, out = self.hook("codex", "--legacy-notify", "--yes")
+        self.assertEqual(rc, 0, out)
+        text = toml.read_text()
+        want = [self.PY, self.script("codex.py")]
+        self.assertIn(json.dumps(self.PY), text)   # backslashes doubled: a TOML basic string
+        self.assertEqual(H.codex_notify(text)[1], want)
+        if sys.version_info >= (3, 11):
+            import tomllib
+            self.assertEqual(tomllib.loads(text)["notify"], want)
+        self.assertIn(H.status("codex")["state"], ("installed", "broken", "other"))
+        rc, out = self.unhook("codex", "--yes")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(toml.read_text(), self.TOML)
+
+    def test_hand_written_raw_backslashes(self):
+        self.write(".codex/hooks.json", "{}")
+        raw = 'notify = ["%s", "%s"]\n' % (self.PY, self.script("codex.py"))   # invalid TOML escapes (\P, \U...)
+        toml = self.write(".codex/config.toml", raw + self.TOML)
+        self.assertEqual(H.codex_notify(toml.read_text())[1], [self.PY, self.script("codex.py")])
+        H.status("codex")   # no traceback
+        rc, out = self.run_cli(H.main, "hooks", [])
+        self.assertEqual(rc, 0, out)
+        rc, out = self.unhook("codex", "--yes")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(toml.read_text(), self.TOML)
+
+    def test_toml_escapes(self):
+        for body, want in ((r"a\\b", "a\\b"), (r"tab\there", "tab\there"), (r"\u00e9\U0001F98B", "\u00e9\U0001F98B"),
+                           (r"\e[0m", "\x1b[0m"), (r'say \"hi\"', 'say "hi"'), (r"C:\Users\x", r"C:\Users\x"),
+                           (r"bad \q", r"bad \q"), (r"short \u12", r"short \u12")):
+            with self.subTest(body=body):
+                self.assertEqual(H._toml_basic(body), want)
 
 
 class CopiedAdapters(TempHome):
@@ -403,7 +495,7 @@ class Hermes(TempHome):
 
     def setUp(self):
         super().setUp()
-        self.fake_bin("hermes", FAKE_HERMES.format(py=sys.executable))
+        self.fake_bin("hermes", FAKE_HERMES)
         self.cfg = self.write(".hermes/config.yaml", self.CFG)
         self.dst = self.home / ".hermes" / "plugins" / "moth"
 
@@ -645,10 +737,11 @@ class Autostart(TempHome):
         text = p.read_text()
         self.assertIn("[Desktop Entry]", text)
         exec_line = next(x for x in text.splitlines() if x.startswith("Exec="))
-        self.assertIn(sys.executable, exec_line)
+        py = A._desktop_quote(sys.executable)   # as Exec= spells it (a Windows python here: backslashes escaped)
+        self.assertIn(py, exec_line)
         self.assertTrue(exec_line.endswith("-m moth.pet"))
         self.assertIn(f"Path={A.CODE}", text)
-        p.write_text(text.replace(sys.executable, "/old/python"))   # another interpreter: stale, `on` fixes it
+        p.write_text(text.replace(py, "/old/python"))   # another interpreter: stale, `on` fixes it
         self.assertEqual(A.state("linux")[0], "stale")
         self.run_cli(A.main, ["on"], "linux")
         self.assertEqual(A.state("linux")[0], "on")

@@ -27,6 +27,7 @@ import random
 import re
 import secrets
 import shutil
+import socketserver
 import sys
 import threading
 import time
@@ -169,8 +170,9 @@ def write_pidfile(port: int) -> str | None:
 def remove_pidfile(path: str | None):
     try:
         with open(path) as f:
-            if json.load(f).get("pid") == os.getpid():   # not one a newer moth on this port wrote
-                os.remove(path)
+            mine = json.load(f).get("pid") == os.getpid()   # not one a newer moth on this port wrote
+        if mine:
+            os.remove(path)   # after the file is closed: Windows can't delete an open file
     except (OSError, TypeError, ValueError, AttributeError):
         pass
 
@@ -727,6 +729,17 @@ class Moth:
 
 
 # --- http ---------------------------------------------------------------------------------------------------
+class Server(ThreadingHTTPServer):
+    """ThreadingHTTPServer minus the reverse-DNS lookup HTTPServer.server_bind does (socket.getfqdn of the bind
+    address, used only for CGI's SERVER_NAME). Where reverse DNS is slow that lookup sits between bind() and listen(),
+    so the port refuses connections for that long (tens of seconds on macOS CI runners) and the pet gives up."""
+    daemon_threads = True
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = str(self.server_address[0]), self.server_address[1]
+
+
 def make_handler(moth: Moth, token: str, hosts: tuple[str, ...] = ("127.0.0.1", "localhost", "[::1]")):
     page = os.path.join(HERE, "static", "index.html")
 
@@ -937,8 +950,7 @@ def main(argv=None, on_ready=None):
     torch.set_num_threads(a.threads or default_threads())
     moth = Moth(a)
     hosts = ("127.0.0.1", "localhost", "[::1]") + ((a.host,) if a.host not in ("0.0.0.0", "::", "") else ())
-    srv = ThreadingHTTPServer((a.host, a.port), make_handler(moth, token, hosts))
-    srv.daemon_threads = True
+    srv = Server((a.host, a.port), make_handler(moth, token, hosts))
     moth.start_reactor()
     url = f"http://127.0.0.1:{a.port}" if a.host in ("0.0.0.0", "::", "") else f"http://{a.host}:{a.port}"
     print(f"moth is awake at {url}  (home: {moth.home.root})", flush=True)

@@ -99,8 +99,10 @@ def _same_dir(a, b) -> bool:
 
 
 def _alive(pid: int) -> bool:
-    if os.name == "nt":
-        return True   # os.kill(pid, 0) would terminate it on Windows; /api/health decides there
+    if not 0 < pid < 2 ** 31:   # a garbled pidfile (and os.kill would overflow)
+        return False
+    if os.name == "nt":   # os.kill(pid, 0) is no probe there (signal 0 = CTRL_C_EVENT): ask the kernel instead
+        return _alive_nt(pid)
     try:
         os.kill(pid, 0)
         return True
@@ -108,6 +110,31 @@ def _alive(pid: int) -> bool:
         return False
     except OSError:
         return True   # exists, owned by someone else
+
+
+def _alive_nt(pid: int) -> bool:
+    """Windows: is there a running process with this pid? Unsure (no ctypes, an odd error): True, and /api/health
+    decides, as before."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        k32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    except (ImportError, OSError, AttributeError):
+        return True
+    h = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return ctypes.get_last_error() != 87   # ERROR_INVALID_PARAMETER: no such pid; access denied: it exists
+    try:
+        code = wintypes.DWORD()
+        if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+            return True
+        return code.value == 259   # STILL_ACTIVE
+    finally:
+        k32.CloseHandle(h)
 
 
 def _health(port: int) -> dict | None:

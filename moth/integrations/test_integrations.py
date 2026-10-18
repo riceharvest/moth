@@ -610,12 +610,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const post = (path, body) => fetch(`${process.env.MOTH_URL}${path}`, { method: "POST", body: JSON.stringify(body),
   headers: { "X-Moth-Token": "test-token-not-secret" } });
 const add = (text, source = "hermes") => post("/api/agent", { text, source, session: "20261018_120000_ab12" });
+// poll (the 2.5 s interval, driven by hand) until moth's reaction is said; not a fixed sleep: slow runners vary
+const heard = async (n) => { for (const end = Date.now() + 8000; said.length < n && Date.now() < end;) {
+  tick(); await sleep(100); } };
 if (plugin.id !== "moth" || typeof plugin.register !== "function") throw new Error("shape");
 plugin.register(ctx); await sleep(200);                 // first poll: cursor at the end, old lines skipped
-await add("one"); await sleep(300); tick(); await sleep(200);     // moth's reaction to a Hermes turn
+await add("one"); await heard(1);                        // moth's reaction to a Hermes turn
 await add("claude's turn", "claude-code"); await post("/api/chat", { text: "hi" });   // not Hermes: never voiced
 await sleep(300); tick(); await sleep(200);
-await add("x ".repeat(150) + "end"); await sleep(300); tick(); await sleep(200);   // a long line: cut into pieces
+await add("x ".repeat(150) + "end"); await heard(2);     // a long line: cut into pieces (the rest on timers)
 timers.forEach(([fn]) => fn());
 plugin.register({}); plugin.register({ pet: {} });    // older desktops: no pet, no crash
 console.log(JSON.stringify({ said, delays: timers.map(([, ms]) => ms) }));

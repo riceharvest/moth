@@ -474,9 +474,12 @@ class HomePaths(unittest.TestCase):
                 self.assertIsNone(ws._resolve(p), p)
         for p in ("notes.txt", "a/b.c", "/work/x", ".hidden", "con.d/x"[4:]):
             self.assertFalse(tools.windows_unsafe(p.replace("/work/", "")), p)
-        # on Linux all of these stay plain names inside the home (training behaviour)
-        self.assertEqual(self.home._resolve("a.txt."), os.path.join(self.home.root, "a.txt."))
-        self.assertEqual(self.home._resolve("con"), os.path.join(self.home.root, "con"))
+        # elsewhere these stay plain names inside the home (training behaviour); on Windows they are refused for real
+        for p in ("a.txt.", "con"):
+            if os.name == "nt":
+                self.assertIsNone(self.home._resolve(p), p)
+            else:
+                self.assertEqual(self.home._resolve(p), os.path.join(self.home.root, p))
 
 
 if __name__ == "__main__":

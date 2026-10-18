@@ -454,11 +454,25 @@ class LaunchBase(unittest.TestCase):
     def external_moth(self) -> subprocess.Popen:
         """A moth someone else started (not the pet): the fake server, in its own session."""
         env = dict(os.environ, FAKE_SERVE_INFO=self.info + ".ext")   # its pids apart from a server the pet starts
-        p = subprocess.Popen([sys.executable, FAKE, "--port", str(self.port)], start_new_session=True, env=env,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        out = os.path.join(self.tmp, "external.log")
+        with open(out, "w") as f:
+            p = subprocess.Popen([sys.executable, FAKE, "--port", str(self.port)], start_new_session=True, env=env,
+                                 stdout=f, stderr=subprocess.STDOUT)
         self.procs.append(p)
-        self.assertTrue(wait_until(lambda: L.probe(self.url)[0] == "moth"), "the external fake moth never woke")
+        self.assertTrue(wait_until(lambda: L.probe(self.url)[0] == "moth"),
+                        f"the external fake moth never woke: {self.read(out)!r}")
         return p
+
+    @staticmethod
+    def read(path: str) -> str:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                return f.read()[-2000:]
+        except OSError as e:
+            return str(e)
+
+    def serve_log(self) -> str:
+        return self.read(os.environ["MOTH_SERVE_LOG"])
 
     def garbage_server(self):
         srv = ThreadingHTTPServer(("127.0.0.1", self.port), Garbage)
@@ -502,6 +516,29 @@ class LaunchTest(LaunchBase):
         kind, why = L.probe(self.url)
         self.assertEqual(kind, "other")
         self.assertIn("moth", why)
+
+    def test_probe_kinds_of_failure(self):
+        """Every OS: how each failure is classified. A connect that times out is a free port (Windows retries a refused
+        loopback connect for ~2 s, longer than probe's timeout), a listener that accepts and stays silent is not."""
+        import urllib.error
+        from unittest import mock
+        cases = [(urllib.error.URLError(ConnectionRefusedError(10061, "refused")), "none"),
+                 (urllib.error.URLError(OSError(10061, "WSAECONNREFUSED")), "none"),
+                 (urllib.error.URLError(TimeoutError("timed out")), "none"),   # connect timed out: nothing accepted
+                 (TimeoutError("timed out"), "other"),                          # accepted, then silent: not moth
+                 (ConnectionResetError(104, "reset"), "other"),
+                 (urllib.error.URLError(OSError(113, "no route")), "other")]
+        for exc, want in cases:
+            with self.subTest(exc=repr(exc)), mock.patch.object(L._OPENER, "open", side_effect=exc):
+                self.assertEqual(L.probe(self.url)[0], want)
+
+    def test_probe_silent_listener_is_other(self):
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", self.port))
+        srv.listen(4)   # accepts (the kernel does) but never answers
+        self.addCleanup(srv.close)
+        kind, why = L.probe(self.url, timeout=0.5)
+        self.assertEqual(kind, "other", why)
 
     def test_probe_old_moth_without_health(self):
         class Old(BaseHTTPRequestHandler):
@@ -583,7 +620,7 @@ class LaunchTest(LaunchBase):
         self.assertEqual(boot.state, "starting", boot)
         self.assertEqual(L.probe(self.url)[0], "none")   # still "loading"
         ok, why = boot.server.wait_ready(timeout=20)
-        self.assertTrue(ok, why)
+        self.assertTrue(ok, f"{why}: {self.serve_log()!r}")
         argv = self.fake_info()["argv"]
         self.assertEqual(argv[-2:], ["--react-every", "0"])   # passthrough last: the user's flags win
         self.assertEqual(argv[argv.index("--device") + 1], "cpu")
@@ -706,7 +743,7 @@ class PetStartsServerTest(LaunchBase):
             seen.setdefault("first", (pet.booting, pet.w.asleep, list(seen["texts"])))
             return not pet.booting and pet.poller.up and not pet.server_down
         seen = self.run_pet(check, ["--server-arg=--quiet-after", "--server-arg=0", "--", "--react-every", "0"])
-        self.assertFalse(seen["timed_out"])
+        self.assertFalse(seen["timed_out"], (seen["texts"], self.serve_log()))
         booting, asleep, texts = seen["first"]
         self.assertTrue(booting and asleep)
         self.assertIn(P.WAKING, texts)
@@ -721,7 +758,7 @@ class PetStartsServerTest(LaunchBase):
     def test_reuses_a_running_moth_and_leaves_it_running(self):
         ext = self.external_moth()
         seen = self.run_pet(lambda pet, seen: pet.poller.up)
-        self.assertFalse(seen["timed_out"])
+        self.assertFalse(seen["timed_out"], (seen["texts"], self.serve_log()))
         self.assertEqual(seen["pet"].boot.state, "ready")
         self.assertIsNone(seen["pet"].boot.server)
         self.assertFalse(os.path.exists(self.info))   # the pet started nothing
@@ -764,7 +801,7 @@ class PetStartsServerTest(LaunchBase):
         with mock.patch.object(L, "install_mode", return_value="pip"), \
                 mock.patch.object(L.weights, "ensure", side_effect=ensure):
             seen = self.run_pet(check, model=False)
-        self.assertFalse(seen["timed_out"])
+        self.assertFalse(seen["timed_out"], (seen["texts"], self.serve_log()))
         downloading, booting, texts, started = seen["first"]
         self.assertTrue(downloading and not booting and not started)   # the server waits for the weights
         self.assertEqual(texts, [P.DOWNLOADING])
@@ -779,7 +816,7 @@ class PetStartsServerTest(LaunchBase):
         with mock.patch.object(L, "install_mode", return_value="pip"), \
                 mock.patch.object(L.weights, "ensure", side_effect=SystemExit("moth: can't reach the hub")):
             seen = self.run_pet(lambda pet, seen: any("hub" in t for t in seen["texts"]), model=False)
-        self.assertFalse(seen["timed_out"])
+        self.assertFalse(seen["timed_out"], (seen["texts"], self.serve_log()))
         self.assertFalse(seen["pet"].downloading)
         self.assertFalse(os.path.exists(self.info))   # nothing started
 
@@ -808,7 +845,7 @@ class PetProcessTest(LaunchBase):
                              stdout=log, stderr=subprocess.STDOUT)
         self.procs.append(p)
         self.assertTrue(wait_until(lambda: len(self.pids()) == 2 and L.probe(self.url)[0] == "moth", 30),
-                        "the pet never woke its server")
+                        f"the pet never woke its server: {self.serve_log()!r}")
         return p
 
     def test_signals_stop_the_server(self):
@@ -898,7 +935,6 @@ class QtTest(unittest.TestCase):
 
         def ready(pet):
             from PySide6.QtCore import QTimer
-            from PySide6.QtWidgets import QApplication
 
             def check():
                 pet.tick()
@@ -907,7 +943,8 @@ class QtTest(unittest.TestCase):
                     seen.update(lines=b.lines, excited=pet.w.excited, visible=pet.bub.isVisible() or None)
                     exercise()
                 if seen or time.monotonic() > deadline:
-                    QApplication.instance().quit()
+                    t.stop()     # once: a second app.quit() stays queued and ends the next test's exec() at once
+                    pet.quit()
 
             def exercise():
                 """The other branches of the tick (it swallows errors, so check it never had to)."""
@@ -1007,7 +1044,7 @@ class SkinLogicTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"CODEX_HOME": "/x/codex", "HERMES_HOME": "/y/hermes"}):
             d = P.pet_dirs()
         self.assertEqual(d[0], os.path.join(os.path.expanduser("~"), ".petdex", "pets"))
-        self.assertEqual(d[1:], ["/x/codex/pets", "/y/hermes/pets"])
+        self.assertEqual(d[1:], [os.path.join("/x/codex", "pets"), os.path.join("/y/hermes", "pets")])
 
     def test_lookup_order_and_folders(self):
         from unittest import mock
@@ -1161,7 +1198,10 @@ class SkinConfigTest(unittest.TestCase):
                            capture_output=True, text=True, timeout=30,
                            env=dict(os.environ, PYTHONPATH=str(ROOT)))
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual(self.C.pet_skin(), os.path.join(os.path.realpath(folder), "mypet"))
+        saved = self.C.pet_skin()   # absolute; Windows may spell the temp folder short (RUNNER~1): compare resolved
+        self.assertTrue(os.path.isabs(saved), saved)
+        self.assertEqual((os.path.realpath(os.path.dirname(saved)), os.path.basename(saved)),
+                         (os.path.realpath(folder), "mypet"))
         for bad in (("pet_skin", " "), ("update_check", "maybe"), ("last_update_check", "5")):
             with self.subTest(bad):
                 self.assertEqual(self.run_cli(*bad)[0], 2)
@@ -1322,6 +1362,7 @@ class PetSkinTrayUpdateTest(unittest.TestCase):
                         seen["texts"].append(" ".join(b.lines))
 
             def step():
+                seen["steps"] = seen.get("steps", 0) + 1
                 collect()
                 try:
                     if time.monotonic() > deadline:
@@ -1346,6 +1387,7 @@ class PetSkinTrayUpdateTest(unittest.TestCase):
             P.run(a, on_ready=ready)
         if "error" in seen:
             raise seen["error"]
+        self.assertTrue(seen.get("steps"), "the Qt loop ended before the script ran (a stray queued app.quit()?)")
         self.assertNotIn("timed_out", seen)
         return seen
 

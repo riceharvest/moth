@@ -74,7 +74,7 @@ def stale_pidfiles() -> list[str]:
         except (OSError, ValueError, KeyError, TypeError):
             out.append(path)
             continue
-        if os.name != "nt" and not update._alive(pid):
+        if not update._alive(pid):
             out.append(path)
     return out
 

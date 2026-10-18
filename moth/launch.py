@@ -148,7 +148,9 @@ def _get(url: str, timeout: float):
 
 
 def probe(url: str, timeout: float = 2.0) -> tuple[str, dict | str]:
-    """("moth", health) / ("none", why) / ("other", what answered). "none" only when nothing listens (refused)."""
+    """("moth", health) / ("none", why) / ("other", what answered). "none" when nothing accepts the connection: refused,
+    or the connect itself timed out (Windows retries a refused loopback connect for ~2 s, so a free port can look
+    like a connect timeout there). "other" when something accepted it and then answered wrong, or not at all."""
     url = url.rstrip("/")
     try:
         d = _get(f"{url}/api/health", timeout)
@@ -166,7 +168,11 @@ def probe(url: str, timeout: float = 2.0) -> tuple[str, dict | str]:
             return "none", "nothing listens"
         if isinstance(e.reason, OSError) and getattr(e.reason, "errno", None) in (111, 61, 10061):
             return "none", "nothing listens"
+        if isinstance(e.reason, TimeoutError):   # urllib wraps only connect/send errors: nothing accepted in time
+            return "none", "nothing answers"
         return "other", f"it doesn't answer like moth ({e.reason})"
+    except TimeoutError:   # accepted, then said nothing within the timeout: something is there, not moth
+        return "other", "it doesn't answer like moth (timed out)"
     except ConnectionRefusedError:
         return "none", "nothing listens"
     except Exception as e:  # noqa: BLE001  reset, timeout, garbage

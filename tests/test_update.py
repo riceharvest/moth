@@ -286,6 +286,14 @@ class UpdateTest(unittest.TestCase):
         serve.remove_pidfile(pidfile)
         self.assertFalse(Path(pidfile).exists())
 
+    def test_alive_on_every_os(self):
+        """The pid check behind stale pidfiles: a real check on Windows too (not os.kill(pid, 0), which signals there)."""
+        self.assertTrue(U._alive(os.getpid()))
+        p = subprocess.Popen([sys.executable, "-c", "pass"])
+        p.wait()
+        self.assertFalse(U._alive(p.pid))
+        self.assertFalse(U._alive(2 ** 40))   # a garbled pidfile
+
     def test_refuses_while_moth_from_this_install_runs(self):
         _, srv, _ = self.serve_moth(self.root)
         port = srv.server_address[1]
