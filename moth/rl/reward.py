@@ -70,7 +70,8 @@ def c_repeat(text: str, user: str, earlier: list[str]) -> float:
     if not mine:
         return 0.0
     seen = {g for p in earlier for g in ngrams(words(p), 3)}
-    return -round(sum(g in seen for g in mine) / len(mine), 4)
+    share = round(sum(g in seen for g in mine) / len(mine), 4)
+    return -share if share else 0.0
 
 
 def c_length(text: str) -> float:
