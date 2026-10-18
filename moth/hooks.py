@@ -128,9 +128,42 @@ def ps_call(cmd: str) -> str:
     return "& " + cmd if cmd.startswith('"') else cmd
 
 
+HOOK_RUN = "hook-run"   # the installers' app: `<moth-hook> hook-run <integrations/x.py>` (packaging/moth_hook.py)
+
+
+def frozen_exe() -> str | None:
+    """The installers' bundled executable a hook runs instead of a Python (PyInstaller sets sys.frozen); None for a
+    Python install. moth-hook(.exe) next to the app's executable: a small stdlib-only runner that starts in a fraction
+    of the big executable's time (a hook runs on every agent turn), console on Windows (PowerShell, Codex's hook shell,
+    doesn't wait for a windowed exe). AppImage: the .AppImage file ($APPIMAGE), whose AppRun hands `hook-run` to
+    moth-hook, not its mount under /tmp/.mount_*, which moves on every launch."""
+    if not getattr(sys, "frozen", False):
+        return None
+    if os.environ.get("APPIMAGE"):
+        return os.environ["APPIMAGE"]
+    exe = sys.executable
+    runner = os.path.join(os.path.dirname(exe), "moth-hook.exe" if _WIN else "moth-hook")
+    return runner if os.path.isfile(runner) else exe
+
+
+def hook_script(name: str) -> str:
+    """The integrations/<name> path a hook command names: this install's file; in an AppImage the bare relative
+    integrations/<name> (the bundled copy, wherever the AppImage is mounted this time)."""
+    if getattr(sys, "frozen", False) and os.environ.get("APPIMAGE"):
+        return "integrations/" + name
+    return script(name)
+
+
+def hook_argv(name: str, py: str | None = None) -> list[str]:
+    """What a hook runs for integrations/<name>: [python, script], or [moth executable, hook-run, script] in the
+    installers' app (py given: that Python, always)."""
+    exe = None if py else frozen_exe()
+    return [exe, HOOK_RUN, hook_script(name)] if exe else [py or sys.executable, script(name)]
+
+
 def harness_command(name: str, py: str | None = None) -> str:
     """The hook command for integrations/<name> as `moth hook` writes it, per harness: Codex's gets ps_call on Windows."""
-    cmd = hook_command(py or sys.executable, script(name))
+    cmd = hook_command(*hook_argv(name, py))
     return ps_call(cmd) if _WIN and name == "codex.py" else cmd
 
 
@@ -340,6 +373,8 @@ def _where(p: str, name: str) -> str:
     """'this' (this install's script), 'other' (another moth that exists) or 'missing'."""
     if os.path.realpath(os.path.expanduser(p)) == os.path.realpath(script(name)):
         return "this"
+    if p.replace("\\", "/") == "integrations/" + name and hook_script(name) == "integrations/" + name:
+        return "this"   # an AppImage's hook (hook_script): its bundled copy
     return "other" if os.path.isfile(os.path.expanduser(p)) else "missing"
 
 
@@ -750,7 +785,7 @@ def plan_hook(name: str, project: str | None = None, profile: str | None = None,
                               f"one notify slot, so moth won't replace it. Use the hooks.json variant (without "
                               f"--legacy-notify) instead")
             else:
-                want = f"notify = {json.dumps([sys.executable, script('codex.py')], ensure_ascii=False)}\n"
+                want = f"notify = {json.dumps(hook_argv('codex.py'), ensure_ascii=False)}\n"
                 if m:   # moth's notify from another install: point it here
                     new = text[:m.start()] + want + text[m.end():]
                     desc = f"update moth's legacy notify in {short(codex_config())}"
@@ -764,7 +799,7 @@ def plan_hook(name: str, project: str | None = None, profile: str | None = None,
                             f"variants (to switch to hooks.json: `{prog()} unhook codex`, then `{prog()} hook codex`)")
             if _where(legacy, "codex.py") != "this":
                 plan.nothing = None
-                want = f"notify = {json.dumps([sys.executable, script('codex.py')], ensure_ascii=False)}\n"
+                want = f"notify = {json.dumps(hook_argv('codex.py'), ensure_ascii=False)}\n"
                 plan.actions.append(Action("write", f"update moth's legacy notify in {short(codex_config())}",
                                            codex_config(), text[:m.start()] + want + text[m.end():]))
         else:
