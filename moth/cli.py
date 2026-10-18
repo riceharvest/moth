@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import argparse
 
-from moth.serve import CPU_QUANT, Moth, default_paths, default_threads, strip_ansi
+from moth.serve import CPU_QUANT, default_paths, default_threads, make_engine, strip_ansi
 
 DIM, LAMP, OFF = "\033[2m", "\033[33m", "\033[0m"
 
@@ -15,7 +15,7 @@ DIM, LAMP, OFF = "\033[2m", "\033[33m", "\033[0m"
 def main():
     d = default_paths()
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default=d["model"])
+    ap.add_argument("--model", default=d["model"], help="a weights folder, an HF repo id or openai:<url>#<model>")
     ap.add_argument("--tokenizer", default=d["tokenizer"])
     ap.add_argument("--home", default=d["home"], help="moth's home folder (kept between runs)")
     ap.add_argument("--pool-file", default=d["pool"])
@@ -31,12 +31,18 @@ def main():
                     help=f"as moth.serve: auto = {CPU_QUANT} on the CPU; none = exact fp32")
     ap.add_argument("--threads", type=int, default=None, help="CPU threads (default: min(8, CPUs))")
     a = ap.parse_args()
-    from moth import weights
-    weights.ensure_default(a.model)   # pip install, first run: download the model files
+    from moth import backends, weights
+    a.manifest = backends.resolve(a.model)
+    if a.manifest.backend == "tiny-agent":
+        if a.manifest.folder:
+            a.model = a.manifest.folder
+        weights.ensure_default(a.model)   # pip install, first run: download the model files
+        backends.prepare(a.manifest)
     import torch
     torch.set_num_threads(a.threads or default_threads())
-    moth = Moth(a)
-    print(f"{DIM}moth is awake. home: {moth.home.root}  (/reset, /home, /quit){OFF}")
+    moth = make_engine(a)
+    name = moth.character
+    print(f"{DIM}{name} is awake. home: {moth.home.root}  (/reset, /home, /quit){OFF}")
     while True:
         try:
             text = input("\nyou> ").strip()
@@ -57,7 +63,7 @@ def main():
             continue
         for ev in moth.chat(text):
             if "say" in ev:
-                print(f"{LAMP}moth>{OFF} {strip_ansi(ev['say'])}")
+                print(f"{LAMP}{name}>{OFF} {strip_ansi(ev['say'])}")
             else:
                 a, t = ev["args"], ev["tool"]
                 cmd = {"bash": f"$ {a.get('command', '')}", "read": f"$ cat {a.get('path', '')}",

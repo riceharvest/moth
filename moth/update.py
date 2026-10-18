@@ -826,6 +826,34 @@ def _update(hub, root: str, repo: str, rev: str | None, yes: bool, pip: bool) ->
     return 0
 
 
+def model_target():
+    """What `moth config model` means for moth update: None = this install's own moth (as always); (folder, repo) for
+    a tiny-agent model moth downloaded from a Hub repo (its manifest's repo id; updated like a pip install's weights:
+    model files only, with a backup); a str = why moth update leaves it alone."""
+    from moth import backends, config
+    spec = config.model()
+    if not spec:
+        return None
+    try:
+        m = backends.resolve(spec, network=False)
+    except backends.ManifestError as e:
+        return f"can't read the configured model ({e})"
+    if m.backend == "openai":
+        return (f"your model is {spec}, an OpenAI-compatible server, not a moth model from the Hugging Face Hub: "
+                "update it where it runs (e.g. `ollama pull`, a newer GGUF). `moth config model default` goes back "
+                "to moth's own model.")
+    if m.backend == "transformers":
+        src = m.repo or m.model or m.folder
+        how = f"`hf download {src}` refreshes it" if src and backends.HUB_ID.fullmatch(src) else "update it by hand"
+        return f"your model {src} runs on transformers, which keeps it itself: {how}."
+    repo = m.repo
+    if repo and m.folder and (_same_dir(m.folder, weights.cache_dir(repo))
+                              or os.path.isfile(os.path.join(m.folder, REVISION_FILE))):
+        return m.folder, repo
+    return (f"your model {m.folder} is a folder moth didn't download from the Hub (no repo id in its moth.json, or no "
+            f"{REVISION_FILE}): update it the way you made it.")
+
+
 def main(argv=None, root: str = ROOT) -> int:
     ap = argparse.ArgumentParser(prog="python -m moth update", epilog=EXIT_HELP,
                                  description="Update this Hugging Face download of moth in place (stop moth first). "
@@ -836,9 +864,18 @@ def main(argv=None, root: str = ROOT) -> int:
     ap.add_argument("--revision", default=weights.pinned_revision(),
                     help="branch, tag or commit (default: $MOTH_REVISION, else main)")
     ap.add_argument("--yes", "-y", action="store_true", help="don't ask before changing files")
-    a = ap.parse_args(argv)
+    args = list(sys.argv[1:] if argv is None else argv)
+    a = ap.parse_args(args)
     pip = _pip(root)
-    if pip:   # pip install: the weights cache is what gets updated
+    target = None if any(x == "--repo" or x.startswith("--repo=") for x in args) else model_target()
+    if isinstance(target, str):   # `moth config model` is something moth update doesn't manage: say so, then do
+        # this install's own update as always (its code, and moth's own model), so code updates and the pet's
+        # daily "new moth out" check keep working
+        print(f"moth update: {target} (this updates moth's own install, as usual.)", file=sys.stderr, flush=True)
+        target = None
+    if target:   # a tiny-agent model from another Hub repo, in the folder moth downloaded it to
+        root, a.repo, pip = target[0], target[1], True
+    elif pip:   # pip install: the weights cache is what gets updated
         root = weights.cache_dir(a.repo)
     if a.rollback:
         return rollback(root, a.yes, pip)

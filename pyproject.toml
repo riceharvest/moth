@@ -30,6 +30,7 @@ dependencies = [
 
 [project.optional-dependencies]
 pet = ["PySide6-Essentials"]   # QtCore/QtGui/QtWidgets/QtSvg; not the Addons wheel (WebEngine, 3D, ...: +56 MB on Linux)
+transformers = ["transformers>=4.45"]   # the transformers model backend (moth/backends, moth/docs/MODEL_BACKENDS.md)
 
 [project.scripts]
 moth = "moth.__main__:main"

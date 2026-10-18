@@ -36,16 +36,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 import torch
-from tokenizers import Tokenizer
 
 TA = os.environ.get("TA_REPO") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, TA)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tiny_agent.chat import parse_assistant, render  # noqa: E402
-from tiny_agent.checkpoint import load_model  # noqa: E402
 from tiny_agent.generate import KVCache, append  # noqa: E402
 from tiny_agent.tools import BASH_TIMEOUT_S, Workspace, truncate  # noqa: E402
-from moth.agent import AGENT_TAG, agent_turn  # noqa: E402
+from moth.agent import AGENT_TAG, agent_turn, clean_agent_message  # noqa: E402
 from moth.home import load_pool, sample_home  # noqa: E402
 from moth.norepeat import PhraseMemory, vocab_classes  # noqa: E402
 from moth.persona import SYSTEM_STUDENT  # noqa: E402
@@ -298,20 +296,23 @@ class Log:
 
 
 class Moth:
-    def __init__(self, a):
-        self.tok = Tokenizer.from_file(a.tokenizer)
-        dtype = torch.float32 if a.device == "cpu" else torch.bfloat16
-        # CPU: Engram tables stay bf16 and memory-mapped (~1 GB less RAM, identical outputs)
-        self.model = load_model(a.model, device=a.device, dtype=dtype, low_mem=a.device == "cpu").eval()
-        quant = self.quant = resolve_quant(a)
-        if quant != "none":   # CPU speed modes (CPU_QUANT is the default there): slightly different outputs than fp32
-            if a.device != "cpu":
-                raise SystemExit("--quant is for --device cpu")
-            from tiny_agent.generate import quantize_cpu
-            quantize_cpu(self.model, quant)
-        self.kv_dtype = dtype
-        # one KV cache for the whole session, reset for every re-read: the decoder's captured GPU graph is tied to it
-        self._kv = KVCache(self.model, 1, MAX_LEN, a.device, dtype=dtype)
+    """moth's engine on the tiny-agent backend (moth/backends/tiny_agent.py loads the model): the KV cache is kept
+    across turns and only new text is fed (_feed / _prefill_all / _turn). Other backends: moth.backends.engine's
+    GenericMoth, the same engine re-rendering the chat each turn (make_engine picks)."""
+    backend = None    # the moth.backends object (None: tests and benchmarks that set tok/model themselves)
+    manifest = None   # its moth.json (moth/backends/manifest.py); None: moth-112m's defaults
+
+    def __init__(self, a, manifest=None):
+        from moth.backends import load_backend, resolve
+        from moth.backends.manifest import apply_args
+        m = manifest or getattr(a, "manifest", None) or resolve(a.model, network=False)
+        if m.backend != "tiny-agent":
+            raise SystemExit(f"moth: {m.backend} models run on moth.serve.make_engine(a), not Moth(a)")
+        if not m.is_default:
+            self.manifest = m
+            a = apply_args(a, m)
+        b = self.backend = load_backend(m, a)   # tokenizer, weights (+ int8 on the CPU), the session's KV cache
+        self.tok, self.model, self.quant, self.kv_dtype, self._kv = b.tok, b.model, b.quant, b.kv_dtype, b.kv
         self.setup(a)
         if a.device != "cpu":   # capture the GPU graphs (decode + short-chunk feeds) now, not on the first turns
             self.cache = self._kv
@@ -322,6 +323,12 @@ class Moth:
     def setup(self, a):
         """Everything but the weights (tests build a Moth with a fake model and call this)."""
         self.a = a
+        # what the manifest changes above the model (no manifest: moth-112m as trained)
+        man = self.manifest
+        self.system = man.system_prompt(SYSTEM_STUDENT) if man else SYSTEM_STUDENT
+        self.character = man.character if man else "moth"
+        self.card_pre, self.card_post = man.card_parts() if man else (AGENT_TAG + "\n", "")
+        self.lowercase = man.lowercase if man else True
         self.im_end = self.tok.token_to_id("<|im_end|>")
         self.ban = [self.tok.token_to_id(t) for t in ("<tool_call>", "<think>")]   # for turns where moth must talk
         self.lock = threading.RLock()
@@ -363,7 +370,7 @@ class Moth:
         return self.specials.sub(lambda m: "< " + m.group(0)[1:], text)
 
     def reset(self):
-        self.messages = [{"role": "system", "content": SYSTEM_STUDENT}]
+        self.messages = [{"role": "system", "content": self.system}]
         self.cache = None
         self.said = deque(maxlen=3)    # token ids of moth's last replies (repetition penalty)
         self.protect: set[int] = set()  # ids from this turn's user message and tool results: free to copy
@@ -526,7 +533,9 @@ class Moth:
                 logits = self._prefill_all()
                 m = parse_assistant(self._turn(logits, talk_only=True))
                 m["tool_calls"], keys = [], set()
-            m["content"] = (m["content"] or "").lower()   # moth only speaks lowercase (the odd "I" slips through)
+            m["content"] = m["content"] or ""
+            if self.lowercase:   # moth only speaks lowercase (the odd "I" slips through)
+                m["content"] = m["content"].lower()
             self.messages.append(m)
             if not m["tool_calls"]:
                 events.append({"say": m["content"] or "..."})
@@ -623,9 +632,9 @@ class Moth:
     def react(self, text: str, hold_for_human: bool = False, item: dict | None = None) -> list[dict]:
         """moth's talk-only reaction to an agent message; afterwards only ~25 words of it stay in moth's history,
         so agent turns don't push the human's conversation out of context. (The cache still holds the full text
-        until the next re-read; trimming decides on the short version.) The model sees exactly agent_turn(text):
-        session names never go into moth's text. item: the message's session (see _one_turn_per_session)."""
-        msg = agent_turn(strip_ansi(text))
+        until the next re-read; trimming decides on the short version.) The model sees exactly agent_card(text)
+        (= agent_turn(text) for moth-112m): session names never go into moth's text. item: the message's session (see _one_turn_per_session)."""
+        msg = self.agent_card(text)
         key = item["key"] if item else None
         with self.lock:
             if hold_for_human and self.clock() - self.last_user < self.quiet_after:   # the human got in first
@@ -640,18 +649,24 @@ class Moth:
                 if e.get("say") and e["say"] != FALLBACK:
                     self.phrases.add(self.enc(e["say"]))
             want = self.defuse(msg)
+            pre, post = len(self.defuse(self.card_pre)), len(self.defuse(self.card_post))
             for i in range(len(self.messages) - 1, 0, -1):
                 m = self.messages[i]
                 if m["role"] == "user":
                     if m["content"] == want:
-                        words = want[len(AGENT_TAG):].split()
+                        words = want[pre:len(want) - post].split()
                         short = " ".join(words[:COMPACT_WORDS]) + (" ..." if len(words) > COMPACT_WORDS else "")
-                        self.messages[i] = {**m, "content": f"{AGENT_TAG}\n{short}", "session": key}
+                        self.messages[i] = {**m, "content": f"{self.card_pre}{short}{self.card_post}", "session": key}
                     break
             # the session this reaction answers, for /api/says?source=&session= (the token-free view strips it)
             tag = {k: item[k] for k in ("source", "session") if item and item.get(k)}
             self.log.add(*({**e, "re": tag} if tag and "say" in e else e for e in evs))
         return evs
+
+    def agent_card(self, text: str) -> str:
+        """The user-role message the model gets for an agent's final message: agent_turn(text) for moth-112m
+        ("[the agent said]\n" + the cleaned text), else the manifest's agent_card with the cleaned text in it."""
+        return f"{self.card_pre}{clean_agent_message(strip_ansi(text))}{self.card_post}"
 
     def _one_turn_per_session(self, key: str | None):
         """Sessions don't mix: before moth reacts to a message from session `key`, its history keeps only the newest
@@ -834,6 +849,8 @@ def make_handler(moth: Moth, token: str, hosts: tuple[str, ...] = ("127.0.0.1", 
             q = parse_qs(url.query)
             if url.path == "/api/health":   # no token (Host still checked): which install runs here, for moth update
                 health = {"ok": True, "pid": os.getpid(), "install_root": INSTALL_ROOT, "version": version()}
+                if getattr(moth, "manifest", None) is not None:   # another model (moth.json): who the pet shows
+                    health.update(character=moth.character, backend=moth.manifest.backend)
                 return self._send(200, json.dumps(health).encode(), "application/json", cors=False)
             if url.path == "/":
                 with open(page, encoding="utf-8") as f:
@@ -950,18 +967,28 @@ def default_threads() -> int:
     return max(1, min(8, os.cpu_count() or 1))
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(manifest=None) -> argparse.ArgumentParser:
+    """manifest (a moth.json, moth/backends/manifest.py): its sampling defaults and tokenizer become the defaults;
+    flags given on the command line still win. None: moth-112m's defaults."""
     d = default_paths()
+    s = manifest.sampling if manifest is not None else {}
+    tok = d["tokenizer"]
+    if manifest is not None and manifest.backend == "tiny-agent" and manifest.folder:
+        own = os.path.join(manifest.folder, manifest.tokenizer or "tokenizer.json")
+        tok = own if (manifest.tokenizer or manifest.repo or os.path.isfile(own)) else tok   # repo: comes with it
     ap = argparse.ArgumentParser(description="moth's local chat server")
-    ap.add_argument("--model", default=d["model"])
-    ap.add_argument("--tokenizer", default=d["tokenizer"])
+    ap.add_argument("--model", default=d["model"],
+                    help="a weights folder, an HF repo id or openai:<base_url>#<model> (default: `moth config model`, "
+                         "else this install's moth; see moth/docs/MODEL_BACKENDS.md)")
+    ap.add_argument("--tokenizer", default=tok)
     ap.add_argument("--home", default=d["home"], help="moth's home folder (kept between runs)")
     ap.add_argument("--pool-file", default=d["pool"])
     ap.add_argument("--seed", type=int, default=3, help="which home moth starts with")
     ap.add_argument("--device", default="cpu")
-    ap.add_argument("--temperature", type=float, default=0.8)
-    ap.add_argument("--top-p", type=float, default=0.95)
-    ap.add_argument("--rep-penalty", type=float, default=1.3, help="on words from moth's own recent replies")
+    ap.add_argument("--temperature", type=float, default=s.get("temperature", 0.8))
+    ap.add_argument("--top-p", type=float, default=s.get("top_p", 0.95))
+    ap.add_argument("--rep-penalty", type=float, default=s.get("rep_penalty", 1.3),
+                    help="on words from moth's own recent replies")
     ap.add_argument("--phrase-memory", type=int, default=16,
                     help="a new reaction can't repeat a 3-token phrase from moth's last N reactions, and the "
                          "repetition penalty covers the last 3 of them, also after a new chat (0: off)")
@@ -969,7 +996,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--phrase-ban-chat", action="store_true",
                     help="use the phrase ban in chat replies too (off: chat recall is never affected)")
     ap.add_argument("--ctx-budget", type=int, default=None, help="max tokens of chat moth keeps in mind")
-    ap.add_argument("--max-turn-tokens", type=int, default=200)
+    ap.add_argument("--max-turn-tokens", type=int, default=s.get("max_tokens", 200))
     ap.add_argument("--max-tool-rounds", type=int, default=3)
     ap.add_argument("--quant", default="auto", choices=["auto", "none", "int8", "bf16"],
                     help=f"Linear weights on the CPU: auto (default) = {CPU_QUANT} on the CPU, none on a GPU; "
@@ -1007,18 +1034,61 @@ def trim_heap():
             pass
 
 
-def main(argv=None, on_ready=None):
+def _given(argv: list, flag: str) -> bool:
+    return any(x == flag or x.startswith(flag + "=") for x in argv)
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    """build_parser()'s options plus the model: --model, else `moth config model`, else this install's moth. A model
+    with a moth.json brings its own sampling defaults (flags still win). a.manifest: the resolved manifest; a.model:
+    the weights folder for tiny-agent models (the spec as given for the others)."""
+    argv = list(sys.argv[1:] if argv is None else argv)
     a = build_parser().parse_args(argv)
-    from moth import weights
+    from moth import backends
+    spec = a.model if _given(argv, "--model") else (backends.configured() or a.model)
+    try:
+        m = backends.resolve(spec)
+    except backends.ManifestError as e:
+        raise SystemExit(f"moth: {e}")
+    if not m.is_default:
+        a = build_parser(m).parse_args(argv)
+    if m.backend == "tiny-agent" and m.folder:   # (an HF repo id: the folder it downloads to)
+        a.model = m.folder
+    a.manifest = m
+    return a
+
+
+def make_engine(a) -> Moth:
+    """Moth for tiny-agent models (the KV-cache path), moth.backends.engine.GenericMoth for the others."""
+    m = getattr(a, "manifest", None)
+    if m is None or m.backend == "tiny-agent":
+        return Moth(a)
+    from moth.backends.engine import GenericMoth
+    return GenericMoth(a)
+
+
+def main(argv=None, on_ready=None):
+    a = parse_args(argv)
+    from moth import backends, weights
     live = {}
     if a.exit_with_parent:   # first, so a pet killed while the model loads takes this server too (moth/launch.py)
         import _thread
         from moth.launch import exit_with_parent
         exit_with_parent(lambda: live["srv"].shutdown() if "srv" in live else _thread.interrupt_main())
-    weights.ensure_default(a.model)   # pip install, first run: download the model files
+    if a.manifest.backend == "tiny-agent":
+        weights.ensure_default(a.model)   # pip install, first run: download the model files
+        backends.prepare(a.manifest)      # a tiny-agent model from another Hub repo: the same first-run download
+    if not a.manifest.is_default:
+        print(f"moth: model {a.manifest.describe()}", flush=True)
+        for n in a.manifest.notes:
+            print(f"moth: moth.json: {n}", file=sys.stderr, flush=True)
+    note = backends.privacy_note(a.manifest)
+    if note:
+        print(f"moth: WARNING: {note}. moth is meant to stay local; point --model / `moth config model` at "
+              "localhost to keep it so.", file=sys.stderr, flush=True)
     token = load_token(a.token_file)
     torch.set_num_threads(a.threads or default_threads())
-    moth = Moth(a)
+    moth = make_engine(a)
     trim_heap()
     hosts = ("127.0.0.1", "localhost", "[::1]") + ((a.host,) if a.host not in ("0.0.0.0", "::", "") else ())
     srv = Server((a.host, a.port), make_handler(moth, token, hosts))

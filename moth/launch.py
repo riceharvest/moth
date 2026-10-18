@@ -81,8 +81,14 @@ def install_mode(code: str = CODE) -> str:
 def server_paths(model: str | None = None, code: str = CODE, mode: str | None = None) -> dict:
     """{"model", "tokenizer", "home", "log", "download"} for this install; "download": the folder weights.ensure()
     has to fill before the server can start (pip install, first run), else None. Raises LaunchError without usable
-    weights."""
+    weights.
+    model: a weights folder, or any model spec moth.serve takes (an HF repo id, openai:<url>#<model>, a folder whose
+    moth.json names another backend: moth/backends); None: `moth config model`, else this install's own moth. A spec
+    that isn't a tiny-agent folder is passed on as it is (serve resolves and, for a Hub repo, downloads it)."""
     home = os.path.expanduser("~")
+    if model is None:
+        model = _configured_model()
+    other = bool(model) and not _tiny_folder(model)
     mode = mode or install_mode(code)
     repo = hf_repo(code)
     d = {"download": None}
@@ -106,13 +112,36 @@ def server_paths(model: str | None = None, code: str = CODE, mode: str | None = 
             d["model"] = next((os.path.join(code, c) for c in DEV_WEIGHTS if complete(os.path.join(code, c))), None)
             if not d["model"]:
                 raise LaunchError("no complete weights in " + ", ".join(c.rsplit("/", 1)[0] for c in DEV_WEIGHTS))
-    if model:
+    if other:   # serve resolves it (and brings its own tokenizer)
+        d.update(model=model.strip(), tokenizer=None, download=None)
+    elif model:
         model = os.path.abspath(os.path.expanduser(model))
         if not complete(model):
             raise LaunchError(f"{model} has no complete config.json + model.safetensors")
         d["model"] = model
+        if os.path.isfile(os.path.join(model, "moth.json")) and os.path.isfile(os.path.join(model, "tokenizer.json")):
+            d["tokenizer"] = os.path.join(model, "tokenizer.json")   # a moth with its own manifest + tokenizer
     d["log"] = os.environ.get("MOTH_SERVE_LOG") or d["log"]
     return d
+
+
+def _configured_model() -> str | None:
+    try:
+        from moth import config   # stdlib only
+        return config.model()
+    except Exception:  # noqa: BLE001  an unreadable config is the default
+        return None
+
+
+def _tiny_folder(model: str) -> bool:
+    """model is a folder of tiny-agent weights (moth-112m's kind: launch checks them); False for every other spec."""
+    from moth import backends   # stdlib only
+    kind = None
+    try:
+        kind, _ = backends.parse_spec(model)
+        return kind == "folder" and backends.resolve(model, network=False).backend == "tiny-agent"
+    except backends.ManifestError:
+        return kind == "folder"   # a broken moth.json: let the weights check / serve say what's wrong
 
 
 def server_command(port: int, paths: dict, extra=(), token_file: str | None = None,
@@ -120,8 +149,9 @@ def server_command(port: int, paths: dict, extra=(), token_file: str | None = No
     """moth.serve on CPU with these paths; `extra` goes last, so the user's flags win (argparse: last one counts).
     exit_with_parent: only for a server the pet starts (Server.start pipes its stdin), never for one run on its own."""
     base = shlex.split(os.environ.get("MOTH_SERVE_CMD", "")) or [sys.executable, "-m", "moth.serve"]
-    cmd = base + ["--device", "cpu", "--model", paths["model"], "--tokenizer", paths["tokenizer"],
-                  "--home", paths["home"], "--port", str(port)]
+    cmd = base + ["--device", "cpu", "--model", paths["model"]] \
+        + (["--tokenizer", paths["tokenizer"]] if paths.get("tokenizer") else []) \
+        + ["--home", paths["home"], "--port", str(port)]
     if token_file:
         cmd += ["--token-file", token_file]
     if exit_with_parent:

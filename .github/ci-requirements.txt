@@ -5,6 +5,8 @@ tokenizers
 safetensors
 numpy
 huggingface_hub
+# test_backends' transformers backend test (a tiny random GPT-2 built in the test, nothing downloaded)
+transformers
 # PySide6 6.12.0 on CPython 3.11 aborts in the GC at interpreter exit after test_pet's several offscreen pet runs in
 # one process (all tests pass, exit 134; 6.11.2 is fine, 3.12 is fine). Drop the cap once a newer 6.12.x fixes it.
 # PySide6-Essentials: what the pet extra installs (pyproject.toml), so a module from the Addons wheel would fail here.
