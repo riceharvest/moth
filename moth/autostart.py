@@ -28,8 +28,10 @@ MARKER = "X-Moth-Autostart=1"
 # (an AppImage's mount, where CODE and ICON are, moves on every launch) and names the icon by its theme name
 FROZEN = bool(getattr(sys, "frozen", False))
 RUN_DIR = os.path.expanduser("~") if FROZEN else CODE
-if FROZEN and os.environ.get("APPIMAGE"):
-    ICON = "moth"
+if FROZEN:
+    from moth.hooks import appimage   # stdlib only
+    if appimage():
+        ICON = "moth"
 
 
 def prog() -> str:
@@ -57,8 +59,10 @@ def pet_python(platform: str | None = None) -> str:
     """sys.executable; on Windows its pythonw.exe sibling (no console window) if there is one. The installers' app:
     its windowed mothw.exe on Windows, the .AppImage file itself ($APPIMAGE) rather than its per-launch mount."""
     py = sys.executable
-    if FROZEN and os.environ.get("APPIMAGE"):
-        return os.environ["APPIMAGE"]
+    if FROZEN:
+        from moth.hooks import appimage
+        if appimage():
+            return appimage()
     if kind(platform) == "windows":
         for name in ("mothw.exe",) if FROZEN else ("pythonw.exe",):
             w = os.path.join(os.path.dirname(py), name)

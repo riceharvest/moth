@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import shutil
 import statistics
 import subprocess
@@ -61,7 +62,8 @@ class Smoke:
         self.home = Path(tempfile.mkdtemp(prefix="moth smoke home " if WIN else "moth-smoke-home-"))
         for d in (".claude", ".codex"):
             (self.home / d).mkdir()
-        env = {k: v for k, v in os.environ.items() if not k.startswith("MOTH_") and k != "QT_QPA_PLATFORM"}
+        drop = ("QT_QPA_PLATFORM", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "HERMES_HOME", "PI_CODING_AGENT_DIR")
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MOTH_") and k not in drop}
         env.update(HOME=str(self.home), XDG_CONFIG_HOME=str(self.home / ".config"),
                    XDG_CACHE_HOME=str(self.home / ".cache"), MOTH_URL=self.url, PYTHONIOENCODING="utf-8")
         if WIN:
@@ -217,6 +219,57 @@ class Smoke:
             self.check("autostart entry written", False, e)
         return cmds
 
+    def autostart_argv(self) -> list | None:
+        """The command the autostart entry runs at login, as written (Exec= / ProgramArguments / the .bat)."""
+        import plistlib
+        try:
+            if WIN:
+                bat = (self.home / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+                       / "Startup" / "moth-pet.bat")
+                return ["cmd", "/c", str(bat)] if bat.exists() else None
+            if MAC:
+                plist = self.home / "Library" / "LaunchAgents" / "local.moth.pet.plist"
+                return plistlib.loads(plist.read_bytes())["ProgramArguments"]
+            text = (self.home / ".config" / "autostart" / "moth-pet.desktop").read_text()
+            line = next(x for x in text.splitlines() if x.startswith("Exec="))
+            return shlex.split(line[5:].replace("%%", "%"))
+        except (OSError, KeyError, StopIteration, ValueError) as e:
+            self.note(f"autostart entry unreadable: {e}")
+            return None
+
+    def wait_health(self, secs: float = 180):
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < secs:
+            h = self.health()
+            if h:
+                return h, time.monotonic() - t0
+            time.sleep(1)
+        return None, secs
+
+    def day_two(self):
+        """After first run: weights from the folder picker (saved in ~/.moth/app.json, no MOTH_MODEL_DIR), started by
+        the autostart entry's own command, then by opening the app: the pet each time, no first-run window."""
+        self.kill_all()
+        state = self.home / ".moth" / "app.json"
+        d = json.loads(state.read_text())
+        d["model_dir"] = str(Path(self.a.model).resolve())
+        state.write_text(json.dumps(d))
+        argv = self.autostart_argv()
+        if argv:
+            p = self.launch(argv, "autostart-run.log")
+            h, secs = self.wait_health()
+            self.check("autostart entry's command wakes moth (weights from app.json, no MOTH_MODEL_DIR)", bool(h),
+                       f"{argv} -> {h} after {secs:.0f} s" if h else self.tail(self.home / ".moth" / "pet.log"))
+            self.kill_all()
+        p = self.launch([self.a.app], "second-launch.log")
+        h, secs = self.wait_health()
+        self.check("opening the app again starts the pet directly (no first-run window)", bool(h) and p.poll() is None,
+                   f"{h} after {secs:.0f} s" if h else self.tail(self.out / "second-launch.log"))
+        if h:
+            time.sleep(4)
+            self.shot("second-launch.png")
+        self.kill_all()
+
     def time_cmd(self, label: str, argv: list, stdin: str, n: int = 10):
         runs = []
         for i in range(n + 1):
@@ -343,6 +396,7 @@ class Smoke:
                 self.hooks(cmds)
                 time.sleep(5)
                 self.shot("pet.png")
+                self.day_two()
             self.uninstall()
         finally:
             self.kill_all()

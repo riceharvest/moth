@@ -4,7 +4,7 @@
 # tiny random model, the hooks as written, screenshots, uninstall).
 # Output: workflow artifacts only. This workflow never creates a release, a tag or anything else public; its token
 # can only read the repo. Unsigned for now (docs/INSTALL.md: SmartScreen / Gatekeeper).
-# The push trigger on the installers branch is for developing this workflow; drop it once that branch is merged.
+# Runs on demand (Actions tab / gh workflow run installers.yml -f os=all|windows|macos|linux) and on v* tags.
 name: installers
 
 on:
@@ -17,13 +17,6 @@ on:
         default: all
   push:
     tags: ["v*"]
-    branches: [installers]
-    paths:
-      - packaging/**
-      - moth/hooks.py
-      - moth/autostart.py
-      - moth/setup.py
-      - .github/workflows/installers.yml
 
 permissions:
   contents: read

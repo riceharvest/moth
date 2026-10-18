@@ -131,6 +131,17 @@ def ps_call(cmd: str) -> str:
 HOOK_RUN = "hook-run"   # the installers' app: `<moth-hook> hook-run <integrations/x.py>` (packaging/moth_hook.py)
 
 
+def appimage() -> str | None:
+    """$APPIMAGE when this is moth's own AppImage (the frozen executable runs from inside its mount, $APPDIR); None
+    otherwise. Every child of any AppImage inherits APPIMAGE (an editor shipped as one, and its terminal), so it alone
+    doesn't say this moth is one."""
+    image, appdir = os.environ.get("APPIMAGE"), os.environ.get("APPDIR")
+    if not (getattr(sys, "frozen", False) and image and appdir):
+        return None
+    exe, root = os.path.realpath(sys.executable), os.path.realpath(appdir)
+    return image if exe.startswith(root.rstrip(os.sep) + os.sep) else None
+
+
 def frozen_exe() -> str | None:
     """The installers' bundled executable a hook runs instead of a Python (PyInstaller sets sys.frozen); None for a
     Python install. moth-hook(.exe) next to the app's executable: a small stdlib-only runner that starts in a fraction
@@ -139,8 +150,8 @@ def frozen_exe() -> str | None:
     moth-hook, not its mount under /tmp/.mount_*, which moves on every launch."""
     if not getattr(sys, "frozen", False):
         return None
-    if os.environ.get("APPIMAGE"):
-        return os.environ["APPIMAGE"]
+    if appimage():
+        return appimage()
     exe = sys.executable
     runner = os.path.join(os.path.dirname(exe), "moth-hook.exe" if _WIN else "moth-hook")
     return runner if os.path.isfile(runner) else exe
@@ -149,7 +160,7 @@ def frozen_exe() -> str | None:
 def hook_script(name: str) -> str:
     """The integrations/<name> path a hook command names: this install's file; in an AppImage the bare relative
     integrations/<name> (the bundled copy, wherever the AppImage is mounted this time)."""
-    if getattr(sys, "frozen", False) and os.environ.get("APPIMAGE"):
+    if appimage():
         return "integrations/" + name
     return script(name)
 

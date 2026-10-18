@@ -29,7 +29,7 @@ class Frozen(unittest.TestCase):
             (self.app / f).write_text("")
         self.home = self.tmp / "home"
         (self.home / ".claude").mkdir(parents=True)
-        env = {k: v for k, v in os.environ.items() if k not in ("APPIMAGE", "CLAUDE_CONFIG_DIR")}
+        env = {k: v for k, v in os.environ.items() if k not in ("APPIMAGE", "APPDIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME")}
         env.update(HOME=str(self.home), USERPROFILE=str(self.home))
         self.patches = [mock.patch.dict(os.environ, env, clear=True),
                         mock.patch.object(sys, "frozen", True, create=True),
@@ -82,9 +82,18 @@ class Frozen(unittest.TestCase):
         self.assertEqual(hooks.status("claude-code")["state"], "installed")
         self.assertIn("moth-hook", (self.home / ".claude" / "settings.json").read_text())
 
+    def test_another_appimage_is_not_moth(self):
+        """APPIMAGE inherited from another AppImage (an editor's terminal): the tarball's moth-hook still."""
+        other = {"APPIMAGE": str(self.tmp / "Editor.AppImage"), "APPDIR": str(self.tmp / ".mount_Editor")}
+        with mock.patch.dict(os.environ, other):
+            self.assertEqual(hooks.hook_argv("claude_code.py")[0], str(self.app / "moth-hook"))
+            self.assertEqual(hooks._where("integrations/claude_code.py", "claude_code.py"), "missing")
+            with mock.patch.object(autostart, "FROZEN", True):
+                self.assertEqual(autostart.pet_python("linux"), str(self.app / "moth"))
+
     def test_appimage(self):
         image = str(self.tmp / "Apps" / "moth.AppImage")
-        with mock.patch.dict(os.environ, {"APPIMAGE": image}):
+        with mock.patch.dict(os.environ, {"APPIMAGE": image, "APPDIR": str(self.tmp)}):
             self.assertEqual(hooks.hook_argv("claude_code.py"), [image, "hook-run", "integrations/claude_code.py"])
             self.assertEqual(hooks._where("integrations/claude_code.py", "claude_code.py"), "this")
             hooks.run_plans([hooks.plan_hook("claude-code")], True, False, "install")
