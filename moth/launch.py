@@ -18,7 +18,11 @@ The child runs in its own process group (POSIX: its own session) so it can be st
 gets SIGTERM if the pet dies without cleaning up (PR_SET_PDEATHSIG). Windows: its own process group (Ctrl-Break)
 inside a Job Object that kills every process in it when stopped or when the pet dies (the job's last handle closes),
 so the server's own children go too, even after the server itself has exited; `taskkill /T /F` is the fallback
-when no job could be made. MOTH_SERVE_CMD (a shell-quoted command)
+when no job could be made. Everywhere (and the only guard on macOS, which has neither): the pet starts the server
+with --exit-with-parent and a pipe on its stdin that the pet holds and never writes to; when the pet dies, however
+it dies, the OS closes that pipe and the server sees EOF and stops cleanly (exit_with_parent below). A server run on
+its own (`python -m moth`, `python -m moth.launch`, try_moth.sh --no-pet) never gets that flag.
+MOTH_SERVE_CMD (a shell-quoted command)
 replaces `python -m moth.serve` (the tests start a stub server that way).
 
   python -m moth.launch [--model DIR] [--port N] [-- moth.serve flags]
@@ -119,13 +123,17 @@ def server_paths(model: str | None = None, code: str = CODE, mode: str | None = 
     return d
 
 
-def server_command(port: int, paths: dict, extra=(), token_file: str | None = None) -> list[str]:
-    """moth.serve on CPU with these paths; `extra` goes last, so the user's flags win (argparse: last one counts)."""
+def server_command(port: int, paths: dict, extra=(), token_file: str | None = None,
+                   exit_with_parent: bool = False) -> list[str]:
+    """moth.serve on CPU with these paths; `extra` goes last, so the user's flags win (argparse: last one counts).
+    exit_with_parent: only for a server the pet starts (Server.start pipes its stdin), never for one run on its own."""
     base = shlex.split(os.environ.get("MOTH_SERVE_CMD", "")) or [sys.executable, "-m", "moth.serve"]
     cmd = base + ["--device", "cpu", "--model", paths["model"], "--tokenizer", paths["tokenizer"],
                   "--home", paths["home"], "--port", str(port)]
     if token_file:
         cmd += ["--token-file", token_file]
+    if exit_with_parent:
+        cmd.append(EXIT_WITH_PARENT)
     return cmd + list(extra)
 
 
@@ -271,6 +279,41 @@ def _taskkill_tree(pid: int):
         pass
 
 
+EXIT_WITH_PARENT = "--exit-with-parent"
+
+
+def exit_with_parent(stop=None, grace: float = 10.0):
+    """The server side of the lifeline (moth.serve --exit-with-parent; tests/fake_serve.py too): a daemon thread reads
+    stdin, which is a pipe whose write end only the pet holds and never writes to. EOF (or a broken-pipe error,
+    Windows) means the pet is gone, even after SIGKILL: then stop() runs (default: KeyboardInterrupt in the main
+    thread, the same clean exit as Ctrl-C), and if the process is still there `grace` s later it exits hard.
+    Returns the thread, or None when there's no stdin to watch."""
+    import _thread
+    import threading
+    try:
+        fd = sys.stdin.fileno()
+    except (AttributeError, OSError, ValueError):   # pythonw: no stdin at all
+        print("moth: --exit-with-parent but no stdin to watch; ignored", file=sys.stderr, flush=True)
+        return None
+
+    def watch():
+        try:
+            while os.read(fd, 4096):   # the pet never writes; anything that does arrive is ignored
+                pass
+        except OSError:
+            pass
+        print("moth: the program that started me is gone; stopping", file=sys.stderr, flush=True)
+        try:
+            (stop or _thread.interrupt_main)()
+        finally:
+            time.sleep(grace)
+            os._exit(0)
+
+    t = threading.Thread(target=watch, daemon=True, name="moth-lifeline")
+    t.start()
+    return t
+
+
 class Server:
     """A moth.serve the pet started. start() in the main thread (PR_SET_PDEATHSIG follows the spawning thread);
     stop() is idempotent and safe from atexit, aboutToQuit and signal-driven quits alike."""
@@ -296,7 +339,8 @@ class Server:
         with open(self.log, "a", encoding="utf-8") as f:
             f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} moth pet started: {shlex.join(self.cmd)}\n")
             f.flush()
-            self.proc = subprocess.Popen(self.cmd, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT,
+            # stdin: the lifeline (exit_with_parent); the pet keeps the write end open, unwritten, until stop()
+            self.proc = subprocess.Popen(self.cmd, stdin=subprocess.PIPE, stdout=f, stderr=subprocess.STDOUT,
                                          cwd=CODE, env=env, **kw)
         if os.name == "nt":   # right away, before the server (a Python start-up: tens of ms) can start children
             self.job = _WinJob.make(self.proc)
@@ -310,8 +354,9 @@ class Server:
     def exited(self) -> bool:
         return self.proc is not None and self.proc.poll() is not None
 
-    def wait_ready(self, stop=None, timeout: float = READY_TIMEOUT, every: float = 0.5) -> tuple[bool, str]:
-        """Until /api/health answers: (True, "") or (False, why). stop: a threading.Event that gives up early."""
+    def wait_ready(self, stop=None, timeout: float = READY_TIMEOUT, every: float = 0.1) -> tuple[bool, str]:
+        """Until /api/health answers: (True, "") or (False, why). stop: a threading.Event that gives up early.
+        every: s between probes (a refused local connect costs next to nothing; 0.5 s added ~0.25 s to the wake-up)."""
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             if stop is not None and stop.is_set():
@@ -358,6 +403,7 @@ class Server:
                     p.wait(5.0)
                 except subprocess.TimeoutExpired:
                     pass
+                self._close_lifeline()
             return
         try:
             for sig, wait in ((signal.SIGINT, grace), (signal.SIGTERM, 3.0), (signal.SIGKILL, 5.0)):
@@ -374,6 +420,16 @@ class Server:
                 p.wait(1.0)
             except subprocess.TimeoutExpired:
                 pass
+            self._close_lifeline()
+
+    def _close_lifeline(self):
+        """Our end of the server's stdin pipe (a server still running sees EOF and stops: exit_with_parent)."""
+        try:
+            pipe = getattr(self.proc, "stdin", None)
+            if pipe is not None:
+                pipe.close()
+        except OSError:
+            pass
 
 
 # --- what the pet does at start -------------------------------------------------------------------------------
@@ -419,7 +475,7 @@ def prepare(url: str, no_server: bool = False, model: str | None = None, extra=(
         paths = server_paths(model)
     except LaunchError as e:
         return Boot("error", f"can't wake moth: {e}")
-    srv = Server(server_command(port, paths, extra, token_file), url, paths["log"])
+    srv = Server(server_command(port, paths, extra, token_file, exit_with_parent=True), url, paths["log"])
     if paths["download"]:   # first run of a pip install: the pet downloads (in a thread), then starts srv
         return Boot("downloading", f"downloading moth's weights ({weights.SIZE_HINT}) into {paths['download']}",
                     srv, download=paths["download"])

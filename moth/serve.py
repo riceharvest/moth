@@ -47,6 +47,7 @@ from tiny_agent.generate import KVCache, append  # noqa: E402
 from tiny_agent.tools import BASH_TIMEOUT_S, Workspace, truncate  # noqa: E402
 from moth.agent import AGENT_TAG, agent_turn  # noqa: E402
 from moth.home import load_pool, sample_home  # noqa: E402
+from moth.norepeat import PhraseMemory, vocab_classes  # noqa: E402
 from moth.persona import SYSTEM_STUDENT  # noqa: E402
 from moth.shell import MARKER, Shell, _windows_unsafe  # noqa: E402
 
@@ -329,6 +330,12 @@ class Moth:
         self.budget = getattr(a, "ctx_budget", None) or CTX_BUDGET
         self.keep = self.budget * CTX_KEEP // CTX_BUDGET
         self.common = {i for w in COMMON.split() for v in (w, " " + w) for i in self.enc(v)}
+        # moth's last reactions, for the phrase ban (moth/norepeat.py); kept across reset() and forget() on purpose
+        self.phrases = PhraseMemory(_opt(a, "phrase_memory", 16), _opt(a, "phrase_n", 3))
+        self.ban_chat = bool(getattr(a, "phrase_ban_chat", False))
+        self.word_ids, self.boring_ids = vocab_classes(self.tok, self.common)
+        self._hook = None     # this turn's logits_hook (set in _chat)
+        self._carry = set()   # this turn's extra repetition-penalty ids: the last reactions' (set in _chat)
         try:
             added = [t.content for t in self.tok.get_added_tokens_decoder().values()]
         except AttributeError:   # older tokenizers
@@ -362,7 +369,9 @@ class Moth:
 
     def forget(self):
         """New chat (the page's button / POST /api/reset): history, log (new epoch), any pending reaction or open
-        batch, and the list of active agent sessions."""
+        batch, and the list of active agent sessions. Kept on purpose: self.phrases, the token ids of moth's own last
+        reactions (RAM only, never shown anywhere), so a new chat doesn't bring back the same joke; stopping moth
+        wipes them."""
         with self.lock:
             self.reset()
             self.log.clear()
@@ -405,9 +414,9 @@ class Moth:
     def _pen_ids(self) -> set[int]:
         """Token ids of moth's last replies that the repetition penalty hits this turn (not common words, not ids from
         this turn's user message or tool results): fixed for a whole turn."""
-        if getattr(self.a, "rep_penalty", 1.0) == 1.0 or not self.said:
+        if getattr(self.a, "rep_penalty", 1.0) == 1.0 or not (self.said or self._carry):
             return set()
-        return {i for r in self.said for i in r} - self.common - self.protect
+        return ({i for r in self.said for i in r} | self._carry) - self.common - self.protect
 
     def _sample(self, logits, talk_only=False):
         """One token from logits (1, V): ban (talk_only), repetition penalty, temperature, top-p. On the logits'
@@ -438,7 +447,8 @@ class Moth:
         one captured graph per token, sampling on the device, tokens read back every few steps (generate.Decoder)."""
         out = self._decoder().generate(
             logits, self.a.max_turn_tokens, self.im_end, temperature=self.a.temperature, top_p=self.a.top_p,
-            pen=getattr(self.a, "rep_penalty", 1.0), pen_ids=self._pen_ids(), ban_ids=self.ban if talk_only else ())
+            pen=getattr(self.a, "rep_penalty", 1.0), pen_ids=self._pen_ids(), ban_ids=self.ban if talk_only else (),
+            logits_hook=self._hook)
         return self.tok.decode(out, skip_special_tokens=False)
 
     def _cut(self, text: str, max_tokens: int) -> str:
@@ -480,6 +490,11 @@ class Moth:
         user = self.defuse(user)
         msg = {"role": "user", "content": user}
         self.protect = set(self.enc(" " + user)) | set(self.enc(user))
+        # the phrase ban: reactions always; chat turns only with --phrase-ban-chat, sparing every user message's words
+        quote = self.enc(" " + user) if talk_only else self.enc(" ".join(
+            [m["content"] for m in self.messages if m["role"] == "user"] + [user]))
+        self._hook = self.phrases.hook(self.word_ids, self.boring_ids, quote) if talk_only or self.ban_chat else None
+        self._carry = self.phrases.recent() if talk_only else set()   # reactions: the soft penalty spans "new chat"
         logits = None
         if self.cache is not None:
             logits = self._feed(self.enc("\n" + render([msg], add_generation_prompt=True)))
@@ -610,6 +625,9 @@ class Moth:
             self.last_react = self.clock()
             self._one_turn_per_session(key)
             evs = self.chat(msg, talk_only=True)
+            for e in evs:   # the phrase ban's memory (not the fallback line: that one isn't moth's own)
+                if e.get("say") and e["say"] != FALLBACK:
+                    self.phrases.add(self.enc(e["say"]))
             want = self.defuse(msg)
             for i in range(len(self.messages) - 1, 0, -1):
                 m = self.messages[i]
@@ -930,6 +948,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--rep-penalty", type=float, default=1.3, help="on words from moth's own recent replies")
+    ap.add_argument("--phrase-memory", type=int, default=16,
+                    help="a new reaction can't repeat a 3-token phrase from moth's last N reactions, and the "
+                         "repetition penalty covers the last 3 of them, also after a new chat (0: off)")
+    ap.add_argument("--phrase-n", type=int, default=3, help=argparse.SUPPRESS)   # the phrase ban's n-gram length
+    ap.add_argument("--phrase-ban-chat", action="store_true",
+                    help="use the phrase ban in chat replies too (off: chat recall is never affected)")
     ap.add_argument("--ctx-budget", type=int, default=None, help="max tokens of chat moth keeps in mind")
     ap.add_argument("--max-turn-tokens", type=int, default=200)
     ap.add_argument("--max-tool-rounds", type=int, default=3)
@@ -952,12 +976,20 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--token-file", default=None, help="default ~/.moth/token (or $MOTH_TOKEN_FILE)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=4747)
+    ap.add_argument("--exit-with-parent", action="store_true",
+                    help="for launchers (the desktop pet): stop when stdin closes, i.e. when the launcher that holds "
+                         "the other end of the pipe dies")
     return ap
 
 
 def main(argv=None, on_ready=None):
     a = build_parser().parse_args(argv)
     from moth import weights
+    live = {}
+    if a.exit_with_parent:   # first, so a pet killed while the model loads takes this server too (moth/launch.py)
+        import _thread
+        from moth.launch import exit_with_parent
+        exit_with_parent(lambda: live["srv"].shutdown() if "srv" in live else _thread.interrupt_main())
     weights.ensure_default(a.model)   # pip install, first run: download the model files
     token = load_token(a.token_file)
     torch.set_num_threads(a.threads or default_threads())
@@ -969,6 +1001,7 @@ def main(argv=None, on_ready=None):
     print(f"moth is awake at {url}  (home: {moth.home.root})", flush=True)
     if on_ready:
         on_ready(url)
+    live["srv"] = srv   # from here the lifeline stops serve_forever (and the finally below removes the pidfile)
     pidfile = write_pidfile(srv.server_address[1])
     try:
         srv.serve_forever()

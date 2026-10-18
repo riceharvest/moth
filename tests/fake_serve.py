@@ -1,6 +1,6 @@
 """A stand-in for `python -m moth.serve` in tests/test_pet.py (MOTH_SERVE_CMD points here): no torch, no model.
 
-Takes moth.serve's flags (only --port matters; the rest is ignored), sleeps FAKE_SERVE_DELAY s before it listens
+Takes moth.serve's flags (only --port and --exit-with-parent matter; the rest is ignored), sleeps FAKE_SERVE_DELAY s before it listens
 (the model loading), starts a grandchild in its own process group (so the tests can see the whole group stopped),
 writes {"pid", "child", "argv"} to FAKE_SERVE_INFO, then answers /api/health, /api/says and /api/log like moth.
 FAKE_SERVE_EXIT=N: exit with N instead of listening (a server that dies while waking up).
@@ -17,6 +17,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 def main():
     argv = sys.argv[1:]
     port = int(argv[argv.index("--port") + 1])
+    if "--exit-with-parent" in argv:   # the real lifeline, as moth.serve runs it (stdlib only)
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from moth.launch import exit_with_parent
+        exit_with_parent()
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
     info = os.environ.get("FAKE_SERVE_INFO")
     if info:

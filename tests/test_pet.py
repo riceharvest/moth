@@ -1,7 +1,8 @@
 """moth/pet.py: the flight logic, the bubble queue, the poller against serve.py's real HTTP handler (torch faked out,
 no model), the platform choice, and (with PySide6) the Petdex sheet and an offscreen run of the real windows.
 Plus the one-command start (moth/launch.py + the pet): a server is started when none answers and stopped with the
-pet (process group, no orphans, also on SIGTERM/SIGINT/SIGHUP and, on Linux, SIGKILL of the pet); a running moth is
+pet (process group, no orphans, also on SIGTERM/SIGINT/SIGHUP and SIGKILL of the pet: the stdin lifeline on every
+OS, plus PR_SET_PDEATHSIG on Linux and the Job Object on Windows); a running moth is
 reused and left alone; something else on the port and low memory start nothing. The "server" is tests/fake_serve.py
 (MOTH_SERVE_CMD), on a spare port; nothing touches 4747, live/ or ~/.moth.
 
@@ -706,6 +707,44 @@ class LaunchTest(LaunchBase):
         boot.server.stop()
         self.assertTrue(wait_until(lambda: not alive(child), 5))   # ... goes with the group
 
+    def test_lifeline_flag_only_for_a_server_the_pet_starts(self):
+        paths = {"model": "m", "tokenizer": "t", "home": "h"}
+        self.assertNotIn(L.EXIT_WITH_PARENT, L.server_command(1, paths, ["--x"]))   # python -m moth.launch, ...
+        cmd = L.server_command(1, paths, ["--react-every", "0"], exit_with_parent=True)
+        self.assertEqual(cmd[-3:], [L.EXIT_WITH_PARENT, "--react-every", "0"])     # the user's flags stay last
+
+    def _orphan_parent(self) -> tuple[subprocess.Popen, int]:
+        """A stand-in pet: a process that starts the server through launch.prepare with the parent-death signal and
+        the Job Object switched off, so the stdin lifeline is the only guard left (macOS's situation, on any OS)."""
+        code = (f"import sys, time; sys.path.insert(0, {str(ROOT)!r}); from moth import launch as L\n"
+                "L._deathsig = lambda: None\nL._WinJob.make = staticmethod(lambda proc: None)\n"
+                f"boot = L.prepare({self.url!r}, model={self.model!r}, mem=lambda: 32.0)\n"
+                "assert boot.state == 'starting', boot\nok, why = boot.server.wait_ready(timeout=20)\n"
+                "print('ready' if ok else why, flush=True)\ntime.sleep(600)\n")
+        p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+        self.procs.append(p)
+        self.assertEqual(p.stdout.readline().strip(), "ready", self.serve_log())
+        return p, self.pids()[0]
+
+    def test_lifeline_stops_the_server_when_its_launcher_is_killed(self):
+        parent, pid = self._orphan_parent()
+        self.assertIn(L.EXIT_WITH_PARENT, self.fake_info()["argv"])
+        parent.kill()   # SIGKILL / TerminateProcess: no cleanup in the launcher at all
+        parent.wait()
+        self.assertTrue(wait_until(lambda: not alive(pid), 10), f"orphaned server: {self.serve_log()!r}")
+        self.assertIn("the program that started me is gone", self.serve_log())
+
+    def test_without_the_flag_stdin_eof_changes_nothing(self):
+        """A server run on its own (python -m moth) never watches stdin: EOF there (e.g. </dev/null) is harmless."""
+        p = subprocess.Popen([sys.executable, FAKE, "--port", str(self.port)], stdin=subprocess.PIPE,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, start_new_session=os.name != "nt")
+        self.procs.append(p)
+        self.assertTrue(wait_until(lambda: L.probe(self.url)[0] == "moth"))
+        p.stdin.close()
+        time.sleep(1.0)
+        self.assertIsNone(p.poll())
+        self.assertEqual(L.probe(self.url)[0], "moth")   # (tearDown kills it and its child)
+
 
 @unittest.skipUnless(HAVE_QT, "PySide6 not installed")
 class PetStartsServerTest(LaunchBase):
@@ -864,14 +903,12 @@ class PetProcessTest(LaunchBase):
                 self.assertTrue(gone, f"{sig.name}: the server outlived the pet")
                 self.assertEqual(L.probe(self.url)[0], "none")
 
-    @unittest.skipUnless(sys.platform.startswith("linux") or os.name == "nt",
-                         "known gap: macOS has neither PR_SET_PDEATHSIG nor Job Objects, so a SIGKILLed pet leaves "
-                         "its server running")
     def test_hard_kill_of_the_pet_takes_the_server(self):
         pet = self.start_pet()
         pid, child = self.pids()
-        pet.kill()   # no atexit, no Qt quit: only the kernel is left (Linux: parent-death signal; Windows: the Job
-        pet.wait()   # Object's KILL_ON_JOB_CLOSE when the dead pet's handle closes)
+        self.assertIn(L.EXIT_WITH_PARENT, self.fake_info()["argv"])
+        pet.kill()   # no atexit, no Qt quit: only the kernel is left (everywhere: the stdin lifeline sees EOF; Linux
+        pet.wait()   # also the parent-death signal; Windows also the Job Object's KILL_ON_JOB_CLOSE)
         self.assertTrue(wait_until(lambda: not alive(pid), 5), "the server outlived a hard-killed pet")
         if os.name == "nt":   # the job holds the server's children too
             self.assertTrue(wait_until(lambda: not alive(child), 5), "the server's child outlived a hard-killed pet")

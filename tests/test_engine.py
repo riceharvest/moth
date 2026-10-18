@@ -405,6 +405,41 @@ class Sessions(unittest.TestCase):
         m.say_to("cool")
         self.assertFalse(any("web" in s or "train" in s for s in m.seen))   # labels never reach the model
 
+    def test_phrase_ban_remembers_reactions_across_new_chat_not_chat(self):
+        """moth/norepeat.py: moth's reactions (not its chat replies, not the fallback line) are remembered, also over
+        "new chat" (the live demo reset between takes); each later reaction gets a ban hook built from them; chat
+        turns get none unless --phrase-ban-chat, and then never on the words of the human's own messages."""
+        m = self.m
+        joke = "my great great great grandma was the first bug."
+        m.script = [joke, "hi! my name is moth.", lambda: 1 / 0, "oh. a cart!", "hi friend.", "great great!"]
+        m.agent_said("Fixed the bug. All 3 tests pass.", "claude-code", "A")
+        self.assertEqual(list(m.phrases.replies), [m.enc(joke)])
+        self.assertIsNone(m._hook)                     # nothing remembered before the first one
+        m.say_to("hi moth, what's your name?")
+        self.assertIsNone(m._hook)                     # chat: no ban by default
+        self.assertEqual(m._carry, set())              # ... and only its usual repetition penalty
+        self.assertEqual(len(m.phrases), 1)            # and chat replies are never stored
+        m.agent_said("Deploy failed.", "codex", "B")   # the turn fails: moth says FALLBACK, which isn't stored
+        self.assertEqual(len(m.phrases), 1)
+        m.forget()                                     # "new chat": history and log go, the phrases stay
+        self.assertEqual(len(m.messages), 1)
+        m.agent_said("Fixed the cart total.", "claude-code", "A")
+        great, grand = m.tok.token_to_id("Ġgreat"), m.tok.token_to_id("Ġgrand")
+        self.assertIn(grand, m._hook.table[(great, great)])
+        self.assertEqual(len(m.phrases), 2)
+        self.assertIn(grand, m._carry)                 # the soft repetition penalty reaches over "new chat" too
+        self.assertIn(grand, m._pen_ids())
+        self.assertNotIn(m.tok.token_to_id("Ġmy"), m._pen_ids())   # (never common words)
+        m.ban_chat = True                              # --phrase-ban-chat: chat too, sparing the human's words
+        m.say_to("say great great great grandma")
+        self.assertNotIn((great, great), m._hook.table)
+        self.assertIn(m.enc(" was the"), [list(k) for k in m._hook.table])
+        m.ban_chat = False
+        m.phrases = serve.PhraseMemory(0)              # --phrase-memory 0: off
+        m.agent_said("Fixed it again.", "claude-code", "A")
+        self.assertIsNone(m._hook)
+        self.assertEqual(len(m.phrases), 0)
+
 
 class LogBuffer(unittest.TestCase):
     def test_ring_epoch_says(self):
