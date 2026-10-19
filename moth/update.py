@@ -115,6 +115,13 @@ def is_download(root: str) -> bool:
     return weights.hf_layout(root)
 
 
+def _not_download(root: str, what: str) -> str:
+    code = os.path.dirname(HERE)
+    if _same_dir(root, ROOT) and os.path.exists(os.path.join(code, ".git")):   # the dev checkout: git updates it
+        return f"{code} is a git checkout of moth; update it with `git -C {code} pull`"
+    return f"{root} isn't a Hugging Face download of moth (no model.safetensors next to code/); nothing to {what}"
+
+
 def _same_dir(a, b) -> bool:
     return isinstance(a, str) and os.path.realpath(a) == os.path.realpath(b)
 
@@ -351,7 +358,7 @@ def _latest(hub, repo: str, rev: str | None):
 
 def check(root: str, repo: str, rev: str | None, pip: bool = False) -> int:
     if not pip and not is_download(root):
-        print(f"{root} isn't a Hugging Face download of moth (no model.safetensors next to code/); nothing to check")
+        print(_not_download(root, "check"))
         return 1
     off = _offline()
     if off:
@@ -634,7 +641,7 @@ def _commit_backup(root: str, plan: dict) -> bool:
 
 def _not_safe(root: str, pip: bool = False) -> str | None:
     if not pip and not is_download(root):
-        return f"{root} isn't a Hugging Face download of moth (no model.safetensors next to code/); nothing to update"
+        return _not_download(root, "update")
     running = server_running(ROOT if pip else root)   # pip: serve's pidfile names the install, not the cache
     if running:
         return f"moth is running from this {'install' if pip else 'folder'} (port {running[0]}, pid {running[1]}): " \
