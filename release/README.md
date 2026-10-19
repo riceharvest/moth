@@ -29,7 +29,8 @@ pipeline_tag: text-generation
 # moth
 
 > **A much better talker is on the way.** A new moth model, fully pretrained, then SFT'd and RL'd, is training right
-> now. It'll arrive as a normal `moth update`, no reinstall.
+> now. To get it: `python -m moth update` in a Hugging Face download, `pip install -U moth-companion` for pip, or the
+> new installer from the [releases page](https://github.com/riceharvest/moth/releases/latest).
 
 Real chats with this model, hand-picked from its eval transcripts (temperature 0.7) and copied as generated.
 `[ran …]` marks a tool call. The last chat skips four turns of small talk, as marked. Nothing else is cut.
@@ -166,7 +167,7 @@ Without a desktop (or for your coding agents' hooks): `cd moth-112m/code && pyth
 the terminal and prints ready-to-paste hook snippets with this install's real paths filled in (`--open` also opens
 the chat page in your browser). Start it before the pet and the pet uses it.
 
-- CPU is fine: a plain reply takes about a quarter of a second. One where moth reads through its files takes a
+- CPU is fine: a plain reply takes about half a second. One where moth reads through its files takes a
   second or two.
   The server uses about 0.8 GB of RAM: the Engram tables stay in bf16, memory-mapped from `model.safetensors`, and
   the OS reads in only the rows moth uses. `--device cuda` or `--device xpu` work with `python -m moth` (the pet
@@ -314,7 +315,10 @@ python -m moth update --rollback   # back to the version before the last update 
 - `--revision <tag or commit>` (or `MOTH_REVISION`) pins a version, older ones included. `--repo` / `MOTH_REPO` picks
   another repo. With `HF_HUB_OFFLINE=1` or `MOTH_OFFLINE=1` set, it says so and doesn't go online.
 - pip installs: `moth update` refreshes only the model files in `~/.cache/moth/<repo>/`, with the same backup and
-  rollback. `--check` also tells you when newer code is out (`pip install -U moth-companion`).
+  rollback. `--check` also tells you when newer code is out (`pip install -U moth-companion`). A model that needs
+  newer code than you have isn't fetched: moth says to upgrade first. The installers' app works the same way and
+  points you at the releases page.
+- A change to only this card or the docs is not an update: `--check` stays at "up to date" and the pet stays quiet.
 
 ## Privacy
 
@@ -427,6 +431,13 @@ keyword-based. One of the 5-turn "passes" is a false positive, shown as the last
 
 Update an existing download in place with `python -m moth update` (from `code/`; `--check` shows what changed;
 see [Updating](#updating)).
+
+**0.3.1**
+- An edit of only the model card or docs no longer counts as an update (no "there's a new me!" bubble).
+- Ready for the next model: an older moth that can't run a newer model says how to upgrade (pip, installer, or
+  `moth update`) instead of crashing, and pip installs never fetch a model their code can't load. A model's
+  `moth.json` can say `"needs_moth": "<version>"`.
+- pip installs: the startup hints use the `moth` command; the wheel leaves out the training scripts.
 
 **0.3.0** (round 3)
 - Conversation-first data: 70% of the 67k kept chats (from 98,660 teacher chats) are plain back-and-forth talk,
