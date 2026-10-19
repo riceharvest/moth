@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from moth.agent import (AGENT_CHAT_REMIND, AGENT_LENGTHS, AGENT_PROMPT, AGENT_REMIND,  # noqa: E402
                         AGENT_RULES, AGENT_SCENARIOS, AGENT_TAG, AGENT_TASKS, AGENT_USER_PERSONAS, HARNESS_STYLES,
                         OUTCOMES, agent_turn)
-from moth.cards import describe, display_name, sample_card  # noqa: E402
+from moth.cards import LANG_NAMES, describe, display_name, lang_of, sample_card  # noqa: E402
 from moth.gist import ASKED, identity_ref  # noqa: E402
 from moth.persona import (SCENARIOS, TEACHER_BIBLE, TOPICS, USER_PERSONAS, USER_SIM_PROMPT,  # noqa: E402
                           teacher_system)
@@ -212,10 +212,15 @@ def id_allowed(u: str, card: dict | None) -> bool:
     return bool(ASKED.search(u))
 
 
+def lang_remind(card: dict | None) -> str:
+    lang = lang_of(card)
+    return "" if lang == "en" else f"\n(reply in {LANG_NAMES[lang]} only.)"
+
+
 def teacher_view(u: str, remind: str | None = None, extra: str = "", card: dict | None = None) -> str:
     if remind:   # agent chats: their own reminder, always
-        return u + remind
-    return u + (TALK_REMIND_ID if id_allowed(u, card) else TALK_REMIND) + extra
+        return u + remind + lang_remind(card)
+    return u + (TALK_REMIND_ID if id_allowed(u, card) else TALK_REMIND) + extra + lang_remind(card)
 
 
 def reply_text(r, cut_ok=False) -> str | None:
@@ -251,7 +256,15 @@ def sim_prompt(persona, scenario, turns, i, msgs, topic="anything", card=None) -
     name = display_name(card) if card is not None else "moth"
     return USER_SIM_PROMPT.format(name=name, who=describe(card) if card is not None else "a moth on a graphics card",
                                   persona=persona, scenario=scenario, topic=topic, turns=turns, i=i,
-                                  transcript=transcript(msgs, name))
+                                  transcript=transcript(msgs, name), language=sim_language(card))
+
+
+def sim_language(card: dict | None) -> str:
+    lang = lang_of(card)
+    if lang == "en":
+        return "Write in English."
+    return (f"Write in {LANG_NAMES[lang]} only, the natural casual way native speakers type it in a chat app (your "
+            "persona's age and habits still show). Never switch to English, even though these instructions are English.")
 
 
 async def user_turn(client, model, persona, scenario, turns, i, msgs, topic="anything", directive="", card=None,
@@ -260,7 +273,8 @@ async def user_turn(client, model, persona, scenario, turns, i, msgs, topic="any
     mine = [m["content"] for m in msgs if m["role"] == "user" and not m["content"].startswith(AGENT_TAG)]
     last = last_moth(msgs)
     short = not directive and msgs and random.random() < 0.4   # without reasoning LFM ignores "one in four very short"
-    if short and last and random.random() < 0.3:
+    en = lang_of(card) == "en"   # the built-in "what X?" turns are English
+    if short and last and en and random.random() < 0.3:
         return confused(last, mine)
     if mine:   # r3: lazy short lines ("ok and?") came back word for word
         p += SIM_NO_REPEAT.format(prev=" / ".join(f'"{x[:100]}"' for x in mine[-8:]))
@@ -269,7 +283,8 @@ async def user_turn(client, model, persona, scenario, turns, i, msgs, topic="any
         # works in 16-token blocks, so sharing the sheet buys nothing. No thinking: capped reasoning leaks into the message
         if short:
             p += SIM_SHORT.format(mood=random.choice(SHORT_MOODS))
-        r = await chat(client, model, [{"role": "system", "content": SIM_SYSTEM}, {"role": "user", "content": p}],
+        r = await chat(client, model, [{"role": "system", "content": SIM_SYSTEM + " " + sim_language(card)},
+                                       {"role": "user", "content": p}],
                        budget=0, temperature=1.0, top_p=0.95, max_tokens=100)
     else:   # same system prompt as moth's calls: Qwen3.x's hybrid prefix cache reuses only whole ~1.5k-token blocks,
         # so both roles share one identical leading block (the character sheet) and only the tail is prefilled
@@ -286,7 +301,7 @@ async def user_turn(client, model, persona, scenario, turns, i, msgs, topic="any
     t = re.sub(r"^(you|me|user|friend|human)\s*:\s*", "", t, flags=re.I).strip()
     if not t or re.match(r"moth\s*:", t, re.I) or (card and card.get("name") and t.lower().startswith(card["name"] + ":")):
         return None
-    w = WHATX_RE.search(t) if len(t.split()) <= 5 and last else None
+    w = WHATX_RE.search(t) if len(t.split()) <= 5 and last and en else None
     if w and w.group(1).lower() not in WORD_STOP | {"do", "does", "is", "are", "you", "u", "mean", "happened", "now", "else",
                                                    "about", "it", "that", "this", "then", "not", "tho", "so"} \
             and stems(w.group(1)).isdisjoint(stems(last)) and w.group(1).lower() not in last.lower():
@@ -374,7 +389,7 @@ async def agent_dialog(client, model, seed, rng, stats, card=None) -> dict | Non
 
     async def say(u: str, remind: str) -> bool:
         msgs.append({"role": "user", "content": u})
-        oai.append({"role": "user", "content": teacher_view(u, remind)})
+        oai.append({"role": "user", "content": teacher_view(u, remind, card=card)})
         if await moth_turn(client, model, oai, msgs, stats, talk_only=True,
                            meta={"type": "agent", "topic": "", "card": card}, card=card):
             return True
@@ -405,7 +420,7 @@ async def agent_dialog(client, model, seed, rng, stats, card=None) -> dict | Non
         return None
     stats["agent_cut"] += not ok
     return {"seed": seed, "type": "agent", "persona": persona, "scenario": scenario, "agent_sources": sources,
-            "turns": len(msgs), "card": card, "messages": msgs}
+            "turns": len(msgs), "card": card, "lang": lang_of(card), "messages": msgs}
 
 
 async def one_dialog(client, model, seed, stats) -> dict | None:
@@ -462,7 +477,7 @@ async def one_dialog(client, model, seed, stats) -> dict | None:
     if not any(m["role"] == "assistant" for m in msgs):
         return None
     return {"seed": seed, "type": "talk", "persona": persona, "scenario": scenario, "topic": topic, "turns": turns,
-            "recall": recall, "card": card, "messages": msgs}
+            "recall": recall, "card": card, "lang": lang_of(card), "messages": msgs}
 
 
 async def run_dialogs(a, client, model):
@@ -515,7 +530,7 @@ def first_teacher_view(seed: int) -> dict:
     card = sample_card(rng)
     if rng.random() < AGENT_SHARE["p"]:
         u = agent_turn(SAMPLE_AGENT)
-        return {"type": "agent", "card": card, "system": teacher_system(card), "user": teacher_view(u, AGENT_REMIND)}
+        return {"type": "agent", "card": card, "system": teacher_system(card), "user": teacher_view(u, AGENT_REMIND, card=card)}
     persona, scenario = rng.choice(USER_PERSONAS), rng.choice(SCENARIOS)
     u = SAMPLE_OPENERS[seed % len(SAMPLE_OPENERS)]
     return {"type": "talk", "card": card, "system": teacher_system(card),

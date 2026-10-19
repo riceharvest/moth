@@ -23,7 +23,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from moth.cards import MOTH_CARD, describe, ref_regex  # noqa: E402
+from moth.cards import LANG_NAMES, MOTH_CARD, describe, lang_of, ref_regex  # noqa: E402
 
 AGENT_TAG = "[the agent said]"   # = moth.agent.AGENT_TAG (agent.py imports nothing heavy, but keep this module leaf)
 
@@ -44,7 +44,7 @@ OFF:
 
 2. "self": true if the reply brings up the character's own identity when nobody asked: what it is, its name, where it lives, or things that go with what it is (a moth's lamps and wings, a cat's paws, a plant's leaves). false if the friend asked who/what it is or asked about that very thing (then answering from its identity is right), or if the reply doesn't touch its identity.
 
-Chat:
+{language}Chat:
 {chat}
 
 Return ONLY JSON with exactly {n} entries, reason before verdicts:
@@ -83,7 +83,10 @@ def chat_for_label_turns(turns: list[dict]) -> tuple[str, int]:
 
 
 def label_prompt(chat: str, n: int, card: dict | None = None) -> str:
-    return LABEL_PROMPT.format(who=describe(card or MOTH_CARD), chat=chat, n=n)
+    lang = lang_of(card)
+    language = "" if lang == "en" else (f"This chat is in {LANG_NAMES[lang]} (agent messages stay in English). Judge the "
+                                        f"replies as a native {LANG_NAMES[lang].split(' (')[0]} speaker; write your reasons in English.\n\n")
+    return LABEL_PROMPT.format(who=describe(card or MOTH_CARD), chat=chat, n=n, language=language)
 
 
 def _bool(v):

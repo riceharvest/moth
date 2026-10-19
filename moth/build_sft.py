@@ -29,11 +29,12 @@ sys.path.insert(0, TA)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tiny_agent.chat import render  # noqa: E402
 from moth.agent import AGENT_TAG, clean_agent_message  # noqa: E402
-from moth.cards import MOTH_CARD, student_system  # noqa: E402
+from moth.cards import MOTH_CARD, is_heldout, student_system  # noqa: E402
 from moth.gist import identity_ref, load_labels  # noqa: E402
 from moth.persona import SYSTEM_STUDENT  # noqa: E402,F401
 
 MAX_WORDS = 40
+MAX_CHARS = 240
 BANNED = ("as an ai", "assistant", "how can i help", "let me know", "feel free", "i'm here to help",
           "i am here to help", "language model", "happy to help", "certainly", "absolutely!", "great question",
           # assistant-speak the r3 teacher still slips in (checked after ’ -> ')
@@ -49,7 +50,7 @@ def clean_reply(t: str) -> str | None:
     t = re.sub(r"\*[^*\n]{1,24}\*", "", t)            # stage directions like *flaps*
     t = re.sub(r"\s*\n\s*\n\s*", " ", t).strip()        # afterthought paragraphs -> one message
     t = re.sub(r"[ \t]+", " ", t).lower()
-    if not t or len(t.split()) > MAX_WORDS:
+    if not t or len(t.split()) > MAX_WORDS or len(t) > MAX_CHARS:   # chars: scripts without spaces (zh)
         return None
     if re.search(r"^\s*([-*#]|\d+\.)\s", t, re.M) or t.count("\n") > 2:
         return None
@@ -445,10 +446,19 @@ def uses_eval_agent_msg(d: dict, keys: set[str]) -> bool:
                if m["role"] == "user" and m["content"].startswith(AGENT_TAG))
 
 
+def refuse_eval_inputs(paths: list[str]) -> None:
+    """Bake-off and eval chats use held-out cards and probes: training on them leaks the eval (2026-10-19 review)."""
+    bad = [p for p in paths if "bakeoff" in os.path.abspath(p).split(os.sep) or "bakeoff" in os.path.basename(p)
+           or os.sep + "evals" + os.sep in os.path.abspath(p)]
+    if bad:
+        raise SystemExit(f"refusing eval/bake-off inputs (held-out cards and probes): {bad}")
+
+
 def filter_chats(paths: list[str], why: collections.Counter, cutoff: dict | None = None, held: set | None = None,
                  eval_keys: set | None = None, labels: dict | None = None):
     """keep() over every chat of every file -> (kept items, keep-rate table by original moth-reply count)."""
     items, by_len = [], collections.defaultdict(collections.Counter)
+    refuse_eval_inputs(paths)
     for path in paths:
         src = os.path.basename(path)
         last_old = (cutoff or {}).get(src, 0)
@@ -457,6 +467,9 @@ def filter_chats(paths: list[str], why: collections.Counter, cutoff: dict | None
             why["chats_in"] += 1
             if d["seed"] in (held or ()):
                 why["heldout"] += 1
+                continue
+            if is_heldout(d.get("card")):
+                why["heldout_card"] += 1   # an eval-only identity card or phrasing: never in training
                 continue
             if eval_keys and uses_eval_agent_msg(d, eval_keys):
                 why["eval_agent_msg"] += 1   # reacts to one of the eval's held-out agent messages

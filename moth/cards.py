@@ -12,6 +12,8 @@ Card schema (a plain dict, JSON-serialisable; a card file is one such object):
   traits   list[str]      0-3 second-person facts ("you love puns", "you're scared of thunder")
   lines    list[str]|None free-form identity text that replaces the template sentences (how real users write a
                           system prompt: "you are a cat named bo.", "Name: Bo. You are a cat."); ~40% of pool cards
+  lang     str            chat language (LANGS: en/zh/es/fr/hi), set per chat by sample_card; missing = "en". The
+                          friend writes in it and the buddy answers in it; the identity lines stay as written
   refs     list[str]      words that count as an identity reference (metrics: identity_ref %): whole words (plural
                           ok); a trailing * marks a stem ("waddl*"). Everyday words (walk, water, rain...) never count
 
@@ -253,10 +255,11 @@ def teacher_card(card: dict) -> str:
     """Card section appended to the teacher's character sheet (after the shared core)."""
     if not card.get("name") and not card.get("kind"):
         return ("\nWHO YOU ARE IN THIS CHAT\n- no name and no special identity. if asked who or what you are: just a little "
-                "chat buddy. that's all; don't make up more.\n" + IDENTITY_RULE)
+                "chat buddy. that's all; don't make up more.\n" + IDENTITY_RULE + language_rule(card))
     facts = "\n".join(f"- {x}" for x in _lines(card))
     extra = f"\n- (you are {card['about']}.)" if card.get("about") and not card.get("kind") else ""
-    return f"\nWHO YOU ARE IN THIS CHAT (your system prompt says this)\n{facts}{extra}\n" + IDENTITY_RULE
+    return (f"\nWHO YOU ARE IN THIS CHAT (your system prompt says this)\n{facts}{extra}\n" + IDENTITY_RULE
+            + language_rule(card))
 
 
 def _card(i: int, rng: random.Random, kinds, names_human, traits) -> dict:
@@ -283,6 +286,23 @@ def build_pool(n: int = 800, seed: int = 0) -> list[dict]:
     humans = [x for x in HUMAN_NAMES if x not in held_names]
     kinds = [(k, [x for x in ns if x not in held_names] or ns, r) for k, ns, r in KINDS]
     return [_maybe_free(_card(i, rng, kinds, humans, TRAITS), rng) for i in range(n)]
+
+
+HELDOUT_ID = re.compile(r"^h\d{3}f?$")
+
+
+def is_heldout(card: dict | None) -> bool:
+    """An eval-only card: a held-out id, or a line in a held-out phrasing (never train on these)."""
+    if not card:
+        return False
+    if HELDOUT_ID.match(str(card.get("id") or "")):
+        return True
+    kinds = {k for k, _, _ in HELDOUT_KINDS}
+    names = {nm for _, ns, _ in HELDOUT_KINDS for nm in ns} | set(HELDOUT_HUMAN)
+    if card.get("kind") in kinds or (card.get("name") or "").lower() in names:
+        return True
+    heads = [t.split("{")[0].lower() for t in HELDOUT_PHRASINGS if t.split("{")[0].strip()]
+    return any(str(x).lower().startswith(h) for x in card.get("lines") or [] for h in heads)
 
 
 def heldout_cards(free: bool = False) -> list[dict]:
@@ -319,10 +339,47 @@ GENERIC_REFS = {"water", "sun", "sleep", "slow", "night", "hot", "rain", "sky", 
 
 _POOL: list[dict] = []
 SHARES = {"moth": 0.08, "blank": 0.10}   # the rest: a pool card
+# chat languages (user decision 2026-10-19): share of training chats, and how the teacher/judge name them
+LANGS = {"en": 0.60, "zh": 0.13, "es": 0.13, "fr": 0.08, "hi": 0.06}
+LANG_NAMES = {"en": "English", "zh": "Chinese (simplified, 简体中文)", "es": "Spanish", "fr": "French",
+              "hi": "Hindi (Devanagari script)"}
+CASED = {"en", "es", "fr"}   # scripts with capital letters: the "all lowercase" style only applies there
+
+
+def lang_of(card: dict | None) -> str:
+    return (card or {}).get("lang") or "en"
+
+
+def sample_lang(rng: random.Random) -> str:
+    x, acc = rng.random(), 0.0
+    for k, p in LANGS.items():
+        acc += p
+        if x < acc:
+            return k
+    return "en"
+
+
+def language_rule(card: dict | None) -> str:
+    """Teacher-sheet section for a non-English chat ('' for English): comes after the shared core (prefix cache)."""
+    lang = lang_of(card)
+    if lang == "en":
+        return ""
+    style = ("short and casual, lowercase like a chat app" if lang in CASED else
+             "short and casual, the way people really type it in a chat app (lowercase does not apply to this script)")
+    return (f"\nLANGUAGE OF THIS CHAT: {LANG_NAMES[lang]}\n- the friend writes in {LANG_NAMES[lang]}; every reply of yours "
+            f"is in {LANG_NAMES[lang]} only, {style}. same character, same rules, same dim warmth; your identity lines "
+            "above are just written in English. messages from the coding agent stay in English: react to them in "
+            f"{LANG_NAMES[lang]}.\n")
 
 
 def sample_card(rng: random.Random, pool: list[dict] | None = None) -> dict:
-    """The card for one training chat: moth ~8% (with 0-2 lore traits), blank ~10%, else a pool card."""
+    """The card for one training chat (with its chat language, LANGS)."""
+    lang = sample_lang(random.Random(rng.random()))   # one draw from rng, so the card draws below stay independent
+    return {**_sample_card(rng, pool), "lang": lang}
+
+
+def _sample_card(rng: random.Random, pool: list[dict] | None = None) -> dict:
+    """moth ~8% (with 0-2 lore traits), blank ~10%, else a pool card."""
     if pool is None:
         if not _POOL:
             _POOL.extend(build_pool())

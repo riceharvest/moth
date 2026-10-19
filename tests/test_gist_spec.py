@@ -341,3 +341,49 @@ def test_merge_gen():
     assert sorted(x["seed"] for x in ds) == [10, 11, 20] and sorted(labs) == [10, 11, 20]
     assert any("overlap" in w for w in warn) and any("already merged" in w for w in warn)
     assert boxes[1]["on_gist"] == 0.75 and boxes[1]["self"] == 0.25
+
+
+# --- languages and leakage (2026-10-19 review) -------------------------------------------------------------------------
+def test_chat_languages():
+    rng = random.Random(0)
+    n = 6000
+    got = collections.Counter(cards.sample_card(rng)["lang"] for _ in range(n))
+    for k, p in cards.LANGS.items():
+        assert abs(got[k] / n - p) < 0.03, (k, got[k] / n)
+    c = {**cards.build_pool()[2], "lang": "zh"}
+    t = persona.teacher_system(c)
+    assert t.startswith(persona.TEACHER_CORE) and "LANGUAGE OF THIS CHAT: Chinese" in t
+    assert "lowercase does not apply" in cards.language_rule(c) and "lowercase like" in cards.language_rule({"lang": "es"})
+    assert "LANGUAGE OF THIS CHAT" not in persona.teacher_system({**c, "lang": "en"})
+    assert "Chinese" in gist.label_prompt("friend: 你好\n[R1] 你好呀", 1, c)
+    assert "Chinese" not in gist.label_prompt("friend: hi\n[R1] hi", 1, {**c, "lang": "en"})
+
+
+def test_sim_and_reminders_follow_the_language():
+    pytest.importorskip("openai")
+    from moth import gen_dialogs as G
+    c = {**cards.build_pool()[2], "lang": "hi"}
+    assert "Hindi" in G.sim_prompt("p", "s", 6, 1, [], "rain", c)
+    assert "Write in English." in G.sim_prompt("p", "s", 6, 1, [], "rain", {**c, "lang": "en"})
+    assert G.teacher_view("नमस्ते", card=c).endswith("(reply in Hindi (Devanagari script) only.)")
+    assert G.teacher_view("hi", card={**c, "lang": "en"}).endswith(G.TALK_REMIND)
+
+
+def test_heldout_cards_never_train():
+    assert all(cards.is_heldout(c) for c in cards.heldout_cards() + cards.heldout_cards(free=True))
+    assert not any(cards.is_heldout(c) for c in cards.build_pool())
+    pytest.importorskip("torch")
+    from moth import build_sft
+    with pytest.raises(SystemExit):
+        build_sft.refuse_eval_inputs(["results/bakeoff/rented/bk-2/bakeoff/qwen27/dialogs.jsonl"])
+    build_sft.refuse_eval_inputs(["results/g4/dialogs.jsonl"])
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "x.jsonl")
+        msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hi! what's up?", "tool_calls": []},
+                {"role": "user", "content": "nothing"}, {"role": "assistant", "content": "nothing is nice.", "tool_calls": []}]
+        with open(p, "w") as f:
+            for i, card in enumerate([cards.heldout_cards()[0], cards.build_pool()[0]]):
+                f.write(json.dumps({"seed": i, "type": "talk", "card": card, "messages": msgs}) + "\n")
+        why = collections.Counter()
+        items, _ = build_sft.filter_chats([p], why)
+    assert [it["seed"] for it in items] == [1] and why["heldout_card"] == 1
