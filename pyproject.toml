@@ -39,6 +39,7 @@ moth-pet = "moth.pet:main"
 [project.urls]
 Homepage = "https://huggingface.co/darioooooo0o/moth-112m"
 Documentation = "https://huggingface.co/darioooooo0o/moth-112m#readme"
+Source = "https://github.com/riceharvest/moth"
 
 [tool.hatch.version]
 path = "moth/VERSION"
