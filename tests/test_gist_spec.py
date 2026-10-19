@@ -390,7 +390,7 @@ def test_heldout_cards_never_train():
 
 
 # --- moth is held-out: never in training (2026-10-19) -----------------------------------------------------------------
-MOTH_LORE_RX = re.compile(r"\bmoths?\b|graphics card|1947|butterfl|first computer bug|grandma was", re.I)
+MOTH_LORE_RX = re.compile(r"\bmoths?\b|graphics card|\b1947\b|butterfl|first computer bug|grandma was", re.I)
 
 
 def test_moth_never_a_training_card():
