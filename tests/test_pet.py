@@ -2239,6 +2239,7 @@ class CardMenuTest(unittest.TestCase):
         url = f"http://127.0.0.1:{srv.server_address[1]}"
         with tempfile.TemporaryDirectory() as d:
             tf = os.path.join(d, "token")
+            from unittest import mock
             patch = mock.patch.dict(os.environ, {"MOTH_CONFIG_FILE": os.path.join(d, "config.json")})
             patch.start()
             self.addCleanup(patch.stop)
