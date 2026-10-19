@@ -63,14 +63,15 @@ def label_of(cwd, session) -> str:
     return name or (session or "")[:8]
 
 
-def http_post(url: str, data: bytes, headers: dict, timeout: float = 1.0) -> None:
-    """POST and wait for moth's answer (never via a proxy: moth is local). Plain http:// goes over a bare socket:
-    this runs on every agent turn, and importing urllib.request alone takes longer than the whole post."""
+def http_post(url: str, data: bytes, headers: dict, timeout: float = 1.0, method: str = "POST") -> bytes:
+    """POST (or `method`) and wait for moth's answer, returned as the body bytes (never via a proxy: moth is local).
+    Plain http:// goes over a bare socket: this runs on every agent turn, and importing urllib.request alone takes
+    longer than the whole post."""
     if not url.lower().startswith("http://"):   # https (a moth behind something): the standard client
         import urllib.request
-        req = urllib.request.Request(url, data=data, headers=headers)
-        urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout).close()
-        return
+        req = urllib.request.Request(url, data=data or None, headers=headers, method=method)
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout) as r:
+            return r.read()
     import socket
     import time
     netloc, _, path = url[7:].partition("/")
@@ -78,14 +79,18 @@ def http_post(url: str, data: bytes, headers: dict, timeout: float = 1.0) -> Non
     if any("\r" in str(v) or "\n" in str(v) for v in headers.values()):
         raise ValueError("bad header")   # a token with a line break in it: refused, as http.client does
     head = "".join(f"{k}: {v}\r\n" for k, v in {**headers, "Content-Length": len(data)}.items())
-    req = f"POST /{path} HTTP/1.1\r\nHost: {netloc}\r\n{head}Connection: close\r\n\r\n".encode("latin-1") + data
+    req = f"{method} /{path} HTTP/1.1\r\nHost: {netloc}\r\n{head}Connection: close\r\n\r\n".encode("latin-1") + data
+    got = []
     with socket.create_connection((host.strip("[]"), int(port)), timeout=timeout) as s:
         end = time.monotonic() + timeout   # as urllib: up to `timeout` to connect, then up to `timeout` for the answer
         s.sendall(req)
         while True:   # moth's answer, to the end (it has the turn before we go)
             s.settimeout(max(0.001, end - time.monotonic()))
-            if not s.recv(4096):
+            chunk = s.recv(4096)
+            if not chunk:
                 break
+            got.append(chunk)
+    return b"".join(got).partition(b"\r\n\r\n")[2]
 
 
 def post(text: str, session=None, label=None) -> None:

@@ -13,7 +13,7 @@ if [ "$DRY" != 1 ] && [ -z "$MODEL" ]; then
 fi
 OUT=${MOTH_RELEASE_OUT:-release/hf}   # override to try a build elsewhere
 TA_FILES="model generate chat checkpoint tools optim"
-MOTH_FILES="__init__ __main__ persona agent home serve shell cli tail eval probes metrics gen_dialogs build_sft sft add_hermes_pool _tools pet config weights launch hooks doctor autostart forget pairwise norepeat"
+MOTH_FILES="__init__ __main__ persona agent home serve shell cli tail eval probes metrics gen_dialogs build_sft sft add_hermes_pool _tools pet config weights launch hooks doctor autostart forget setup pairwise norepeat"
 
 # what goes where: "<source>\t<path in the repo>"
 files() {
@@ -26,6 +26,9 @@ files() {
   # tiny_agent ships from this project's copy (moth-specific changes, e.g. the low-mem CPU loader)
   for f in $TA_FILES; do printf '%s\t%s\n' "tiny_agent/$f.py" "code/tiny_agent/$f.py"; done
   for f in $MOTH_FILES; do printf '%s\t%s\n' "moth/$f.py" "code/moth/$f.py"; done
+  # the model backends (tiny-agent, transformers, openai) and moth.json's parser (moth/docs/MODEL_BACKENDS.md)
+  find moth/backends -type f -name '*.py' -not -path '*/__pycache__/*' | LC_ALL=C sort |
+    while IFS= read -r f; do printf '%s\t%s\n' "$f" "code/$f"; done
   printf '%s\t%s\n' moth/update.py code/moth/update.py moth/VERSION code/moth/VERSION   # python -m moth update / --version
   printf '%s\t%s\n' moth/file_pool.json code/moth/file_pool.json
   # the chat page and everything next to it (e.g. bundled fonts), so the page needs no network

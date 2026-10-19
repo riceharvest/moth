@@ -3,8 +3,10 @@
   moth doctor [--port 4747]
 
 Checks Python, torch (in a subprocess with a timeout, so a missing or broken torch can't take this down), the other
-packages, the weights and tokenizer, the token file, the port, the coding-agent hooks, PySide6 and the display for
-the pet, free RAM and disk, the show_in_harness setting and the version. No model is loaded; it takes a second or
+packages, the model (`moth config model`: backend, model, character; a privacy line when an openai endpoint
+isn't on this machine) and, for moth's own model, the weights and tokenizer, the token file, the port, the
+coding-agent hooks, PySide6 and the display for the pet, free RAM and disk, the show_in_harness setting and the
+version. No model is loaded; it takes a second or
 two (most of it torch's import). Exit 1 if any line is ✗.
 """
 from __future__ import annotations
@@ -172,6 +174,63 @@ def check_weights(r: Report) -> str | None:
     return folder
 
 
+def check_model(r: Report, spec: str | None = None, timeout: float = 2.0):
+    """The model behind moth (`moth config model`, moth/backends): backend, model, character. Returns its manifest when
+    it isn't this install's own moth (then the weights/tokenizer lines are skipped), else None. Never downloads; an
+    openai endpoint is asked GET /v1/models only when it is on this machine (doctor never contacts another host)."""
+    try:
+        from moth import backends, config
+        spec = config.model() if spec is None else spec
+    except Exception as e:  # noqa: BLE001
+        r.add("!", "model", f"couldn't read the model setting: {e}")
+        return None
+    if not spec:
+        r.add("✓", "model", f"moth's own (tiny-agent, character 'moth')  ({prog()} config model ... swaps it)")
+        return None
+    try:
+        m = backends.resolve(spec, network=False)
+    except Exception as e:  # noqa: BLE001  ManifestError, an unreadable folder
+        r.add("✗", "model", f"{spec}: {e}", f"fix its moth.json, or {prog()} config model default")
+        return None
+    for n in m.notes:
+        r.add("!", "model", f"moth.json: {n}")
+    what = m.describe()
+    if m.backend == "tiny-agent":
+        st = os.path.join(m.folder or "", "model.safetensors")
+        if m.folder and os.path.isfile(st) and safetensors_complete(st):
+            r.add("✓", "model", what)
+        elif m.repo:
+            r.add("!", "model", f"{what}: not downloaded yet; moth fetches it from {m.repo} on its next start",
+                  f"start moth once with a network connection ({prog()})")
+        else:
+            r.add("✗", "model", f"{what}: no complete model.safetensors in {m.folder}",
+                  f"{prog()} config model <a weights folder> (or default)")
+    elif m.backend == "transformers":
+        if importlib.util.find_spec("transformers") is None:
+            r.add("✗", "model", f"{what}: transformers isn't installed",
+                  'pip install "moth-companion[transformers]"   (or pip install transformers)')
+        else:
+            r.add("✓", "model", what)
+    else:
+        note = backends.privacy_note(m)
+        if note:   # never contacted from here
+            r.add("!", "model", what)
+            r.add("!", "privacy", note, f"run the server on this machine, or {prog()} config model default")
+        else:
+            from moth.backends.openai_compat import chat_url
+            models = chat_url(m.base_url)[:-len("/chat/completions")] + "/models"
+            try:
+                import urllib.request
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with opener.open(models, timeout=timeout) as resp:
+                    resp.read(1 << 16)
+                r.add("✓", "model", f"{what}  (answers at {models}; moth's text stays on this machine)")
+            except Exception as e:  # noqa: BLE001
+                r.add("!", "model", f"{what}: nothing answers at {models} yet ({type(e).__name__})",
+                      "start the server (llama-server / ollama serve / vllm serve) before moth")
+    return m
+
+
 def dev_alternative() -> str | None:
     """The dev checkout's newest complete weights, as try_moth.sh picks them."""
     from moth import weights
@@ -319,6 +378,31 @@ def check_display(r: Report, env=None, platform: str | None = None):
                               "work without)")
 
 
+def check_fullscreen(r: Report, env=None, platform: str | None = None, on: bool | None = None):
+    """Whether the pet can tell that another app is fullscreen (config hide_in_fullscreen; moth/pet.py probes)."""
+    env = os.environ if env is None else env
+    platform = platform or sys.platform
+    if on is None:
+        try:
+            from moth import config
+            on = config.hide_in_fullscreen()
+        except Exception:  # noqa: BLE001
+            on = True
+    if not on:
+        r.add("·", "fullscreen", f"off: the pet stays up over fullscreen apps  ({prog()} config hide_in_fullscreen on)")
+        return
+    wayland = env.get("WAYLAND_DISPLAY") or env.get("XDG_SESSION_TYPE") == "wayland"
+    if platform == "darwin" or platform.startswith("win"):
+        r.add("✓", "fullscreen", "the pet hides while another app is fullscreen on its screen")
+    elif wayland and env.get("DISPLAY"):
+        r.add("·", "fullscreen", "XWayland: the pet hides for fullscreen X11 apps (Wine / Proton games), not for "
+                                 "native-Wayland ones (can't be seen: it stays up)")
+    elif wayland:
+        r.add("·", "fullscreen", "native Wayland can't tell the pet what's fullscreen, so it never hides (fails open)")
+    elif env.get("DISPLAY"):
+        r.add("✓", "fullscreen", "X11: the pet hides while another app is fullscreen on its screen")
+
+
 def available_ram_gb() -> float | None:
     try:
         if sys.platform.startswith("linux"):
@@ -387,7 +471,7 @@ def check_setting(r: Report):
                  "default": "default"}[source]
         r.add("✓", "show_in_harness", f"{'on' if value else 'off'} ({where}): moth's replies "
                                       f"{'also show' if value else 'show only in the pet / moth tail, not'} inside "
-                                      f"Pi / OpenCode" + ("" if value else f"  ({prog()} config show_in_harness on)"))
+                                      f"Pi / OpenCode / Codex" + ("" if value else f"  ({prog()} config show_in_harness on)"))
     except Exception as e:
         r.add("✗", "show_in_harness", f"couldn't read the setting: {e}", f"{prog()} config")
 
@@ -406,14 +490,19 @@ def run(port: int = 4747, probe=probe_torch) -> Report:
     check_python(r)
     check_torch(r, probe)
     check_packages(r)
-    folder = check_weights(r)
-    check_tokenizer(r)
+    custom = check_model(r)
+    if custom is None:   # this install's own moth: its weights and tokenizer
+        folder = check_weights(r)
+        check_tokenizer(r)
+    else:
+        folder = custom.folder if custom.backend == "tiny-agent" else None
     check_token(r)
     check_port(r, port)
     running = any(name == "port" and m == "✓" for m, name, *_ in r.lines)
     check_hooks(r)
     check_pyside(r)
     check_display(r)
+    check_fullscreen(r)
     check_ram(r, running=running)
     check_disk(r, folder, bool(folder) and os.path.isfile(os.path.join(folder, "model.safetensors")))
     check_setting(r)

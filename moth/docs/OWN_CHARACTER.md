@@ -110,6 +110,25 @@ The probes (`moth/probes.py`), the judge prompt (`JUDGE` in `moth/eval.py`) and 
 (`moth/metrics.py`) are written for moth too. Rewrite them for your character. Read the transcripts as well as the
 scores: the judge misses things you'll spot in a minute.
 
+## 6. Ship it with a moth.json
+
+Put a `moth.json` next to `model.safetensors`, `config.json` and `tokenizer.json`. It holds:
+
+- the character's name, which the pet shows;
+- the short system prompt you trained with (your `SYSTEM_STUDENT`);
+- the agent-card format, if you changed `[the agent said]`;
+- your sampling defaults;
+- the HF repo id, if you upload it there.
+
+```json
+{"backend": "tiny-agent", "character": "pebble", "system": "you are pebble. ...", "repo": "you/pebble-112m"}
+```
+
+Then `moth config model runs/mine/ckpt_100` (or `moth config model you/pebble-112m` once it's on the Hub) runs your
+character behind the same pet and hooks, and `moth update` refreshes it from your repo. Every key is described in
+[`MODEL_BACKENDS.md`](MODEL_BACKENDS.md). The same file also lets moth run a model that wasn't made with this
+pipeline (transformers or a llama.cpp / Ollama server).
+
 ## Licenses
 
 Your training data carries the teacher's terms. Chats written by LFM2.5 fall under the LFM Open License (see

@@ -80,7 +80,7 @@ def opencode_dir() -> str:
 
 
 def dsh_dir() -> str:
-    return os.path.join(home(), ".dsh")
+    return os.environ.get("DSH_HOME") or os.path.join(home(), ".dsh")   # dsh's own $DSH_HOME, as the launcher reads it
 
 
 def config_dir(name: str) -> str:
@@ -128,9 +128,53 @@ def ps_call(cmd: str) -> str:
     return "& " + cmd if cmd.startswith('"') else cmd
 
 
+HOOK_RUN = "hook-run"   # the installers' app: `<moth-hook> hook-run <integrations/x.py>` (packaging/moth_hook.py)
+
+
+def appimage() -> str | None:
+    """$APPIMAGE when this is moth's own AppImage (the frozen executable runs from inside its mount, $APPDIR); None
+    otherwise. Every child of any AppImage inherits APPIMAGE (an editor shipped as one, and its terminal), so it alone
+    doesn't say this moth is one."""
+    image, appdir = os.environ.get("APPIMAGE"), os.environ.get("APPDIR")
+    if not (getattr(sys, "frozen", False) and image and appdir):
+        return None
+    exe, root = os.path.realpath(sys.executable), os.path.realpath(appdir)
+    return image if exe.startswith(root.rstrip(os.sep) + os.sep) else None
+
+
+def frozen_exe() -> str | None:
+    """The installers' bundled executable a hook runs instead of a Python (PyInstaller sets sys.frozen); None for a
+    Python install. moth-hook(.exe) next to the app's executable: a small stdlib-only runner that starts in a fraction
+    of the big executable's time (a hook runs on every agent turn), console on Windows (PowerShell, Codex's hook shell,
+    doesn't wait for a windowed exe). AppImage: the .AppImage file ($APPIMAGE), whose AppRun hands `hook-run` to
+    moth-hook, not its mount under /tmp/.mount_*, which moves on every launch."""
+    if not getattr(sys, "frozen", False):
+        return None
+    if appimage():
+        return appimage()
+    exe = sys.executable
+    runner = os.path.join(os.path.dirname(exe), "moth-hook.exe" if _WIN else "moth-hook")
+    return runner if os.path.isfile(runner) else exe
+
+
+def hook_script(name: str) -> str:
+    """The integrations/<name> path a hook command names: this install's file; in an AppImage the bare relative
+    integrations/<name> (the bundled copy, wherever the AppImage is mounted this time)."""
+    if appimage():
+        return "integrations/" + name
+    return script(name)
+
+
+def hook_argv(name: str, py: str | None = None) -> list[str]:
+    """What a hook runs for integrations/<name>: [python, script], or [moth executable, hook-run, script] in the
+    installers' app (py given: that Python, always)."""
+    exe = None if py else frozen_exe()
+    return [exe, HOOK_RUN, hook_script(name)] if exe else [py or sys.executable, script(name)]
+
+
 def harness_command(name: str, py: str | None = None) -> str:
     """The hook command for integrations/<name> as `moth hook` writes it, per harness: Codex's gets ps_call on Windows."""
-    cmd = hook_command(py or sys.executable, script(name))
+    cmd = hook_command(*hook_argv(name, py))
     return ps_call(cmd) if _WIN and name == "codex.py" else cmd
 
 
@@ -340,6 +384,8 @@ def _where(p: str, name: str) -> str:
     """'this' (this install's script), 'other' (another moth that exists) or 'missing'."""
     if os.path.realpath(os.path.expanduser(p)) == os.path.realpath(script(name)):
         return "this"
+    if p.replace("\\", "/") == "integrations/" + name and hook_script(name) == "integrations/" + name:
+        return "this"   # an AppImage's hook (hook_script): its bundled copy
     return "other" if os.path.isfile(os.path.expanduser(p)) else "missing"
 
 
@@ -578,10 +624,15 @@ def file_is_moth(path: str, name: str) -> bool:
         return False
 
 
-# --- dsh: one line in a YAML list (cordis.patch.yml), as text --------------------------------------------------
-DSH_LINE = re.compile(r"^[ \t]*-[ \t]*insert:[ \t]*\[[ \t]*\{[ \t]*id:[ \t]*['\"]?moth['\"]?[ \t]*,[ \t]*name:[ \t]*"
-                      r"(?P<name>'(?:[^']|'')*'|\"(?:[^\"\\]|\\.)*\"|[^}\s]+)[ \t]*\}[ \t]*\][ \t]*(?:#[^\n]*)?\n?",
-                      re.M)
+# --- dsh: one entry in a YAML list (cordis.patch.yml), as text ------------------------------------------------
+# A block list gets a `- insert: [...]` line (DSH_LINE). A flow list (`[]`, which a fresh profile's file holds under its
+# comments, or `[a, b]`) can't take a block line after it, so an empty one is replaced by that line and a non-empty
+# one gets `{ insert: [...] }` as its last item (DSH_FLOW, removed with its comma on unhook).
+_DSH_NAME = r"(?P<name>'(?:[^']|'')*'|\"(?:[^\"\\]|\\.)*\"|[^}\s]+)"
+_DSH_ENTRY = (r"insert:[ \t]*\[[ \t]*\{[ \t]*id:[ \t]*['\"]?moth['\"]?[ \t]*,[ \t]*name:[ \t]*" + _DSH_NAME +
+              r"[ \t]*\}[ \t]*\]")
+DSH_LINE = re.compile(r"^[ \t]*-[ \t]*" + _DSH_ENTRY + r"[ \t]*(?:#[^\n]*)?\n?", re.M)
+DSH_FLOW = re.compile(r"(?P<lead>,\s*)?\{\s*" + _DSH_ENTRY + r"\s*\}(?P<trail>\s*,)?")
 
 
 def dsh_profiles() -> list[str]:
@@ -594,7 +645,60 @@ def dsh_patch(profile: str) -> str:
 
 
 def dsh_line() -> str:
-    return "- insert: [{ id: moth, name: '" + script(os.path.join("dsh", "moth.mjs")).replace("'", "''") + "' }]\n"
+    return "- " + _dsh_entry() + "\n"
+
+
+def _dsh_entry() -> str:
+    return "insert: [{ id: moth, name: '" + script(os.path.join("dsh", "moth.mjs")).replace("'", "''") + "' }]"
+
+
+def dsh_entries(text: str) -> list[re.Match]:
+    """moth's entries in a cordis.patch.yml: block lines and flow items (a flow item is never inside a block line)."""
+    return sorted([*DSH_LINE.finditer(text), *DSH_FLOW.finditer(text)], key=lambda m: m.start())
+
+
+def _dsh_content(text: str) -> list[tuple[int, int, str]]:
+    """(start, end, text without a trailing comment) of every line that isn't blank or a comment."""
+    out, pos = [], 0
+    for line in text.splitlines(keepends=True):
+        body = re.sub(r"(^|[ \t])#.*$", "", line.rstrip("\r\n")).strip()   # YAML: `#` after a space starts a comment
+        if body:
+            out.append((pos, pos + len(line.rstrip("\r\n")), body))
+        pos += len(line)
+    return out
+
+
+def dsh_add(text: str | None) -> str:
+    """The patch file with moth's entry added, whatever list form it holds."""
+    body = text or ""
+    lines = _dsh_content(body)
+    if lines and lines[0][2].startswith("["):   # a flow list
+        joined = "".join(b for _, _, b in lines)
+        if re.fullmatch(r"\[\s*\]", joined):   # empty: the block line takes its place (comments around it stay)
+            start, end = body.index("[", lines[0][0]), body.rindex("]", 0, lines[-1][1]) + 1
+            return body[:start] + dsh_line().rstrip("\n") + body[end:] + ("" if body[end:] else "\n")
+        start, end, last = lines[-1]   # non-empty: a last item before its closing bracket
+        close = body.rindex("]", start, end + 1)
+        before = body[:close].rstrip()
+        sep = "" if before.endswith("[") else " " if before.endswith(",") else ", "
+        return (before + sep + "{ " + _dsh_entry() + " }" + body[len(before):close] + body[close:] +
+                ("" if body.endswith("\n") else "\n"))
+    if body and not body.endswith("\n"):
+        body += "\n"
+    return body + dsh_line()
+
+
+def dsh_remove(text: str) -> str:
+    """The patch file without moth's entries; a flow item takes one comma with it."""
+    new = text
+    for m in reversed(dsh_entries(text)):
+        if m.re is DSH_FLOW:   # an item between two others keeps one comma
+            new = new[:m.start()] + ("," if m.group("lead") and m.group("trail") else "") + new[m.end():]
+        else:
+            new = new[:m.start()] + new[m.end():]
+    if not _dsh_content(new):   # dsh refuses a patch file that isn't a list: an empty one, comments only included
+        new += ("\n" if new and not new.endswith("\n") else "") + "[]\n"
+    return new
 
 
 def _dsh_name(m: re.Match) -> str:
@@ -669,7 +773,7 @@ def status(name: str, project: str | None = None) -> dict:
     elif name == "dsh":
         found_in = []
         for p in dsh_profiles():
-            for m in DSH_LINE.finditer(_read(dsh_patch(p)) or ""):
+            for m in dsh_entries(_read(dsh_patch(p)) or ""):
                 found_in.append((p, _dsh_name(m)))
         if not found_in:
             st["state"], st["detail"] = "absent", "no moth entry in any ~/.dsh profile"
@@ -750,7 +854,7 @@ def plan_hook(name: str, project: str | None = None, profile: str | None = None,
                               f"one notify slot, so moth won't replace it. Use the hooks.json variant (without "
                               f"--legacy-notify) instead")
             else:
-                want = f"notify = {json.dumps([sys.executable, script('codex.py')], ensure_ascii=False)}\n"
+                want = f"notify = {json.dumps(hook_argv('codex.py'), ensure_ascii=False)}\n"
                 if m:   # moth's notify from another install: point it here
                     new = text[:m.start()] + want + text[m.end():]
                     desc = f"update moth's legacy notify in {short(codex_config())}"
@@ -764,7 +868,7 @@ def plan_hook(name: str, project: str | None = None, profile: str | None = None,
                             f"variants (to switch to hooks.json: `{prog()} unhook codex`, then `{prog()} hook codex`)")
             if _where(legacy, "codex.py") != "this":
                 plan.nothing = None
-                want = f"notify = {json.dumps([sys.executable, script('codex.py')], ensure_ascii=False)}\n"
+                want = f"notify = {json.dumps(hook_argv('codex.py'), ensure_ascii=False)}\n"
                 plan.actions.append(Action("write", f"update moth's legacy notify in {short(codex_config())}",
                                            codex_config(), text[:m.start()] + want + text[m.end():]))
         else:
@@ -823,23 +927,22 @@ def plan_hook(name: str, project: str | None = None, profile: str | None = None,
         path = dsh_patch(profile)
         text = _read(path)
         want = dsh_line()
-        ms = list(DSH_LINE.finditer(text or ""))
+        ms = dsh_entries(text or "")
         mjs = os.path.join("dsh", "moth.mjs")
         if any(_where(_dsh_name(m), mjs) == "this" for m in ms):
             plan.nothing = f"already installed ({short(path)})"
         elif ms:
             new = text
             for m in reversed(ms):
-                new = new[:m.start()] + want + new[m.end():]
+                if m.re is DSH_FLOW:
+                    new = new[:m.start()] + (m.group("lead") or "") + "{ " + _dsh_entry() + " }" + \
+                        (m.group("trail") or "") + new[m.end():]
+                else:
+                    new = new[:m.start()] + want + new[m.end():]
             plan.actions.append(Action("write", f"update moth's entry in {short(path)} to {script(mjs)}", path, new))
         else:
-            body = text or ""
-            if body.strip() in ("", "[]"):
-                body = ""
-            elif not body.endswith("\n"):
-                body += "\n"
             plan.actions.append(Action("write", f"{'add moth to' if text is not None else 'create'} {short(path)}: "
-                                                f"{want.strip()}", path, body + want))
+                                                f"{want.strip()}", path, dsh_add(text)))
     return plan
 
 
@@ -884,12 +987,8 @@ def plan_unhook(name: str, project: str | None = None, profile: str | None = Non
         for p in ([profile] if profile else dsh_profiles()):
             path = dsh_patch(p)
             text = _read(path)
-            ms = list(DSH_LINE.finditer(text or ""))
-            if ms:
-                new = text
-                for m in reversed(ms):
-                    new = new[:m.start()] + new[m.end():]
-                plan.actions.append(Action("write", f"remove moth's entry from {short(path)}", path, new))
+            if dsh_entries(text or ""):
+                plan.actions.append(Action("write", f"remove moth's entry from {short(path)}", path, dsh_remove(text)))
     if not plan.actions and not plan.error and not plan.notes:
         plan.nothing = "not installed, nothing to remove"
     return plan

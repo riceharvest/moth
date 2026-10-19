@@ -315,6 +315,42 @@ class PollTest(unittest.TestCase):
                        {"you": "hi"}, {"say": "hello you"}, {"tool": "bash", "args": {}, "result": "x"})
         self.assertEqual(p.poll()[0], [("ooh", "claude · moth-repo"), ("hello you", None)])
 
+    def test_lines_carry_source_label_reply_and_index(self):
+        """What the pet's filters and "what did i miss" need: the harness a reaction answered (the say's own re tag
+        beats the card before it: a batch's last card can be another session's), its project, and replies to you."""
+        p = P.Poller(self.url, self.tok)
+        p.poll()
+        start = p.cursor
+        self.m.log.add({"agent": "b", "source": "codex", "label": "api"}, {"say": "ooh", "re": {"source": "codex"}},
+                       {"you": "hi"}, {"say": "hello you"},
+                       {"agent": "c", "source": "claude-code", "label": "moth-repo"},
+                       {"say": "a batch", "re": {"source": "hermes", "session": "s1"}})
+        got = p.poll()[0]
+        self.assertEqual(got, [("ooh", "codex · api"), ("hello you", None), ("a batch", "hermes")])
+        self.assertEqual([(x.source, x.label, x.reply) for x in got],
+                         [("codex", "api", False), (None, None, True), ("hermes", None, False)])
+        self.assertEqual([x.index for x in got], [start + 1, start + 3, start + 5])
+        # /api/says (no token): text only, nothing to filter on, and never a "reply"
+        q = P.Poller(self.url, os.path.join(self.tmp, "missing"))
+        q.poll()
+        self.m.log.add({"agent": "d", "source": "pi"}, {"say": "plain"})
+        (line,), _ = q.poll()
+        self.assertEqual((line.source, line.label, line.reply), (None, None, False))
+
+    def test_history_is_what_the_log_held_at_start(self):
+        self.m.log.add({"agent": "x", "source": "pi", "label": "web"}, {"say": "earlier one"},
+                       {"you": "q"}, {"say": "an answer, not a reaction"})
+        p = P.Poller(self.url, self.tok)
+        self.assertEqual(p.history(), [])   # not polled yet
+        p.poll()
+        self.m.log.add({"say": "after the start"})
+        h = p.history()
+        self.assertEqual([x.text for x in h], ["old line from before the pet", "earlier one"])
+        self.assertEqual((h[1].source, h[1].label), ("pi", "web"))
+        self.assertEqual(p.history(keep=1)[0].text, "earlier one")
+        self.assertEqual(p.poll()[0], [("after the start", None)])   # the cursor and card state are untouched
+        self.assertEqual(P.Poller(closed_url(), self.tok).history(), [])
+
     def test_wrong_token_falls_back_to_says(self):
         with open(self.tok, "w") as f:
             f.write("nope")
@@ -1130,7 +1166,8 @@ class QtTest(unittest.TestCase):
                     self.end_headers()
                     self.wfile.write(b)
                     return
-                evs = lines.pop(0) if lines else []
+                # the pet's one "what did i miss" history request (since=0) mustn't eat a scripted answer
+                evs = [] if "since=0" in self.path else (lines.pop(0) if lines else [])
                 b = json.dumps({"events": evs, "next": 10 + len(evs), "epoch": "e"}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -1335,6 +1372,11 @@ class SkinLogicTest(unittest.TestCase):
             return mock.patch.object(P.subprocess, "run", return_value=subprocess.CompletedProcess([], rc, out, err))
         with fake(10, "newer code: moth 0.3.0 -> 0.4.0:  pip install -U moth-companion"):
             self.assertEqual(P.check_for_update(), ("update", P.PIP_HINT))
+        from moth.backends import compat
+        with fake(10, "newer code: moth 0.3.0 -> 0.4.0:  install the newest moth from ..."), \
+                mock.patch.object(sys, "frozen", True, create=True):   # the installers' app: a new installer
+            self.assertEqual(P.check_for_update(), ("update", compat.RELEASES))
+        self.assertEqual(P.update_line(compat.RELEASES), f"there's a new me! get it at {compat.RELEASES}")
         with fake(10, "update available: moth 0.3.0 -> 0.4.0"), mock.patch.object(L.weights, "mode",
                                                                                  return_value="hub"):
             self.assertEqual(P.check_for_update(), ("update", "python -m moth update"))
@@ -1661,8 +1703,9 @@ class PetSkinTrayUpdateTest(unittest.TestCase):
         if not QSystemTrayIcon.isSystemTrayAvailable():
             self.assertIsNone(seen["tray"])   # no tray offscreen: skipped silently
         self.assertEqual([t for t in seen["items"] if t],
-                         ["open chat page", "mute bubbles", "sleep", "show moth in harnesses", "skin",
-                          "check for updates", "quit"])
+                         ["open chat page", "what did i miss", "mute bubbles", "mute harnesses", "quiet hours",
+                          "sleep", "show moth in harnesses", "skin", "stay on this screen", "check for updates",
+                          "quit"])
         self.assertEqual(seen["skins"], [("moth", False), ("Another One (other)", False), ("Testpet", True)])
         self.assertIs(seen["harness"], True)
         self.assertEqual(seen["muted"], (True, True))
@@ -1763,6 +1806,404 @@ class PetSkinTrayUpdateTest(unittest.TestCase):
                 chk.assert_not_called()
                 self.assertFalse(seen["running"])
                 self.assertNotIn("last_update_check", self.read_cfg())
+
+
+# --- quality of life: fullscreen, done-signal, missed list, mutes, quiet hours, screens -----------------------------
+class QolLogicTest(unittest.TestCase):
+    """The stdlib parts: quiet-hours parsing, the missed list, mute filtering, screen picking, fullscreen decisions
+    from (mocked) window-system snapshots, and the done-hop's animation."""
+
+    def test_quiet_hours(self):
+        from moth import config as C
+        self.assertEqual(C.quiet_span("23:00-08:00"), (23 * 60, 8 * 60))
+        self.assertEqual(C.quiet_span(" 9:05 - 17:30 "), (9 * 60 + 5, 17 * 60 + 30))
+        for bad in ("off", "", "23:00", "24:00-08:00", "23:60-08:00", "10:00-10:00", "a:b-c:d", "1:2:3-4:5", None, 7):
+            self.assertIsNone(C.quiet_span(bad), bad)
+        self.assertEqual(C.parse_quiet("23:00-8:00"), "23:00-08:00")
+        self.assertEqual(C.parse_quiet("OFF"), "off")
+        self.assertIsNone(C.parse_quiet("whenever"))
+        night = "23:00-08:00"   # over midnight: 23:00 up to, not including, 08:00
+        for minute, want in ((22 * 60 + 59, False), (23 * 60, True), (0, True), (3 * 60, True), (7 * 60 + 59, True),
+                             (8 * 60, False), (12 * 60, False)):
+            self.assertEqual(P.in_quiet(night, minute), want, minute)
+        day = "09:00-17:30"
+        self.assertEqual([P.in_quiet(day, m) for m in (8 * 60 + 59, 9 * 60, 17 * 60 + 29, 17 * 60 + 30)],
+                         [False, True, True, False])
+        self.assertFalse(P.in_quiet("off", 0))
+        self.assertFalse(P.in_quiet("nonsense", 0))
+        self.assertIsInstance(P.in_quiet(night), bool)   # now, local time
+
+    def test_new_config_keys(self):
+        from unittest import mock
+
+        from moth import config as C
+        tmp = tempfile.mkdtemp()
+        with mock.patch.dict(os.environ, {"MOTH_CONFIG_FILE": os.path.join(tmp, "c.json")}):
+            self.assertEqual([C.lookup(k)[0] for k in C.PET_LIVE], [True, False, [], "any", "off"])
+            C.muted_sources().append("x")   # a copy: the default stays empty
+            self.assertEqual(C.muted_sources(), [])
+            self.assertEqual(C.parse_sources("Codex, pi,codex"), ["codex", "pi"])
+            self.assertEqual(C.parse_sources("none"), [])
+            self.assertIsNone(C.parse_sources("codex,nope"))
+            for argv, rc in ((["muted_sources", "pi,dsh"], 0), (["muted_sources", "bogus"], 2),
+                             (["quiet_hours", "22:30-6:00"], 0), (["quiet_hours", "late"], 2),
+                             (["pet_screen", "HDMI-1"], 0), (["chirp", "on"], 0), (["hide_in_fullscreen", "nah"], 2)):
+                with mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+                    self.assertEqual(C.main(argv), rc, argv)
+            self.assertEqual((C.muted_sources(), C.quiet_hours(), C.pet_screen(), C.chirp(), C.hide_in_fullscreen()),
+                             (["dsh", "pi"], "22:30-06:00", "HDMI-1", True, True))
+            with mock.patch("sys.stdout"):
+                C.main(["pet_screen", "any"])
+            self.assertEqual(C.pet_screen(), "any")
+            text = C.describe()
+            self.assertIn("muted_sources = dsh,pi", text)
+            self.assertIn("quiet_hours = 22:30-06:00", text)
+
+    def test_mute_filter(self):
+        self.assertTrue(P.source_muted("codex", ["codex", "pi"]))
+        self.assertFalse(P.source_muted("hermes", ["codex"]))
+        self.assertFalse(P.source_muted(None, ["codex"]))   # unknown source (no token): never muted
+        self.assertFalse(P.source_muted("codex", None))
+
+    def test_missed_list(self):
+        clock = Clock()
+        clock.t = 10_000.0
+        m = P.Missed(keep=3, clock=clock)
+        self.assertEqual(m.rows(), [])
+        m.add("one", "codex", "api")
+        clock.t += 60
+        m.add("two", "claude-code", "moth-repo", why="hidden")
+        clock.t += 120
+        m.add("three", None, None, why="muted")
+        m.add("four", "hermes", None, why="asleep")
+        clock.t += 240
+        self.assertEqual(m.rows(), [("hermes · 4 min ago", "four", "while asleep"),
+                                    ("4 min ago", "three", "while muted"),
+                                    ("claude · moth-repo · 6 min ago", "two", "while hidden")])   # "one" fell off
+        m.seed([P.Line("from the log", None, "pi", "web")])
+        self.assertEqual([r[1] for r in m.rows()], ["four", "three", "two"])   # full: the history doesn't fit
+        m2 = P.Missed(clock=clock)
+        m2.add("new")
+        m2.seed([P.Line("old a", None, "pi", "web"), P.Line("old b")])
+        self.assertEqual([r[:2] for r in m2.rows()], [("just now", "new"), ("earlier", "old b"),
+                                                       ("pi · web · earlier", "old a")])
+        self.assertEqual([P.ago(s) for s in (None, 0, 44, 50, 61, 3599, 3600, 7300, 90000, -5)],
+                         ["earlier", "just now", "just now", "1 min ago", "1 min ago", "60 min ago", "1 h ago",
+                          "2 h ago", "1 d ago", "just now"])
+
+    def test_pick_bounds_and_staying_on_a_screen(self):
+        A, B = (0, 0, 1920, 1040), (1920, 0, 1280, 984)   # side by side, B shorter: a gap under it
+        screens = [("A", A), ("B", B)]
+        self.assertEqual(P.pick_bounds("B", screens, 100, 100), (B, "B"))        # pinned
+        self.assertEqual(P.pick_bounds("gone", screens, 100, 100), (A, "A"))     # unplugged: where it is
+        self.assertEqual(P.pick_bounds("any", screens, 2000, 50), (B, "B"))
+        self.assertEqual(P.pick_bounds(None, screens, 2500, 1010), (B, "B"))     # in the gap: nearest, not primary
+        self.assertEqual(P.pick_bounds(None, [], 0, 0), (None, None))
+        w = P.Wander(A, size=56, rng=random.Random(4))
+        w.move_to(B, 0.0)
+        self.assertEqual(w.state, P.REST)
+        self.assertTrue(B[0] <= w.x < B[0] + B[2] and B[1] <= w.y < B[1] + B[3])
+        w.cursor_seen = -1e9
+        t = 0.0
+        for _ in range(int(120 * 30)):   # two minutes of flight with a cursor on screen A pulling at it
+            t += 1 / 30
+            w.step(1 / 30, t, cursor=(300, 300) if int(t) % 3 else (310, 300), bounds=B)
+            self.assertTrue(B[0] <= w.x <= B[0] + B[2] and B[1] <= w.y <= B[1] + B[3], (t, w.x, w.y))
+
+    def test_fullscreen_decision(self):
+        on = {"rect": (0, 0, 1920, 1080), "states": {"fullscreen"}, "types": {"normal"}, "managed": True,
+              "pt": (1800, 1000), "screen": (1920, 1080)}
+        self.assertTrue(P.fullscreen_on(on))
+        self.assertFalse(P.fullscreen_on({**on, "pt": (2500, 500)}))       # fullscreen on the other screen
+        self.assertFalse(P.fullscreen_on({**on, "types": {"desktop"}}))     # the desktop window is screen-sized
+        self.assertFalse(P.fullscreen_on({**on, "types": {"dock"}}))
+        self.assertFalse(P.fullscreen_on(None))
+        self.assertFalse(P.fullscreen_on({}))
+        self.assertFalse(P.fullscreen_on({**on, "pt": None}))
+        plain = {**on, "states": set()}
+        self.assertTrue(P.fullscreen_on(plain))                              # borderless, covers the screen
+        self.assertFalse(P.fullscreen_on({**plain, "managed": False}))       # XWayland placeholder / not an app
+        self.assertFalse(P.fullscreen_on({**plain, "states": {"maximized_vert", "maximized_horz"}}))
+        self.assertFalse(P.fullscreen_on({**plain, "rect": (0, 30, 1920, 1050)}))   # a big window, not the screen
+        self.assertFalse(P.fullscreen_on({**on, "rect": (10, 10, 800, 600), "pt": (1800, 1000)}))
+        # HiDPI: the same window in device pixels, the pet's point and screen scaled to match
+        self.assertTrue(P.fullscreen_on({"rect": (0, 0, 3840, 2160), "states": set(), "managed": True,
+                                         "pt": (3600, 2000), "screen": (3840, 2160)}))
+
+    def test_probe_choice(self):
+        self.assertIsNone(P.make_probe("offscreen"))
+        self.assertIsNone(P.make_probe("wayland"))   # native Wayland: can't ask, never hides
+        from unittest import mock
+        with mock.patch.object(P, "X11Probe", side_effect=OSError("no display")):
+            self.assertIsNone(P.make_probe("xcb"))   # a broken X: fails open too
+
+    def test_doctor_says_where_fullscreen_hiding_works(self):
+        from moth import doctor as D
+        r = D.Report()
+        for env, plat, on in (({"DISPLAY": ":0"}, "linux", True), ({"WAYLAND_DISPLAY": "w", "DISPLAY": ":0"}, "linux", True),
+                              ({"WAYLAND_DISPLAY": "w"}, "linux", True), ({}, "win32", True), ({}, "darwin", True),
+                              ({"DISPLAY": ":0"}, "linux", False)):
+            D.check_fullscreen(r, env, plat, on)
+        self.assertEqual([m for m, *_ in r.lines], ["✓", "·", "·", "✓", "✓", "·"])
+        self.assertIn("never hides", r.lines[2][2])
+        self.assertIn("not for native-Wayland", r.lines[1][2])
+        self.assertIn("hide_in_fullscreen on", r.lines[5][2])
+
+    def test_done_hop(self):
+        self.assertIsNone(P.hop(-0.01))
+        self.assertIsNone(P.hop(P.HOP_S))
+        self.assertEqual(P.hop(0.0), (0.0, P.OPEN))
+        lifts = [P.hop(i / 100)[0] for i in range(int(P.HOP_S * 100))]
+        first, second = max(lifts[:50]), max(lifts[50:])
+        self.assertAlmostEqual(first, 0.34, places=2)
+        self.assertTrue(0.08 < second < first, (first, second))   # a big hop, then a small bounce
+        self.assertLess(lifts[50], 0.01)                           # touches down in between
+        air = {P.hop(i / 100)[1] for i in range(5, 45)}
+        self.assertGreaterEqual(len(air), 3)                       # the wings flutter in the air
+        self.assertTrue(air <= set(P.FLAP))
+        self.assertLess(first + 0.035 + P.ART_ASPECT / 2, 1.75 / 2)   # stays inside the 1.75-size window
+
+    def test_chirp_never_raises(self):
+        from unittest import mock
+        self.assertTrue(os.path.isfile(P.CHIRP_WAV))
+        import wave
+        with wave.open(P.CHIRP_WAV) as wv:
+            self.assertLess(wv.getnframes() / wv.getframerate(), 1.0)   # a short chirp
+        c = P.Chirp(os.path.join(tempfile.mkdtemp(), "missing.wav"))
+        self.assertFalse(c.play())
+        c = P.Chirp()
+        c.how = ""   # no player found
+        self.assertFalse(c.play())
+        c.how = "/bin/true"
+        with mock.patch.object(P.subprocess, "Popen") as po:
+            po.return_value.poll.return_value = None   # still playing
+            self.assertTrue(c.play())
+            self.assertFalse(c.play())                 # no pile-up
+        self.assertEqual(po.call_count, 1)
+        self.assertEqual(po.call_args[0][0], ["/bin/true", P.CHIRP_WAV])
+        c.how, c.proc = "/usr/bin/aplay", None
+        with mock.patch.object(P.subprocess, "Popen", side_effect=OSError("gone")):
+            self.assertFalse(c.play())
+
+
+class FakeProbe:
+    """A window system whose active window is fullscreen (over the pet's point) or not; counts its snapshots."""
+
+    def __init__(self):
+        self.full, self.calls = False, 0
+
+    def snapshot(self, ctx):
+        self.calls += 1
+        if not self.full:
+            return None
+        x, y = ctx["pt"]
+        return {"rect": (x - 50, y - 50, 100, 100), "states": {"fullscreen"}, "types": set(), "managed": True,
+                "pt": ctx["pt"], "screen": ctx["screen"]}
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 not installed")
+class PetQolTest(unittest.TestCase):
+    """The real windows (offscreen): the done-signal, mutes, quiet hours, fullscreen hiding, the missed popup and the
+    new menu entries."""
+
+    setUp = PetSkinTrayUpdateTest.setUp
+    tearDown = PetSkinTrayUpdateTest.tearDown
+    write_cfg = PetSkinTrayUpdateTest.write_cfg
+    read_cfg = PetSkinTrayUpdateTest.read_cfg
+    run_pet = PetSkinTrayUpdateTest.run_pet
+
+    @staticmethod
+    def line(text, source="claude-code", label="moth-repo", reply=False):
+        return P.Line(text, P.caption_for({"source": source, "label": label}) if source else None, source, label,
+                      reply)
+
+    def test_done_signal_mutes_quiet_and_fullscreen(self):
+        from unittest import mock
+        chirps = []
+
+        def script(pet, seen):
+            yield
+            pet.chirper.play = lambda: chirps.append(1) or True
+            w = pet.w
+            w.wander, w.state, w.idle_since = False, P.REST, time.monotonic()
+            pet.bubbles.clear()
+            # 1. a reaction: bubble, hop (wings fluttering, lifted, 30 fps), no chirp (off by default)
+            pet.events.put(("lines", [self.line("fixed it!")]))
+            pet._tick()
+            seen["bubble"] = [b.lines for b in [pet.bubbles.now_showing] + pet.bubbles.waiting if b]
+            t0 = time.monotonic()
+            frames, dys = set(), []
+            while time.monotonic() - t0 < 0.45:
+                pet._tick()
+                frames.add(pet.win.pose.frame)
+                dys.append(pet.win.dy)
+                yield
+            seen["hop"] = (len(frames), min(dys), pet.timer.interval())
+            while time.monotonic() - pet.hop_at < P.HOP_S + 0.05:
+                yield
+            pet._tick()
+            seen["after_hop"] = (pet.hop_dy, pet.timer.interval() != int(1000 / 30) or w.flying())
+            seen["chirps_off"] = len(chirps)
+            # 2. chirp on, and a muted harness: no bubble, no hop, no chirp, still in the list
+            pet.save_setting("chirp", True)
+            pet.save_setting("muted_sources", ["codex"])
+            pet.bubbles.clear()
+            hop_at = pet.hop_at
+            pet.events.put(("lines", [self.line("codex did it", "codex", "api")]))
+            pet._tick()
+            seen["muted_src"] = (pet.bubbles.now_showing, pet.hop_at == hop_at, len(chirps))
+            pet.events.put(("lines", [self.line("claude again")]))
+            pet._tick()
+            seen["chirp_on"] = len(chirps)
+            # 3. quiet hours: dozes, no bubble, no chirp; your own chat still answered; ends: wakes
+            pet.bubbles.clear()
+            pet.set_quiet(True, time.monotonic())
+            seen["quiet_asleep"] = w.asleep
+            pet.events.put(("lines", [self.line("night owl"), self.line("re: you", None, None, reply=True)]))
+            pet._tick()
+            seen["quiet"] = ([b.lines for b in [pet.bubbles.now_showing] + pet.bubbles.waiting if b], len(chirps))
+            pet.set_quiet(False, time.monotonic())
+            seen["quiet_over"] = w.asleep
+            pet.menu_sleep = True                      # quiet hours ending never wakes a menu-slept moth
+            pet.set_quiet(True, time.monotonic())
+            pet.set_quiet(False, time.monotonic())
+            seen["menu_sleep_kept"] = w.asleep
+            pet.menu_sleep = False
+            pet.apply_sleep(time.monotonic())
+            # 4. fullscreen: hidden, slow ticks, no bubbles; asked once per FS_EVERY; back when it ends
+            pet.bubbles.clear()
+            fake = pet.probe = FakeProbe()
+            fake.full, pet.next_fs = True, 0.0
+            pet._tick()
+            seen["hidden"] = (pet.hidden, pet.win.isVisible(), pet.timer.interval())
+            for _ in range(5):
+                pet._tick()
+            seen["probe_calls"] = fake.calls
+            pet.events.put(("lines", [self.line("while you game")]))
+            pet._tick()
+            seen["hidden_bubble"] = pet.bubbles.now_showing
+            pet.say("zzz… (moth server asleep)")          # not saved up for later either
+            seen["hidden_queue"] = len(pet.bubbles.waiting)
+            fake.full, pet.next_fs = False, 0.0
+            pet._tick()
+            seen["back"] = (pet.hidden, pet.win.isVisible())
+            pet.save_setting("hide_in_fullscreen", False)   # off: never hides
+            fake.full, pet.next_fs = True, 0.0
+            pet._tick()
+            seen["off"] = pet.hidden
+            seen["rows"] = pet.missed.rows()
+            seen["complained"] = pet.complained
+        with mock.patch.object(P, "make_probe", return_value=None):
+            seen = self.run_pet(script, timeout=15)
+        self.assertEqual(seen["bubble"], [["fixed it!"]])
+        n, lowest, iv = seen["hop"]
+        self.assertGreaterEqual(n, 3)                       # wing frames change through the hop
+        self.assertLess(lowest, -0.2 * 64)                  # lifted (size 64)
+        self.assertEqual(iv, int(1000 / 30))
+        self.assertEqual(seen["after_hop"][0], 0.0)
+        self.assertEqual(seen["chirps_off"], 0)
+        self.assertEqual(seen["muted_src"], (None, True, 0))
+        self.assertEqual(seen["chirp_on"], 1)
+        self.assertTrue(seen["quiet_asleep"])
+        self.assertEqual(seen["quiet"], ([["re: you"]], 1))
+        self.assertFalse(seen["quiet_over"])
+        self.assertTrue(seen["menu_sleep_kept"])
+        self.assertEqual(seen["hidden"], (True, False, 1000))   # Pet.HIDDEN_MS
+        self.assertEqual(seen["probe_calls"], 1)
+        self.assertIsNone(seen["hidden_bubble"])
+        self.assertEqual(seen["hidden_queue"], 0)
+        self.assertEqual(seen["back"], (False, True))
+        self.assertFalse(seen["off"])
+        self.assertFalse(seen["complained"])
+        rows = seen["rows"]
+        self.assertEqual([(r[1], r[2]) for r in rows[:5]],
+                         [("while you game", "while hidden"), ("night owl", "while asleep"), ("claude again", None),
+                          ("codex did it", "while muted"), ("fixed it!", None)])
+        self.assertEqual(rows[3][0], "codex · api · just now")
+        self.assertNotIn("re: you", [r[1] for r in rows])   # answers to you aren't "missed"
+
+    def test_menu_entries_and_missed_popup(self):
+        def script(pet, seen):
+            yield
+            m = pet.tray_menu
+            pet.fill_menu(m)
+            texts = [a.text() for a in m.actions()]
+            seen["texts"] = texts
+            mutes = next(a.menu() for a in m.actions() if a.text() == "mute harnesses")
+            seen["mutes"] = [(a.text(), a.isCheckable(), a.isChecked()) for a in mutes.actions()]
+            next(a for a in mutes.actions() if a.text() == "codex").trigger()
+            seen["cfg_mute"] = self.read_cfg().get("muted_sources")
+            pet.fill_menu(m)
+            mutes = next(a.menu() for a in m.actions() if a.text() == "mute harnesses")
+            seen["codex_checked"] = next(a for a in mutes.actions() if a.text() == "codex").isChecked()
+            quiet = next(a.menu() for a in m.actions() if a.text() == "quiet hours")
+            seen["presets"] = [a.text() for a in quiet.actions() if a.isCheckable()]
+            next(a for a in quiet.actions() if a.text() == "23:00 – 08:00").trigger()
+            seen["cfg_quiet"] = self.read_cfg().get("quiet_hours")
+            pin = next(a for a in m.actions() if a.text() == "stay on this screen")
+            pin.trigger()
+            seen["cfg_pin"] = self.read_cfg().get("pet_screen")
+            pet.fill_menu(m)
+            seen["pin_checked"] = next(a for a in m.actions() if a.text() == "stay on this screen").isChecked()
+            next(a for a in m.actions() if a.text() == "stay on this screen").trigger()
+            seen["cfg_unpin"] = self.read_cfg().get("pet_screen")
+            pet.missed.add("ooh, a parser!", "claude-code", "moth-repo")
+            pet.missed.add("tests pass", "codex", "api", why="hidden")
+            next(a for a in m.actions() if a.text() == "what did i miss").trigger()
+            for _ in range(3):
+                yield
+            mw = pet.missed_win
+            seen["popup"] = (mw is not None and mw.isVisible(), [e[0] for e in mw.entries], mw.entries[0][1])
+            g, sg = mw.geometry(), pet.win.screen().availableGeometry()
+            seen["on_screen"] = sg.contains(g)
+            mw.hide()
+            pet.set_hidden(True, time.monotonic())   # from the tray while hidden: at the cursor, still on screen
+            pet.show_missed()
+            seen["popup_hidden"] = mw.isVisible() and sg.contains(mw.geometry())
+            mw.hide()
+            pet.set_hidden(False, time.monotonic())
+            seen["complained"] = pet.complained
+        seen = self.run_pet(script)
+        t = seen["texts"]
+        for name in ("open chat page", "what did i miss", "mute bubbles", "mute harnesses", "quiet hours", "sleep",
+                     "show moth in harnesses", "skin", "stay on this screen", "check for updates", "quit"):
+            self.assertIn(name, t)
+        self.assertEqual([x[0] for x in seen["mutes"]], ["claude", "codex", "hermes", "pi", "opencode",
+                                                         "deepseek (dsh)"])
+        self.assertTrue(all(c and not on for _, c, on in seen["mutes"]))
+        self.assertEqual(seen["cfg_mute"], ["codex"])
+        self.assertTrue(seen["codex_checked"])
+        self.assertEqual(seen["presets"], ["off", "22:00 – 07:00", "23:00 – 08:00", "00:00 – 09:00"])
+        self.assertEqual(seen["cfg_quiet"], "23:00-08:00")
+        self.assertNotIn(seen["cfg_pin"], (None, "any"))   # the screen's name (offscreen has none: "0,0 800x600")
+        self.assertTrue(seen["pin_checked"])
+        self.assertEqual(seen["cfg_unpin"], "any")
+        self.assertEqual(seen["popup"], (True, ["codex · api · just now", "claude · moth-repo · just now"],
+                                         "while hidden"))
+        self.assertTrue(seen["on_screen"])
+        self.assertTrue(seen["popup_hidden"])
+        self.assertFalse(seen["complained"])
+
+    def test_skin_hops_with_its_jumping_row(self):
+        pets = os.path.join(self.tmp, "pets")
+        make_pet(os.path.join(pets, "jumper"))
+        make_pet(os.path.join(pets, "nojump"), empty=("jumping", "waving"))
+
+        def script(pet, seen):
+            yield
+            for sid in ("jumper", "nojump"):
+                pet.choose_skin(sid)
+                pet.w.wander, pet.w.state, pet.w.excited_until = False, P.REST, -1.0   # sitting, calm
+                pet.done_signal(time.monotonic())
+                time.sleep(0.2)
+                pet._tick()
+                seen[sid] = (pet.win.look[1], pet.win.dy)
+                while time.monotonic() - pet.hop_at < P.HOP_S + 0.05:
+                    yield
+        seen = self.run_pet(script)
+        self.assertEqual(seen["jumper"], ("jumping", 0.0))   # its own jump: no extra lift
+        self.assertEqual(seen["nojump"][0], "idle")
+        self.assertLess(seen["nojump"][1], 0)                # no jump / wave row: lifted instead
 
 
 if __name__ == "__main__":

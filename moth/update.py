@@ -43,7 +43,7 @@ from moth import weights
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))   # moth-112m/ in the download: code/moth/update.py
 REPO_ID = weights.REPO_ID   # one place for the repo id (moth/weights.py)
-WEIGHTS = {"model.safetensors", "config.json", "tokenizer.json"}
+WEIGHTS = {"model.safetensors", "config.json", "tokenizer.json", "moth.json"}   # what a pip install fetches
 INTEGRATIONS = "code/moth/integrations/"
 BACKUP, REVISION_FILE = ".moth-backup", ".moth-version"
 STAGING, JOURNAL, LOCK = ".moth-update", ".moth-swap", ".moth-update.lock"
@@ -113,6 +113,13 @@ def is_download(root: str) -> bool:
     never finished downloading (weights.hf_layout, the same test serve.default_paths() and the pet use, so they
     send such a folder here instead of downloading elsewhere). Keeps the dev checkout (and ~) safe."""
     return weights.hf_layout(root)
+
+
+def _not_download(root: str, what: str) -> str:
+    code = os.path.dirname(HERE)
+    if _same_dir(root, ROOT) and os.path.exists(os.path.join(code, ".git")):   # the dev checkout: git updates it
+        return f"{code} is a git checkout of moth; update it with `git -C {code} pull`"
+    return f"{root} isn't a Hugging Face download of moth (no model.safetensors next to code/); nothing to {what}"
 
 
 def _same_dir(a, b) -> bool:
@@ -351,7 +358,7 @@ def _latest(hub, repo: str, rev: str | None):
 
 def check(root: str, repo: str, rev: str | None, pip: bool = False) -> int:
     if not pip and not is_download(root):
-        print(f"{root} isn't a Hugging Face download of moth (no model.safetensors next to code/); nothing to check")
+        print(_not_download(root, "check"))
         return 1
     off = _offline()
     if off:
@@ -380,6 +387,10 @@ def check(root: str, repo: str, rev: str | None, pip: bool = False) -> int:
         print(f"files missing from this download of {version_line(root)}: {describe(files)}")
         print("\nrun  python -m moth update  to fetch them")
         return 10
+    if docs_only(files, removed):   # a card edit is no new moth: no "update available" (nor the pet's bubble)
+        print(f"up to date: {version_line(root)}  (only the docs changed upstream: {', '.join((files + removed)[:4])}"
+              f"{' ...' * (len(files) + len(removed) > 4)}; python -m moth update fetches them)")
+        return 0
     new = _remote_text(hub, repo, info.sha, "code/moth/VERSION").strip() or "?"
     print(f"update available: moth {version(root)} -> {new}  (revision {(mine or 'unknown')[:12]} -> {info.sha[:12]})")
     print(f"changes: {describe(files, removed)}")
@@ -404,15 +415,30 @@ def _plan(hub, repo: str, root: str, sibs, mine: str | None, sha: str):
 
 
 def _newer(a: str, b: str) -> bool:
-    """Version b is newer than a (dotted numbers; anything else: just different)."""
-    try:
-        return tuple(map(int, b.split("."))) > tuple(map(int, a.split(".")))
-    except ValueError:
-        return bool(b) and b != a
+    from moth.backends import compat   # stdlib only
+    return compat.newer(a, b)
+
+
+def docs_only(files, removed=()) -> bool:
+    """Only the model card / docs differ (README.md, LICENSE, NOTICE, *.md under code/): nothing moth runs."""
+    allf = list(files) + list(removed)
+    return bool(allf) and all(f not in WEIGHTS and (not f.startswith("code/") or f.endswith(".md")) for f in allf)
+
+
+def _too_new(hub, repo: str, info) -> str | None:
+    """A pip / app install fetches only the model files: why this code can't run the Hub's model, if it can't."""
+    from moth.backends import compat
+    return compat.remote_problem(hub, repo, info.sha, {s.rfilename for s in info.siblings})
 
 
 def _pip_check(cache: str, hub, repo: str, info, files: list[str], removed: list[str]) -> int:
+    from moth.backends import compat
     rc, mine = 0, revision(cache)
+    why = _too_new(hub, repo, info) if files or removed else None
+    if why:
+        print(f"a newer model is on the Hub (revision {info.sha[:12]}), but it needs newer moth code: {why}")
+        print(f"newer code: {compat.upgrade_hint()}, then  moth update  fetches the model")
+        return 10
     if files or removed:
         rc = 10
         print(f"newer weights on the Hub: revision {(mine or 'none')[:12]} -> {info.sha[:12]}  ({repo})")
@@ -426,10 +452,9 @@ def _pip_check(cache: str, hub, repo: str, info, files: list[str], removed: list
     new = _remote_text(hub, repo, info.sha, "code/moth/VERSION").strip()
     if _newer(version(), new):
         rc = 10
-        print(f"newer code: moth {version()} -> {new}:  pip install -U moth-companion  "
-              "(uv tool upgrade moth-companion / pipx upgrade moth-companion)")
+        print(f"newer code: moth {version()} -> {new}:  {compat.upgrade_hint()}")
     else:
-        print(f"code: moth {version()}; pip install -U moth-companion gets the newest release")
+        print(f"code: moth {version()}; {compat.upgrade_hint(short=True)} gets the newest release")
     return rc
 
 
@@ -616,7 +641,7 @@ def _commit_backup(root: str, plan: dict) -> bool:
 
 def _not_safe(root: str, pip: bool = False) -> str | None:
     if not pip and not is_download(root):
-        return f"{root} isn't a Hugging Face download of moth (no model.safetensors next to code/); nothing to update"
+        return _not_download(root, "update")
     running = server_running(ROOT if pip else root)   # pip: serve's pidfile names the install, not the cache
     if running:
         return f"moth is running from this {'install' if pip else 'folder'} (port {running[0]}, pid {running[1]}): " \
@@ -768,6 +793,12 @@ def _update(hub, root: str, repo: str, rev: str | None, yes: bool, pip: bool) ->
         print(f"up to date: {version_line(root)}")
         _say_edits(kept, [])
         return 0
+    why = _too_new(hub, repo, info) if pip else None
+    if why:   # the model files alone would leave this code unable to start moth
+        from moth.backends import compat
+        print(f"the model at revision {info.sha[:12]} needs newer moth code ({why}): {compat.upgrade_hint()}, then "
+              "run  moth update  again. Nothing was changed.")
+        return 1
     print(f"update {root}: {describe(files, removed)}  (revision {(mine or 'unknown')[:12]} -> {info.sha[:12]})")
     _say_edits(kept, edited)
     try:
@@ -813,7 +844,8 @@ def _update(hub, root: str, repo: str, rev: str | None, yes: bool, pip: bool) ->
         if backed_up is not None:
             print(f"previous weights kept in {os.path.join(root, BACKUP)}  (moth update --rollback)" if backed_up
                   else "couldn't keep a backup of the previous weights this time (no --rollback)")
-        print("code comes from pip:  pip install -U moth-companion")
+        from moth.backends import compat
+        print(f"newer code, when there is some:  {compat.upgrade_hint(short=True)}")
         return 0
     print(f"updated: moth {old} -> {version(root)} (revision {info.sha[:12]})")
     print(f"changed: {describe(files, removed)}")
@@ -826,6 +858,34 @@ def _update(hub, root: str, repo: str, rev: str | None, yes: bool, pip: bool) ->
     return 0
 
 
+def model_target():
+    """What `moth config model` means for moth update: None = this install's own moth (as always); (folder, repo) for
+    a tiny-agent model moth downloaded from a Hub repo (its manifest's repo id; updated like a pip install's weights:
+    model files only, with a backup); a str = why moth update leaves it alone."""
+    from moth import backends, config
+    spec = config.model()
+    if not spec:
+        return None
+    try:
+        m = backends.resolve(spec, network=False)
+    except backends.ManifestError as e:
+        return f"can't read the configured model ({e})"
+    if m.backend == "openai":
+        return (f"your model is {spec}, an OpenAI-compatible server, not a moth model from the Hugging Face Hub: "
+                "update it where it runs (e.g. `ollama pull`, a newer GGUF). `moth config model default` goes back "
+                "to moth's own model.")
+    if m.backend == "transformers":
+        src = m.repo or m.model or m.folder
+        how = f"`hf download {src}` refreshes it" if src and backends.HUB_ID.fullmatch(src) else "update it by hand"
+        return f"your model {src} runs on transformers, which keeps it itself: {how}."
+    repo = m.repo
+    if repo and m.folder and (_same_dir(m.folder, weights.cache_dir(repo))
+                              or os.path.isfile(os.path.join(m.folder, REVISION_FILE))):
+        return m.folder, repo
+    return (f"your model {m.folder} is a folder moth didn't download from the Hub (no repo id in its moth.json, or no "
+            f"{REVISION_FILE}): update it the way you made it.")
+
+
 def main(argv=None, root: str = ROOT) -> int:
     ap = argparse.ArgumentParser(prog="python -m moth update", epilog=EXIT_HELP,
                                  description="Update this Hugging Face download of moth in place (stop moth first). "
@@ -836,9 +896,18 @@ def main(argv=None, root: str = ROOT) -> int:
     ap.add_argument("--revision", default=weights.pinned_revision(),
                     help="branch, tag or commit (default: $MOTH_REVISION, else main)")
     ap.add_argument("--yes", "-y", action="store_true", help="don't ask before changing files")
-    a = ap.parse_args(argv)
+    args = list(sys.argv[1:] if argv is None else argv)
+    a = ap.parse_args(args)
     pip = _pip(root)
-    if pip:   # pip install: the weights cache is what gets updated
+    target = None if any(x == "--repo" or x.startswith("--repo=") for x in args) else model_target()
+    if isinstance(target, str):   # `moth config model` is something moth update doesn't manage: say so, then do
+        # this install's own update as always (its code, and moth's own model), so code updates and the pet's
+        # daily "new moth out" check keep working
+        print(f"moth update: {target} (this updates moth's own install, as usual.)", file=sys.stderr, flush=True)
+        target = None
+    if target:   # a tiny-agent model from another Hub repo, in the folder moth downloaded it to
+        root, a.repo, pip = target[0], target[1], True
+    elif pip:   # pip install: the weights cache is what gets updated
         root = weights.cache_dir(a.repo)
     if a.rollback:
         return rollback(root, a.yes, pip)

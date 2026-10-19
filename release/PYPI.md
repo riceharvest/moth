@@ -6,6 +6,7 @@ look around in and write to, and can watch your coding agent and react to its re
 It runs locally, on CPU.
 
 Model card, samples, how it was made and licenses: https://huggingface.co/darioooooo0o/moth-112m
+Source, issues and the Windows / macOS / Linux installers: https://github.com/riceharvest/moth
 
 ## Install
 

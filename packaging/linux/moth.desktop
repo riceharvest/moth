@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=moth
+GenericName=Desktop companion
+Comment=A tiny local companion that keeps you company while your coding agent works
+Exec=moth
+Icon=moth
+Terminal=false
+Categories=Utility;
+Keywords=pet;companion;chatbot;coding;agent;
+StartupNotify=false

@@ -30,6 +30,7 @@ dependencies = [
 
 [project.optional-dependencies]
 pet = ["PySide6-Essentials"]   # QtCore/QtGui/QtWidgets/QtSvg; not the Addons wheel (WebEngine, 3D, ...: +56 MB on Linux)
+transformers = ["transformers>=4.45"]   # the transformers model backend (moth/backends, moth/docs/MODEL_BACKENDS.md)
 
 [project.scripts]
 moth = "moth.__main__:main"
@@ -38,6 +39,7 @@ moth-pet = "moth.pet:main"
 [project.urls]
 Homepage = "https://huggingface.co/darioooooo0o/moth-112m"
 Documentation = "https://huggingface.co/darioooooo0o/moth-112m#readme"
+Source = "https://github.com/riceharvest/moth"
 
 [tool.hatch.version]
 path = "moth/VERSION"
@@ -45,7 +47,7 @@ pattern = "(?P<version>\\S+)"
 
 # What ships: the runtime modules (the same set release/build.sh puts in the Hub repo's code/, plus any new module
 # by default), static/, assets/ (not the candidates/ art that wasn't picked), integrations/**, file_pool.json,
-# VERSION. Not: research/dev-only scripts and data (agent pool, judges, pairwise), caches.
+# VERSION. Not: research/dev-only scripts and data (agent pool, judges, pairwise, training, eval), caches.
 [tool.hatch.build]
 exclude = [
     "__pycache__",
@@ -59,6 +61,15 @@ exclude = [
     "moth/pairwise.py",
     "moth/rejudge.py",
     "moth/rl",
+    # the training / eval pipeline (the Hub download and the git repo have it; nothing at runtime imports it)
+    "moth/add_hermes_pool.py",
+    "moth/build_sft.py",
+    "moth/eval.py",
+    "moth/gen_dialogs.py",
+    "moth/metrics.py",
+    "moth/probes.py",
+    "moth/sft.py",
+    "tiny_agent/optim.py",
 ]
 
 [tool.hatch.build.targets.wheel]

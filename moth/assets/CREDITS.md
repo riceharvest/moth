@@ -1,7 +1,7 @@
 # Art and font credits
 
-moth uses one piece of third-party art and two third-party fonts. None of them is covered by moth's Apache-2.0
-license.
+moth uses one piece of third-party art, two third-party fonts and one third-party sound. None of them is covered by
+moth's Apache-2.0 license.
 
 - The art (desktop pet, Petdex sprite sheet, chat page header icon and favicon) is used under CC BY 4.0. See
   "202206 Silkmoth adult female icon" below.
@@ -79,3 +79,21 @@ Files in `fonts/`:
 
 The desktop pet asks Qt for "Fraunces", then Georgia, DejaVu Serif, serif. It doesn't bundle or download fonts, so
 it uses Fraunces only if it is installed on the system.
+
+## Sound
+
+`sounds/chirp.wav` is the desktop pet's optional "your agent is done" sound (config `chirp`, off by default).
+
+- Title:   `confirmation_001.ogg`, from the "Interface Sounds" pack (1.0, 2020-02-11)
+- Author:  Kenney (www.kenney.nl)
+- Source:  https://kenney.nl/assets/interface-sounds (`kenney_interface-sounds.zip`, sha256
+  f2193d072726d6758a5f7871b2dcc54dcce0d5c35c6f0a62f92549b327c81232)
+- License: Creative Commons Zero (CC0 1.0), https://creativecommons.org/publicdomain/zero/1.0/ (the pack's
+  `License.txt`). Credit isn't required; it's given anyway.
+
+Changes (mechanical, with ffmpeg; nothing was made new): 12 dB quieter, resampled to 22.05 kHz mono 16-bit WAV
+(so Windows' `winsound` and `aplay` can play it without a decoder), metadata dropped:
+
+```sh
+ffmpeg -i confirmation_001.ogg -af volume=-12dB -ar 22050 -ac 1 -c:a pcm_s16le -map_metadata -1 -fflags +bitexact chirp.wav
+```

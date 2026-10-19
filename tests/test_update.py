@@ -151,6 +151,20 @@ class UpdateTest(unittest.TestCase):
     def moth_state(self) -> dict:
         return {str(p): p.read_bytes() for p in (self.home / ".moth").rglob("*") if p.is_file()}
 
+    def test_docs_only(self):
+        self.assertTrue(U.docs_only(["README.md", "LICENSE", "code/moth/docs/MODEL_BACKENDS.md"], ["NOTICE"]))
+        for f in ("code/moth/serve.py", "model.safetensors", "config.json", "moth.json", "code/moth/VERSION"):
+            self.assertFalse(U.docs_only(["README.md", f]), f)
+        self.assertFalse(U.docs_only([], []))
+
+    def test_startup_hints_use_the_moth_command_on_pip(self):
+        from moth import __main__ as main_mod
+        with unittest.mock.patch.object(W, "mode", return_value="pip"):
+            self.assertEqual(main_mod.run_here("hook", "--all"), "moth hook --all")
+            self.assertNotIn(" && ", main_mod.snippets().split("Let moth set it up:")[1].splitlines()[0])
+        with unittest.mock.patch.object(W, "mode", return_value="hf"):
+            self.assertTrue(main_mod.run_here("hook", "--all").startswith("cd "))
+
     def test_check_up_to_date(self):
         self.hub.head = "sha1"
         code, out = self.run_cli("--check")

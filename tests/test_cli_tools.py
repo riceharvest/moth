@@ -41,6 +41,7 @@ from moth import hooks as H  # noqa: E402
 
 INTEG = ROOT / "moth" / "integrations"
 REAL_HOME = Path(os.environ.get("MOTH_TEST_REAL_HOME") or os.path.expanduser("~"))   # (conftest.py)
+REAL_DSH, REAL_NODE = shutil.which("dsh"), shutil.which("node")   # before TempHome narrows PATH
 
 
 # --- guard: the user's real configs must not change --------------------------------------------------------------
@@ -669,6 +670,88 @@ class Dsh(TempHome):
         rc, out = self.hook("dsh", "--profile", "b", "--yes")
         self.assertEqual(rc, 0, out)
         self.assertEqual((self.home / ".dsh/profiles/a/cordis.patch.yml").read_text(), "")
+
+
+class DshListForms(TempHome):
+    """cordis.patch.yml holds one YAML list. A fresh profile's file is comments plus a bare `[]` (dsh 0.2.0-rc.2's
+    auto-init): a block line after a flow list is invalid YAML and dsh refuses to boot, so moth's entry must replace
+    an empty flow list and join a non-empty one. Unhook leaves a list, never an empty file (dsh rejects that too)."""
+    FRESH = ("# Your patch layer for this dsh profile, applied after every bundle layer:\n"
+             "# a top-level YAML array of loader patch entries.\n[]\n")
+
+    def setUp(self):
+        super().setUp()
+        os.environ.pop("DSH_HOME", None)
+        self.mjs = str(INTEG / "dsh" / "moth.mjs").replace("'", "''")
+
+    def roundtrip(self, before: str, after: str, back: str | None = None):
+        p = self.write(".dsh/profiles/main/cordis.patch.yml", before)
+        rc, out = self.hook("dsh", "--yes")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(p.read_text(), after)
+        self.assertEqual(H.status("dsh")["state"], "installed")
+        rc, out = self.hook("dsh", "--yes")
+        self.assertIn("already installed", out)
+        rc, out = self.unhook("dsh", "--yes")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(p.read_text(), before if back is None else back)
+        self.assertEqual(H.status("dsh")["state"], "absent")
+        return p
+
+    def test_fresh_profile_empty_flow_list(self):
+        line = f"- insert: [{{ id: moth, name: '{self.mjs}' }}]"
+        self.roundtrip(self.FRESH, self.FRESH.replace("[]", line))
+
+    def test_empty_flow_list_with_spaces_and_comment(self):
+        line = f"- insert: [{{ id: moth, name: '{self.mjs}' }}]"
+        self.roundtrip("[ ]  # nothing yet\n", f"{line}  # nothing yet\n", "[]\n")
+
+    def test_non_empty_flow_list_gets_a_last_item(self):
+        item = f"{{ insert: [{{ id: moth, name: '{self.mjs}' }}] }}"
+        self.roundtrip("[{ disable: pet }]  # mine\n", f"[{{ disable: pet }}, {item}]  # mine\n")
+        self.roundtrip("[\n  { disable: pet },\n]\n", f"[\n  {{ disable: pet }}, {item}\n]\n",
+                       "[\n  { disable: pet }\n]\n")
+
+    def test_unhook_never_leaves_an_empty_file(self):
+        p = self.write(".dsh/profiles/main/cordis.patch.yml", "")
+        self.hook("dsh", "--yes")
+        self.unhook("dsh", "--yes")
+        self.assertEqual(p.read_text(), "[]\n")
+
+    def test_dsh_home(self):
+        os.environ["DSH_HOME"] = str(self.tmp / "dshhome")
+        p = self.tmp / "dshhome" / "profiles" / "web" / "cordis.patch.yml"
+        p.parent.mkdir(parents=True)
+        p.write_text(self.FRESH)
+        rc, out = self.hook("dsh", "--yes")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("id: moth", p.read_text())
+
+    @unittest.skipUnless(REAL_DSH and REAL_NODE, "dsh not installed")
+    def test_real_dsh_boots_with_it(self):
+        """The real launcher composes the profile (dsh <profile> --dump-config) with moth's entry in every form."""
+        dsh, path = REAL_DSH, os.environ.get("PATH")
+        os.environ["PATH"] = os.pathsep.join([str(self.bin), os.path.dirname(dsh), os.path.dirname(REAL_NODE),
+                                              os.path.dirname(sys.executable), "/usr/bin", "/bin"])
+        os.environ["DSH_HOME"] = str(self.tmp / "dshhome")
+        run = lambda: subprocess.run([dsh, "headless", "--dump-config"], capture_output=True, text=True,  # noqa: E731
+                                     timeout=180)
+        p0 = run()   # auto-inits the shipped headless profile: the real fresh file
+        self.assertEqual(p0.returncode, 0, p0.stderr[-500:])
+        patch = self.tmp / "dshhome" / "profiles" / "headless" / "cordis.patch.yml"
+        for before in (patch.read_text(), "[{ disable: nothing-here }]\n", "- disable: nothing-here\n"):
+            with self.subTest(before=before):
+                patch.write_text(before)
+                rc, out = self.hook("dsh", "--profile", "headless", "--yes")
+                self.assertEqual(rc, 0, out)
+                p = run()
+                self.assertEqual(p.returncode, 0, p.stderr[-500:])
+                self.assertIn("moth.mjs", p.stdout)
+                self.unhook("dsh", "--profile", "headless", "--yes")
+                p = run()
+                self.assertEqual(p.returncode, 0, p.stderr[-500:])
+                self.assertNotIn("moth.mjs", p.stdout)
+        os.environ["PATH"] = path
 
 
 class HooksList(TempHome):

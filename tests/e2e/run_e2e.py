@@ -20,7 +20,9 @@ For each run it:
        pi -p --session-id <uuid> --provider moth-e2e ...     (session id: the one we set)
        opencode run --format json -m moth-e2e/fake-model hi  (session id: the events' sessionID)
      and asserts moth got exactly the fake model's reply, with the right source, session and label ("proj e2e"),
-     and (Claude Code, Codex) that it arrived BEFORE the CLI exited: the hooks run in the foreground for that.
+     and (Claude Code, Codex) that it arrived BEFORE the CLI exited: the hooks run in the foreground for that;
+  5. Codex with show_in_harness on: two turns of one thread (exec + exec resume); the Stop hook fetches moth's line
+     for that thread (its {"systemMessage"}), and that line must appear in no request body the fake model gets.
 Results go to <out>/results.json and a table on stdout; logs (fake model requests, moth's record, each CLI's output,
 the installed configs) to <out>/. Exit 1 if a harness not listed in --soft failed; a harness whose CLI isn't on PATH
 is skipped (and fails unless --soft lists it, so CI can't go green on a missing install).
@@ -153,9 +155,12 @@ class Runner:
         self.record = e.out / "moth_record.jsonl"
         self.record.unlink(missing_ok=True)
         (e.out / "llm_requests.jsonl").unlink(missing_ok=True)
+        self.bodies = e.out / "llm_bodies.jsonl"   # every request body in full: what the model was sent
+        self.bodies.unlink(missing_ok=True)
         m = e.start("fake_moth", ["--token-file", str(e.home / ".moth" / "token"), "--record", str(self.record)])
         e.moth_url = f"http://127.0.0.1:{m['port']}"
-        llm = e.start("fake_llm", ["--reply", REPLY, "--log", str(e.out / "llm_requests.jsonl")])
+        llm = e.start("fake_llm", ["--reply", REPLY, "--log", str(e.out / "llm_requests.jsonl"),
+                                   "--bodies", str(self.bodies)])
         self.llm = f"http://127.0.0.1:{llm['port']}"
         log(f"scratch root: {e.root}\nhook python: {e.python}\nfake moth: {e.moth_url}   fake model: {self.llm}")
 
@@ -287,7 +292,45 @@ class Runner:
             res["problems"].append(f"the unapproved control run exited {code0}")
         if unapproved:
             res["problems"].append(f"the UNAPPROVED hook posted {len(unapproved)}x (Codex should skip it)")
+        res["display"] = self.codex_display(base, env)
+        res["problems"] += res["display"]["problems"]
         res["status"] = "pass" if not res["problems"] else "fail"
+        return res
+
+    def codex_display(self, base: list[str], env: dict) -> dict:
+        """show_in_harness on: the Stop hook prints moth's reaction as {"systemMessage"} (the TUI draws it under the
+        turn). Two turns of one thread (exec, then exec resume): the hook must have fetched moth's line for that
+        thread both times, and that line must be in NO request body the model got, while turn 2's request does
+        carry turn 1 (so the check isn't vacuous)."""
+        e, bypass = self.e, base[:2] + ["--dangerously-bypass-hook-trust"] + base[2:]
+        env = {**env, "MOTH_SHOW_IN_HARNESS": "1"}
+        access = Path(str(self.record) + ".access")
+        n_acc = len(access.read_text(encoding="utf-8").splitlines()) if access.exists() else 0
+        n_body = len(self.bodies.read_text(encoding="utf-8").splitlines()) if self.bodies.exists() else 0
+        res: dict = {"problems": []}
+        code, so, _, _ = run(bypass + ["hi"], env, e.proj, "codex_display1", e.out)
+        thread = next((ev.get("thread_id") for ev in map(_json_or_none, so.splitlines())
+                       if ev and ev.get("type") == "thread.started"), None)
+        if code != 0 or not thread:
+            res["problems"].append(f"display turn 1: exit {code}, thread {thread!r}")
+            return res
+        code, _, _, _ = run(bypass + ["resume", thread, "and now?"], env, e.proj, "codex_display2", e.out)
+        if code != 0:
+            res["problems"].append(f"display turn 2 (resume): exit {code}")
+        polls = [r["path"] for r in map(_json_or_none, access.read_text(encoding="utf-8").splitlines()[n_acc:])
+                 if r and r["method"] == "GET" and r["path"].startswith("/api/says?source=codex&session=" + thread)]
+        res["says_polls"] = len(polls)
+        if len(polls) < 2:   # turn 1: a baseline + the queued reaction; turn 2: at least the late-lines check
+            res["problems"].append(f"the hook fetched moth's line {len(polls)}x for thread {thread} (expected >= 2)")
+        line = f"heard {e_label(e)}"   # fake_moth's reaction: "heard <label>: <first words>"
+        bodies = [json.loads(l)["body"] for l in self.bodies.read_text(encoding="utf-8").splitlines()[n_body:]]
+        res["model_requests"] = len(bodies)
+        leaked = [i for i, b in enumerate(bodies) if line in b or "systemMessage" in b]
+        if leaked:
+            res["problems"].append(f"moth's line REACHED THE MODEL in request(s) {leaked}")
+        if not any("and now?" in b and REPLY in b for b in bodies):
+            res["problems"].append("turn 2's request doesn't carry turn 1 (the leak check would prove nothing)")
+        log(f"  display: {len(polls)} polls, {len(bodies)} model requests, moth's line in none: {not leaked}")
         return res
 
     def pi(self) -> dict:
@@ -357,6 +400,14 @@ class Runner:
         else:
             log(f"logs in {self.e.out}")
         return 1 if bad else 0
+
+
+def _json_or_none(line: str):
+    try:
+        d = json.loads(line)
+    except ValueError:
+        return None
+    return d if isinstance(d, dict) else None
 
 
 def e_label(e: Env) -> str:

@@ -134,14 +134,15 @@ the adapter for your harness as well.
 
 **Each in-harness display shows moth's reaction to its own session only.** With several agents running, moth's
 newest line is often its reply to another one (seen live: Claude Code's band showed moth's reply to Hermes). So the
-Claude Code band, the Pi widget and the OpenCode toast ask `/api/says?source=<harness>&session=<id>` for the
+Claude Code band, the Pi widget, the OpenCode toast and the Codex line ask `/api/says?source=<harness>&session=<id>` for the
 session they belong to, and show nothing rather than another session's line. The Hermes Desktop pet asks for
 `source=hermes` (every Hermes session in that app: the renderer can't map its sessions to the agent's ids). The
-desktop pet, `moth tail` and the chat page still show everything. Codex and dsh have no in-harness display.
+desktop pet, `moth tail` and the chat page still show everything. dsh has no in-harness display.
 
 moth needs a moment to think. A display that waits after a turn (Pi, OpenCode, when turned on) waits up to about
 4 s. A slower line is not lost: it shows on the next poll, after the next turn, or right away in `moth tail` and the
-pet.
+pet. Codex's line comes from its Stop hook, which Codex waits for, so it waits only when moth queued the turn right
+away (about a second at most); with moth's default pacing the reaction shows under the next turn.
 
 **Venting stays private.** Whatever you say to moth, and what moth says back, never enters the agent's context.
 That is why there is no `/moth` in Claude Code or Hermes. In Claude Code a command's output row is read by the model.
@@ -170,8 +171,8 @@ Pi runs extension commands outside the conversation (details per harness below).
 
 ### In-harness display: off by default (`show_in_harness`)
 
-The Pi widget and the OpenCode toast come inside adapters you install anyway, so they are **off** until you turn
-them on. Off, those adapters still post every turn (the desktop pet and `moth tail` react as usual); they just don't
+The Pi widget, the OpenCode toast and the Codex line come inside adapters you install anyway, so they are **off**
+until you turn them on. Off, those adapters still post every turn (the desktop pet and `moth tail` react as usual); they just don't
 poll moth or draw anything in the harness.
 
 ```bash
@@ -335,13 +336,36 @@ moth's reaction to that session as a TUI toast (`client.tui.showToast`, title "m
 `source=opencode&session=<sessionID>`, with a cursor per session, so two sessions in one OpenCode each get theirs). The install is unchanged. There is no `/moth` here: use `moth tail` to
 chat.
 
+### Codex: a line under the turn
+
+With `show_in_harness` on, the Codex Stop hook (`codex.py`, the same hook as always) also prints
+`{"systemMessage": "moth: <line>"}` with moth's newest reaction to that session, and the Codex TUI draws it under
+the turn as `↳ Hook · moth: ...`. A Stop hook's systemMessage is a Warning entry of the hook run that only the UI
+renders: it is not added to the conversation, so the model never sees it. Checked with real `codex` 0.163.0 turns
+against a fake model API (`tests/e2e/run_e2e.py`, the `display` part of the Codex check): over two turns of one
+thread, moth's line is in none of the requests the model gets, while turn 2's request carries turn 1. `codex exec`
+doesn't print it.
+
+Codex waits for its Stop hook, so the hook waits for moth only when moth queued the turn right away (`--react-every
+0`), for about a second at most. With moth's default pacing, moth reacts a few seconds after the turn, and that
+line shows under the next turn of the same session (a cursor per session in `~/.moth/codex-display.json`). A slow or
+down moth costs no more than the plain post. There is no `/moth` here: use `moth tail` to chat.
+
 ### dsh: not built (options)
 
-- **A client slot in our cordis plugin.** `dsh/moth.mjs` could poll `/api/says` after `turn/end` and hand moth's
-  line to whatever display surface dsh exposes to plugins, the same way as Pi's widget.
+Checked against the installed `@deepseek-ai/dsh` 0.2.0-rc.2: its shipped profiles are `web`, `headless`, `sdk`,
+`sdk-minimal` and `acp`, and none has a terminal UI a plugin could draw in. The host-side cordis plugin that posts
+moth's turns (`dsh/moth.mjs`) has no display surface of its own.
+
+- **`web`:** the page is a React client built from slots (`dsh-client-ui-slots`). A moth line there would be a
+  web-client plugin: a browser half (plain JS handed `React` and `host`, `dsh-cordis-client-runner`) installed as a
+  Client module through the Plugin Manager, or a dynamic package the page has to approve each time it loads. Not
+  built: it needs the web client running against a model to check that the line renders and stays out of the turn.
+- **`headless` / `sdk` / `acp`:** the output belongs to the caller (the editor, for ACP), so there is nowhere to put
+  a line that isn't part of the session.
 - **`@linxin666/dsh-pet`.** If that pet plugin is installed, its announce call could carry moth's line.
 
-Neither was checked against dsh sources (dsh isn't installed here). Until then, use `moth tail` next to dsh.
+Until then, use `moth tail` or the desktop pet next to dsh.
 
 ---
 
@@ -490,6 +514,11 @@ Add this to `~/.dsh/profiles/<profile>/cordis.patch.yml`, a YAML list, next to a
 ```
 
 Or pass it for one run: `dsh --patch /path/to/patch.yml ...`, where the patch file holds the same list.
+
+`python -m moth hook dsh` does this for you (`$DSH_HOME` instead of `~/.dsh` when set). A fresh profile's file is a
+few comments and an empty flow list, `[]`, and a block line can't follow a flow list (dsh then refuses to boot), so
+moth's line replaces an empty `[]`, joins a non-empty `[...]` as its last item, and `unhook` leaves `[]` rather than
+an empty file, which dsh also rejects.
 
 - `session/event` is the "post-commit, fire-and-forget append feed" of every session-log event. From it the adapter:
   - remembers the text blocks of the newest `assistant/message` in the turn, skipping `interrupted: true`;

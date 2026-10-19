@@ -1,0 +1,9 @@
+# What the installers bundle (packaging/moth.spec), plus the build tools. torch comes first, from the CPU index on
+# Linux and Windows (.github/workflows/installers.yml); macOS arm64's default wheel is CPU / MPS already.
+tokenizers
+safetensors
+numpy
+huggingface_hub
+PySide6-Essentials
+pyinstaller>=6.11
+pillow          # build time only: make_icons.py writes moth.ico / moth.icns
