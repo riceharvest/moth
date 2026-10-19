@@ -154,12 +154,13 @@ def _norm_card(card: dict) -> dict:
 
 
 FIELDS = {"kind", "Kind", "noun", "name", "Name"}   # phrasing fields (cards.phrase)
-STALE = ("split", "folders", "home")   # card fields of the tools/home era: ignored when an old line is loaded
+STALE = ("folders", "home")   # card fields of the tools/home era: ignored when an old line is loaded
 
 
 def _current(c: dict) -> dict:
-    """An appended card line read under the current schema (lines are never rewritten; ids don't depend on these)."""
-    c = {k: v for k, v in c.items() if k not in STALE}
+    """An appended card line read under the current schema (lines are never rewritten; ids don't depend on these).
+    A "split" pin is honoured only as "heldout" (eval growth batches); nothing can be pinned into training."""
+    c = {k: v for k, v in c.items() if k not in STALE and not (k == "split" and v != "heldout")}
     if str(c.get("about", "")).startswith("whatever its system prompt says"):   # cards.describe quotes lines now
         c.pop("about")
         if not c.get("name") and not c.get("kind"):
@@ -212,7 +213,7 @@ class Registry:
                 continue
             if p["id"] not in pseen:
                 pseen.add(p["id"])
-                phr.append({k: v for k, v in p.items() if k != "split"})
+                phr.append({k: v for k, v in p.items() if not (k == "split" and v != "heldout")})
         self._phr = [{**p, "split": phrasing_split(p)} for p in phr]
         self._by_id = {c["id"]: c for c in self._cards}
 
@@ -231,32 +232,39 @@ class Registry:
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(obj, ensure_ascii=False, sort_keys=True) + "\n")
 
-    def add_card(self, card: dict, source: str = "manual") -> dict | None:
-        """Append one card (None if its id is already known). Raises ValueError for an eval friend's name."""
+    def add_card(self, card: dict, source: str = "manual", heldout: bool = False) -> dict | None:
+        """Append one card (None if its id is already known). Raises ValueError for an eval friend's name.
+        heldout=True pins it to the held-out pool (growing the eval; refused if a training card has its name); a
+        card named like a held-out one is pinned held-out too, so a name never crosses the split."""
         card = _norm_card(card)
-        if (card.get("name") or "").lower() in C.EVAL_FRIEND_NAMES:
+        name = (card.get("name") or "").lower()
+        if name in C.EVAL_FRIEND_NAMES:
             raise ValueError(f"card name {card['name']!r} is one of the eval friends' names (cards.EVAL_FRIEND_NAMES)")
         if card["id"] in self._by_id:
             return None
         card = {k: v for k, v in card.items() if k != "split"}
+        if heldout and name and name in {(c.get("name") or "").lower() for c in self.cards("train")}:
+            raise ValueError(f"held-out card name {name!r} is already a training card's name")
+        if heldout or (name and name in {(c.get("name") or "").lower() for c in self.cards("heldout")}):
+            card["split"] = "heldout"
         card["source"] = card.get("source") or source
         card["added"] = card.get("added") or time.strftime("%Y-%m-%d")
         self._append(self.cards_path, card)
         self.reload()
         return self._by_id[card["id"]]
 
-    def add_line(self, line: str, source: str = "line") -> dict | None:
-        return self.add_card(card_from_line(line), source)
+    def add_line(self, line: str, source: str = "line", heldout: bool = False) -> dict | None:
+        return self.add_card(card_from_line(line), source, heldout)
 
-    def add_phrasing(self, tmpl: str, source: str = "manual") -> dict | None:
+    def add_phrasing(self, tmpl: str, source: str = "manual", heldout: bool = False) -> dict | None:
         bad = set(re.findall(r"{(\w+)}", tmpl)) - FIELDS
         if bad:
             raise ValueError(f"unknown fields {sorted(bad)}; use kind, Kind, noun, name, Name")
         pid = phrasing_id(tmpl)
         if any(p["id"] == pid for p in self._phr):
             return None
-        self._append(self.phrasings_path, {"id": pid, "tmpl": tmpl, "source": source,
-                                           "added": time.strftime("%Y-%m-%d")})
+        self._append(self.phrasings_path, {"id": pid, "tmpl": tmpl, "source": source, "added": time.strftime("%Y-%m-%d"),
+                                           **({"split": "heldout"} if heldout else {})})
         self.reload()
         return next(p for p in self._phr if p["id"] == pid)
 
@@ -385,39 +393,59 @@ def _digest(specs: list[dict]) -> str:
     return _h(json.dumps(specs, sort_keys=True, ensure_ascii=False))
 
 
-def build_eval_specs(reg: Registry, per_card: int = 5, seed: int = 1947, multilingual: bool = True) -> list[dict]:
-    """Held-out cards in the template and with each a held-out phrasing, plus moth and blank: one sim episode per
-    scenario (cycled, per_card of them) and the scripted who-are-you probes for each."""
+MOTH_CHATS_PER_LANG = 30     # the shipped default card: its own big slice (agent reactions = the headline slice)
+BLANK_CHATS_PER_LANG = 2
+
+
+def build_eval_specs(reg: Registry, per_card: int | None = None, seed: int = 1947, multilingual: bool = True
+                     ) -> list[dict]:
+    """The frozen eval design (v5+): breadth over depth, because card variance dominates.
+    * every held-out base card: one chat per language (LANGS), scenarios cycling talk/agent/recall, the card in its
+      own form for even languages and in a held-out phrasing for odd ones (when one fits); plus ONE English
+      who-are-you probe (card_who / card_name / card_about rotating over cards);
+    * the moth card (the shipped default): MOTH_CHATS_PER_LANG chats per language, 2/3 of them agent reactions,
+      plus the three English probes; the blank card: BLANK_CHATS_PER_LANG per language plus one probe.
+    per_card is ignored (v3/v4 used an earlier design; frozen files are snapshots and are never rebuilt)."""
     from moth.probes import CARD_PROBES, stable_seed
     agent = load_agent_msgs(EVAL_AGENT_MSGS) or MOCK_AGENT_MSGS
     held_ph = reg.phrasings("heldout")
-    cards = []
-    for i, c in enumerate(reg.cards("heldout")):
-        cards.append(c)
-        for k in range(len(held_ph)):
-            fc = reg.phrase(c, held_ph[(i + k) % len(held_ph)])
-            if fc:
-                cards.append(fc)
-                break
-    cards += [reg.card("moth"), reg.card("blank")]
+    langs = list(getattr(C, "LANGS", {"en": 1.0})) if multilingual else ["en"]
     specs = []
-    langs = list(getattr(C, "LANGS", {})) if multilingual else []
-    for j, c in enumerate(cards):
-        base = c
-        for k in range(per_card):
-            scen = SCENARIOS[(j + k) % len(SCENARIOS)]
-            if langs:   # per-language slices: languages cycle over the chat specs (probes stay English)
-                c = {**base, "lang": langs[(j * per_card + k) % len(langs)]}
-            s = stable_seed(f"rl:{c['id']}:{scen}", k)
-            specs.append(make_spec(c, scen, random.Random(s + seed), s, agent))
-        for _, name, lines, check in CARD_PROBES:
-            specs.append(script_spec(base, name, lines, check, stable_seed(f"rl:{base['id']}:{name}", 0)))
+
+    def chat(c, scen, lang, k):
+        c = {**c, "lang": lang}
+        s = stable_seed(f"rl:{c['id']}:{scen}:{lang}", k)
+        specs.append(make_spec(c, scen, random.Random(s + seed), s, agent))
+
+    def probe(c, which):
+        _, name, lines, check = CARD_PROBES[which % len(CARD_PROBES)]
+        specs.append(script_spec(c, name, lines, check, stable_seed(f"rl:{c['id']}:{name}", 0)))
+
+    for i, c in enumerate(reg.cards("heldout")):
+        phrased = None
+        for k in range(len(held_ph)):
+            phrased = reg.phrase(c, held_ph[(i + k) % len(held_ph)])
+            if phrased:
+                break
+        for li, lang in enumerate(langs):
+            form = phrased if (li % 2 == 1 and phrased) else c
+            chat(form, SCENARIOS[(i + li) % len(SCENARIOS)], lang, 0)
+        probe(c, i)
+    moth, blank = reg.card("moth"), reg.card("blank")
+    for lang in langs:
+        for k in range(MOTH_CHATS_PER_LANG):
+            chat(moth, "agent" if k % 3 != 2 else ("talk", "recall")[(k // 3) % 2], lang, k)
+        for k in range(BLANK_CHATS_PER_LANG):
+            chat(blank, SCENARIOS[k % len(SCENARIOS)], lang, k)
+    for w in range(len(CARD_PROBES)):
+        probe(moth, w)
+    probe(blank, 0)
     ids = [s["id"] for s in specs]
     assert len(ids) == len(set(ids)), "eval spec ids must be unique"
     return specs
 
 
-def freeze(version: str, reg: Registry | None = None, root: str = POOL_DIR, per_card: int = 5) -> str:
+def freeze(version: str, reg: Registry | None = None, root: str = POOL_DIR, per_card: int | None = None) -> str:
     path = eval_path(version, root)
     if os.path.exists(path):
         raise FileExistsError(f"{path} exists: frozen eval sets are never overwritten; pick a new version")
@@ -461,12 +489,15 @@ def teacher_lines(ask, n: int, avoid: set[str]) -> list[str]:
     return [" ".join(str(x).split()) for x in xs if isinstance(x, str) and 3 <= len(str(x)) <= 200]
 
 
-def add_teacher_batch(reg: Registry, ask, n: int, source: str = "teacher") -> list[dict]:
-    avoid = C.EVAL_FRIEND_NAMES | HELD_NAMES
+def add_teacher_batch(reg: Registry, ask, n: int, source: str = "teacher", heldout: bool = False) -> list[dict]:
+    """heldout=True: an eval-growth batch, pinned to the held-out pool (and asked to avoid every training name)."""
+    avoid = set(C.EVAL_FRIEND_NAMES | HELD_NAMES)
+    if heldout:
+        avoid |= {(c.get("name") or "").lower() for c in reg.cards("train") if c.get("name")}
     out = []
     for line in teacher_lines(ask, n, avoid):
         try:
-            c = reg.add_line(line, source)
+            c = reg.add_line(line, source, heldout)
         except ValueError:
             continue
         if c:
@@ -485,11 +516,13 @@ def main(argv=None):
     a_add.add_argument("--teacher", type=int, default=0, help="ask the teacher for N one-line cards")
     a_add.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
     a_add.add_argument("--model", default=None)
+    a_add.add_argument("--heldout", action="store_true", help="pin to the held-out (eval) pool")
     a_ph = sub.add_parser("add-phrasing")
     a_ph.add_argument("tmpl")
+    a_ph.add_argument("--heldout", action="store_true", help="pin to the held-out (eval) phrasings")
     a_fr = sub.add_parser("freeze")
     a_fr.add_argument("version")
-    a_fr.add_argument("--per-card", type=int, default=5)
+    a_fr.add_argument("--per-card", type=int, default=None, help="(unused since v5: one chat per card per language)")
     a = ap.parse_args(argv)
     reg = Registry(a.root)
     if a.cmd == "list":
@@ -503,24 +536,24 @@ def main(argv=None):
     if a.cmd == "add":
         added = []
         for line in a.line:
-            c = reg.add_line(line)
+            c = reg.add_line(line, heldout=a.heldout)
             added.append(c)
         if a.file:
             d = json.load(open(a.file, encoding="utf-8"))
             for c in d if isinstance(d, list) else [d]:
-                added.append(reg.add_card(c, "file"))
+                added.append(reg.add_card(c, "file", a.heldout))
         if a.teacher:
             from moth.rl.llm import OAIClient
             cl = OAIClient(a.base_url, a.model)
             added += add_teacher_batch(reg, lambda p: cl.chat([{"role": "user", "content": p}], temperature=1.0,
                                                               max_tokens=60 * a.teacher + 200,
                                                               chat_template_kwargs={"enable_thinking": False})["text"],
-                                       a.teacher)
+                                       a.teacher, heldout=a.heldout)
         for c in added:
             print("skipped (already known)" if c is None else f"{c['id']} {c['split']}: {C.describe(c)}")
         return
     if a.cmd == "add-phrasing":
-        p = reg.add_phrasing(a.tmpl)
+        p = reg.add_phrasing(a.tmpl, heldout=a.heldout)
         print("skipped (already known)" if p is None else f"{p['id']} {p['split']}: {p['tmpl']}")
         return
     if a.cmd == "freeze":

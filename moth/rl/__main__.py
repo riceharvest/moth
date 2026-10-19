@@ -58,7 +58,7 @@ def build_moth(a):
                             pool_file=os.path.join(ROOT, "moth/file_pool.json"), device=a.device, temperature=0.7,
                             top_p=0.95, rep_penalty=1.3, ctx_budget=None, max_turn_tokens=200, max_tool_rounds=3,
                             home=os.path.join(a.out or tempfile.mkdtemp(prefix="moth-rl-"), "home"), seed=0)
-    return MothPolicy(Moth(ns))
+    return MothPolicy(Moth(ns), legacy_prompt=getattr(a, "legacy_prompt", False))
 
 
 def make_judge(kind: str, url: str, model: str | None, cache: JudgeCache, role: str):
@@ -147,17 +147,34 @@ def main(argv=None):
     r.add_argument("--mock", action="store_true")
     e = sub.add_parser("eval")
     common(e)
-    e.add_argument("--version", default="v4")
+    e.add_argument("--version", default="v5")
+    e.add_argument("--tier", choices=["quick", "full"], default="quick",
+                   help="quick: ~2k replies, en-heavy (checkpoint picking); full: >=10k, >=2k per language, gates")
+    e.add_argument("--ref-final2", default=None, help="results.json of final2 on the same eval/tier (release gate)")
+    e.add_argument("--ref-sft", default=None, help="results.json of the SFT checkpoint on the same eval/tier (gate)")
+    e.add_argument("--bootstrap", type=int, default=0, help="chat-level cluster bootstrap resamples (headline rows)")
+    e.add_argument("--legacy-prompt", action="store_true", help="--moth-model is final2 (tools-era system prompt)")
+    e.add_argument("--monitor", default=None, help="reward-hacking monitor log (JSONL); needs --step")
+    e.add_argument("--step", type=int, default=None, help="RL step of this checkpoint (for --monitor)")
+    e.add_argument("--monitor-rise", type=float, default=0.15)
     e.add_argument("--mock", action="store_true")
     e.add_argument("--ref", default=None)
     e.add_argument("--limit", type=int, default=None)
     e.add_argument("--label", default=None)
-    e.add_argument("--replies", type=int, default=3000, help="run passes over the frozen set until this many replies")
+    e.add_argument("--replies", type=int, default=None, help="override the tier's reply target")
     e.add_argument("--eval-judge-url", default=None, help="eval-only judge (headline), not the reward judge")
     e.add_argument("--eval-judge-model", default=None)
     e.add_argument("--eval-judge-kind", choices=["generative", "forward"], default="generative")
     e.add_argument("--no-reward-judge", action="store_true", help="skip the reward-judge agreement section")
     e.add_argument("--gold", default=None, help="frozen human/Claude-labelled JSONL: each judge's agreement")
+    gs = sub.add_parser("gold-sheet", help="600-reply labelling sheet: half random, half stratified")
+    gs.add_argument("--inputs", nargs="+", required=True, help="episodes.json (eval/run) and/or labelled_replies.jsonl")
+    gs.add_argument("--out", required=True)
+    gs.add_argument("--n", type=int, default=600)
+    gs.add_argument("--seed", type=int, default=0)
+    pl = sub.add_parser("plan", help="MDE table for planned eval sizes")
+    pl.add_argument("--deff", type=float, default=1.5, help="design effect (eval reports measure it)")
+    pl.add_argument("--replies", type=int, nargs="+", default=[2000, 10000])
     c = sub.add_parser("cost")
     c.add_argument("--meter", required=True)
     c.add_argument("--episodes", type=int, required=True)
@@ -176,6 +193,24 @@ def main(argv=None):
         print(json.dumps(box_hours(per, a.episodes, tps, a.price, a.box), indent=1))
         return
 
+    if a.cmd == "gold-sheet":
+        from moth.rl.gold import build_sheet, load_items, write_sheet
+        rows = build_sheet(load_items(a.inputs), a.n, a.seed)
+        write_sheet(rows, a.out)
+        import collections as _c
+        print(f"{a.out}: {len(rows)} replies", dict(_c.Counter(r["stratum"] for r in rows)),
+              dict(_c.Counter(r["lang"] for r in rows)))
+        return
+
+    if a.cmd == "plan":
+        from moth.rl.stats import plan
+        rates = {"on_gist": 0.85, "self": 0.01, "specific": 0.8, "assistant": 0.02, "repeat": 0.1}
+        print(f"MDE in points (two evals of n replies each, alpha 0.05, power 0.8, deff {a.deff})")
+        print("| replies | " + " | ".join(f"{k} (p={v})" for k, v in rates.items()) + " |")
+        for n in a.replies:
+            print(f"| {n} | " + " | ".join(str(plan(v, a.deff, n)) for v in rates.values()) + " |")
+        return
+
     if a.cmd == "eval":
         from moth.rl.evalrun import run_eval
         label = a.label or a.policy_model or a.moth_model or ("mock-" + a.policy)
@@ -187,8 +222,14 @@ def main(argv=None):
             cl = OAIClient(a.eval_judge_url, a.eval_judge_model)
             pair_ask = lambda p: cl.chat([{"role": "user", "content": p}], temperature=0, max_tokens=300,  # noqa: E731
                                          chat_template_kwargs={"enable_thinking": False})["text"]
+        refs = {k: v for k, v in (("final2", a.ref_final2), ("sft", a.ref_sft)) if v}
         s = run_eval(a.version, policy_factory(a), sim, ej, a.out, a.ref, pair_ask, a.workers, limit=a.limit,
-                     label=label, replies=a.replies, reward_judge=None if a.no_reward_judge else judge, gold=a.gold)
+                     label=label, replies=a.replies, reward_judge=None if a.no_reward_judge else judge, gold=a.gold,
+                     tier=a.tier, refs=refs, bootstrap=a.bootstrap)
+        if a.monitor:
+            from moth.rl.monitor import HackMonitor
+            rec = HackMonitor(a.monitor, rise=a.monitor_rise).update(a.step if a.step is not None else -1, s)
+            print(("REWARD HACKING FLAG: " + "; ".join(rec["why"])) if rec["flag"] else f"monitor: ok {rec}")
         with open(os.path.join(a.out, "report.md"), encoding="utf-8") as f:
             print(f.read())
         write_json(os.path.join(a.out, "meter.json"), {"per_episode": s["cost_per_episode"]}, indent=1)

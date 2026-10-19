@@ -8,6 +8,9 @@
   adapters.py  verifiers-shaped MultiTurnEnv (optional import) and a plain GRPO rollout function
   evalrun.py   eval on a frozen held-out set (+ pairwise vs a reference)
   llm.py       stdlib OpenAI-compatible client, cost meter, box-hours
+  stats.py     cluster-aware rates (deff-adjusted Wilson, bootstrap), MDE, planning
+  monitor.py   reward-hacking monitor (reward judge vs eval judge on the quick eval)
+  gold.py      600-reply labelling sheet (random + stratified) and per-stratum judge agreement
   tiny_agent_bridge.py  TinyAgentPolicy (exact tokens + logp per turn), episode -> tiny-agent tokens/weights
   README.md    "plugging into tiny-agent GRPO": the exact call shapes
 

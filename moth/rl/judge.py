@@ -342,12 +342,14 @@ def load_gold(path: str) -> list[dict]:
             who = next((k for k in ("gold", "human", "claude") if isinstance(x.get(k), dict)), None)
             if who is None:
                 continue   # judge labels only: not gold
-            turns = [{"user": x["friend"], "events": [{"say": x["text"]}]}]
-            labels = [x[who]]
+            ctx = x.get("context") or []   # earlier turns of the chat (moth.rl.gold sheets): unlabelled
+            turns = [{"user": c["user"], "events": [{"say": c["say"]}]} for c in ctx]
+            turns.append({"user": x["friend"], "events": [{"say": x["text"]}]})
+            labels = [None] * len(ctx) + [x[who]]
         if len(labels) != len(turns):
             raise ValueError(f"{path}: {x.get('id')}: {len(labels)} labels for {len(turns)} replies")
         out.append({"id": x.get("id") or x.get("chat_id"), "card": card, "turns": turns, "labels": labels,
-                    "labeler": who})
+                    "labeler": who, "stratum": x.get("stratum")})
     return out
 
 
@@ -371,6 +373,8 @@ def agreement(judge: Judge, gold: list[dict], meter: CostMeter | None = None) ->
             failed += 1
             continue
         for lj, lg in zip(labs, g["labels"]):
+            if lg is None:   # context reply without a gold label
+                continue
             for f in pairs:
                 if f in lg and f in lj:
                     pairs[f].append((bool(lj[f]), bool(lg[f])))

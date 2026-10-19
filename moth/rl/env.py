@@ -78,11 +78,17 @@ class MothPolicy:
     replies, so the format reward's uppercase check is constant through this policy. Stateful (one chat at a time):
     give each worker thread its own (a policy factory)."""
 
-    def __init__(self, moth):
-        self.moth = moth
+    def __init__(self, moth, legacy_prompt: bool = False):
+        """legacy_prompt: the released round-3 tools model (final2) was trained on cards.student_system_v1; use it
+        so final2 can be a pairwise reference on the same frozen specs."""
+        self.moth, self.legacy = moth, legacy_prompt
 
     def start(self, spec):
-        self.moth.system = spec["system"]
+        if self.legacy:
+            from moth.cards import student_system_v1
+            self.moth.system = student_system_v1(spec["card"])
+        else:
+            self.moth.system = spec["system"]
         self.moth.reset()
 
     def generate(self, messages):

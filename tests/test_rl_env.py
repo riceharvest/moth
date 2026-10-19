@@ -3,6 +3,7 @@ episodes, groups, adapters, eval runner, cost meter. CPU only, no endpoint (one 
 
   python -m pytest tests/test_rl_env.py -q      (or: python tests/test_rl_env.py)
 """
+import collections
 import contextlib
 import io
 import json
@@ -55,14 +56,15 @@ def test_builtins_are_pinned_and_bucket_is_stable():
 
 def test_appended_cards_split_by_hash_and_never_move():
     reg = tmp_reg()
-    first = [reg.add_line(f"you are a frog named zz{i}") for i in range(40)]
+    nm = lambda i, p: p + "abcdefghijklmnopqrstuvwxyz"[i % 26] + "aeiou"[i // 26]  # noqa: E731  distinct letter names
+    first = [reg.add_line(f"you are a frog named {nm(i, 'zz')}") for i in range(40)]
     assert all(c["split"] == registry.card_split({k: v for k, v in c.items() if k != "split"}) for c in first)
     before = {c["id"]: c["split"] for c in first}
     for i in range(40):
-        reg.add_line(f"you're a teapot called qq{i}")
+        reg.add_line(f"you're a teapot called {nm(i, 'qq')}")
     reg2 = registry.Registry(reg.root)   # a fresh load of the same files
     assert {c["id"]: reg2.card(c["id"])["split"] for c in first} == before
-    assert reg.add_line("you are a frog named zz0") is None   # same line = same id: not added twice
+    assert reg.add_line(f"you are a frog named {nm(0, 'zz')}") is None   # same line = same id: not added twice
     assert sum(1 for line in open(reg.cards_path, encoding="utf-8") if line.strip()) == 80
 
 
@@ -567,7 +569,7 @@ def test_eval_runner_judges_cis_passes_and_pairwise():
     assert any("too noisy" in w for w in s["warnings"])   # < 3000 replies
     rj = s["reward_judge_vs_eval_judge"]
     assert rj["judge"] == "mock-judge" and rj["on"]["n"] > 0 and rj["on"]["kappa"] == 1.0   # same heuristic
-    assert {p["sample"] for p in llm.read_json(os.path.join(out_g, "pairwise.json"))} == {0}   # ref ran 1 pass
+    assert {p["sample"] for p in llm.read_json(os.path.join(out_g, "pairwise_ref.json"))} == {0}   # ref ran 1 pass
     recs = llm.read_json(os.path.join(out_g, "results.json"))
     assert {"cat", "name", "seed", "sample", "card_id", "turns"} <= set(recs[0])
     assert len({r["sample"] for r in recs}) == s["passes"]
@@ -607,6 +609,142 @@ def test_gold_agreement():
                    + json.dumps({"card": {}, "friend": "x", "text": "y", "labels": {}}) + "\n")
     g2 = J.load_gold(gold)
     assert len(g2) == 1 and g2[0]["labeler"] == "human" and g2[0]["card"]["lang"] == "es"
+
+
+# --- eval sizing: cluster stats, tiers, gates, monitor, gold sheet ---------------------------------------------------
+def test_cluster_stats_and_mde():
+    from moth.rl import stats
+    flat = stats.cluster_rate([1, 0] * 500, [1] * 1000)   # 1000 independent replies
+    clumped = stats.cluster_rate([5, 0] * 100, [5] * 200)   # same rate, all-or-nothing chats
+    assert flat["pct"] == clumped["pct"] == 50.0
+    assert flat["deff"] == pytest.approx(1.0, abs=0.01) and clumped["deff"] > 4 and clumped["hi"] - clumped["lo"] > 2 * (flat["hi"] - flat["lo"])
+    assert clumped["mde"] > flat["mde"] and clumped["n_eff"] < 250
+    lo, hi = stats.cluster_bootstrap([5, 0] * 100, [5] * 200, B=300)
+    assert lo < 50 < hi and hi - lo > 10
+    assert stats.plan(0.85, 1.5, 10000) <= 3.0 and stats.plan(0.85, 1.5, 2000) <= 5.0   # the full-tier targets
+    assert stats.cluster_rate([0] * 50, [3] * 50)["mde"] > 0   # a rate at 0 still has an MDE (1% floor)
+    w = stats.win_rate(600, 100, 300)
+    assert w["pct"] == 65.0 and w["lo"] > 50 and w["n"] == 1000
+
+
+def test_eval_tiers_and_release_gates():
+    reg = tmp_reg()
+    for i in range(6):   # a few more held-out cards so languages have something to slice
+        reg.add_card({"name": f"q{'abcdef'[i]}x", "kind": "a moon rock"}, heldout=True)
+    registry.freeze("t5", reg, reg.root)
+    doc = registry.load_eval("t5", reg.root)
+    quick = evalrun.tier_specs(doc["specs"], "quick")
+    qids = {s["id"] for s in quick}
+    assert all(s["id"] in qids for s in doc["specs"] if s["lang"] == "en" or s["card_id"] == "moth")
+    other = [s for s in doc["specs"] if s["lang"] != "en" and s["card_id"] != "moth"]
+    assert 0 < sum(s["id"] in qids for s in other) < len(other) / 2   # en-heavy: a quarter of the rest
+    sim = MockSimulator()
+    out_ref = tempfile.mkdtemp()
+    evalrun.run_eval("t5", lambda: env.MockPolicy("bland"), sim, eval_judge(), out_ref, root=reg.root, tier="full",
+                     replies=400, per_lang=60)
+    s = evalrun.run_eval("t5", lambda: env.MockPolicy(), sim, eval_judge(), tempfile.mkdtemp(), root=reg.root,
+                         tier="full", replies=400, per_lang=60, refs={"final2": os.path.join(out_ref, "results.json")})
+    langs = {lg: b["replies"] for lg, b in s["by_lang"].items()}
+    assert set(langs) == {"en", "zh", "es", "fr", "hi"} and min(langs.values()) >= 60
+    assert s["moth"]["episodes"] > 0 and s["moth_agent"]["episodes"] > 0
+    names = {g["name"]: g for g in s["gates"]}
+    assert set(names) == {"MDE on_gist overall", "MDE on_gist per language", "pairwise vs final2"}
+    assert not names["pairwise vs final2"]["pass"] and "need 1000" in names["pairwise vs final2"]["why"]   # too few
+    assert s["pairwise"]["final2"]["win_rate"]["pct"] > 50   # the specific policy beats the bland one
+    rep_md = open(os.path.join(out_ref, "report.md"), encoding="utf-8").read()
+    assert "MDE (points" in rep_md and "moth card, agent reactions" in rep_md
+
+
+def test_reward_hacking_monitor():
+    from moth.rl.monitor import HackMonitor
+
+    def summ(rew, og, vf=None):
+        s = {"reward_judge_vs_eval_judge": {"reward": {"mean": rew}}, "all": {"on_gist": {"pct": og, "mde": 2.0},
+                                                                                "reward": {"mean": rew}}}
+        if vf is not None:
+            s["pairwise"] = {"final2": {"win_rate": {"pct": vf, "mde": 4.0}}}
+        return s
+    path = os.path.join(tempfile.mkdtemp(), "mon.jsonl")
+    m = HackMonitor(path, rise=0.15, window=3)
+    assert not m.update(0, summ(0.10, 80.0, 50.0))["flag"]
+    assert not m.update(1, summ(0.20, 83.0, 55.0))["flag"]   # both rise: fine
+    r = m.update(2, summ(0.40, 80.5, 49.0))   # reward +0.30 over the window, on_gist flat, vs final2 down
+    assert r["flag"] and len(r["why"]) == 2
+    assert len(HackMonitor(path).hist) == 3   # append-only log, reloads
+
+
+def test_gold_sheet_stratified_and_per_stratum_agreement():
+    from moth.rl import gold as G
+    from moth.rl import judge as J
+    reg = tmp_reg()
+    registry.freeze("g", reg, reg.root)
+    out = tempfile.mkdtemp()
+    k = {"i": 0}
+
+    def mixed(msgs):
+        k["i"] += 1
+        return ["i'm just a little moth. lamps!", "oh no, the tea! was the cat sorry?", "haha nice"][k["i"] % 3]
+    evalrun.run_eval("g", lambda: env.FnPolicy(mixed), MockSimulator(), eval_judge(), out, root=reg.root, replies=1500)
+    items = G.load_items([os.path.join(out, "episodes.json")])
+    rows = G.build_sheet(items, n=600, seed=1)
+    assert len(rows) == 600 and sum(r["stratum"] == "random" for r in rows) == 300
+    strat = [r for r in rows if r["stratum"] == "stratified"]
+    by_lang = collections.Counter(r["lang"] for r in strat)
+    assert all(by_lang[lg] >= 60 for lg in ("en", "zh", "es", "fr", "hi"))
+    assert sum(bool(r["reasons"]) for r in strat) > sum(bool(r["reasons"]) for r in rows if r["stratum"] == "random")
+    path = os.path.join(out, "sheet.jsonl")
+    G.write_sheet(rows, path)
+    assert os.path.exists(path[:-6] + ".csv")
+    filled = []   # a "labeller" fills the human column for 40 random + 40 stratified rows
+    for r in [x for x in rows if x["stratum"] == "random"][:40] + strat[:40]:
+        r = dict(r)
+        r["human"] = {"on": "lamps" not in r["text"], "self": "moth" in r["text"], "specific": "tea" in r["text"]}
+        filled.append(r)
+    llm.write_text(path, "\n".join(json.dumps(x) for x in filled + rows[100:110]) + "\n")   # unfilled rows skipped
+    g = J.load_gold(path)
+    assert len(g) == 80 and {x["stratum"] for x in g} == {"random", "stratified"}
+    a = G.agreement_by_stratum(MockJudge(), g)
+    assert set(a) == {"random", "stratified"}
+    for st in a.values():
+        assert st["on"]["n"] == 40 and st["on"]["acc"]["lo"] <= st["on"]["acc"]["pct"] <= st["on"]["acc"]["hi"]
+
+
+def test_heldout_growth_pins_and_v5_breadth():
+    reg = tmp_reg()
+    c = reg.add_line("you are a velvet armchair named sofonisba", heldout=True)
+    assert c["split"] == "heldout"
+    assert registry.Registry(reg.root).card(c["id"])["split"] == "heldout"   # the pin survives a reload
+    with pytest.raises(ValueError):
+        reg.add_line("you are a teapot named miso", heldout=True)   # a training card's name
+    p = reg.add_phrasing("hey {name}, you're {kind} today.", heldout=True)
+    assert p["split"] == "heldout"
+    later = reg.add_line("you are a bus named sofonisba")   # a held-out name: pinned held-out, never trains
+    assert later["split"] == "heldout"
+    ask = lambda prompt: '["you are a grumpy lamp post named lucius.", "You are Zelda, a clockwork owl."]'  # noqa: E731
+    got = registry.add_teacher_batch(reg, ask, 2, heldout=True)
+    assert [x["split"] for x in got] == ["heldout", "heldout"]
+    doc = registry.load_eval("v5")   # the committed release-size set
+    base = collections.defaultdict(set)
+    for sp in doc["specs"]:
+        base[sp["card_id"].split("~")[0]].add(sp.get("lang"))
+    held = [b for b in base if b not in ("moth", "blank")]
+    assert len(held) >= 100 and all(len(base[b]) == 5 for b in held)
+    assert len({sp["card"].get("phrasing_id") for sp in doc["specs"] if sp["card"].get("phrasing_id")}) >= 20
+    moth_chats = [sp for sp in doc["specs"] if sp["card_id"] == "moth" and sp["scenario"] != "script"]
+    assert len(moth_chats) >= 40 and sum(sp["scenario"] == "agent" for sp in moth_chats) >= 20
+
+
+def test_moth_policy_legacy_prompt_for_final2():
+    class FakeMoth:
+        def __init__(self):
+            self.system = None
+
+        def reset(self):
+            pass
+    fm = FakeMoth()
+    spec = spec_of("talk", seed=1)
+    env.MothPolicy(fm, legacy_prompt=True).start(spec)
+    assert fm.system == C.student_system_v1(spec["card"]) and "Tools:" in fm.system
 
 
 # --- endpoints, cost# --- endpoints, cost ------------------------------------------------------------------------------------------------

@@ -6,8 +6,8 @@ a reward vector plus a weighted scalar. Module map: `__init__.py`. Reward defini
 
 ```
 python -m moth.rl mock --episodes 3                         # the whole loop on CPU, no endpoint
-python -m moth.rl.registry add --line "you are a cat named bo"   # grow the card pool; freeze v5 when it has grown
-python -m moth.rl eval --version v4 --moth-model runs/x/model --sim-url URL --eval-judge-url EVAL_URL [--judge-url REWARD_URL] [--ref A/results.json]
+python -m moth.rl.registry add --line "you are a cat named bo"   # grow the card pool; freeze v6 when it has grown
+python -m moth.rl eval --tier quick --moth-model runs/x/model --sim-url URL --eval-judge-url EVAL_URL [--judge-url REWARD_URL] [--ref A/results.json]
 python -m pytest -q tests/test_rl_env.py
 ```
 
@@ -27,20 +27,43 @@ python -m pytest -q tests/test_rl_env.py
     only appears as an agreement table against it; `run_eval` refuses the same model in both slots.
   - `--gold labels.jsonl` (hand/Claude labels, chat- or reply-level, see `judge.py`) reports each judge's accuracy
     and kappa.
-- **Eval size:** `--replies 3000` (the default) runs passes over the frozen set, re-seeding each pass, until there are
-  that many replies; a 1% identity rate is then about 30 events. Every rate has a 95% Wilson interval, and the reward
-  mean has a normal interval. The simulator runs at temperature 0 by default (training: 1.0).
+- **Eval tiers** (`--tier`, `evalrun.TIERS`), on the frozen `eval_v5`:
+  - `quick` is for picking checkpoints during RL, every N steps: about 2k replies, en-heavy (the moth card, every
+    English spec and a quarter of the rest).
+  - `full` is for milestones and the release: at least 10k replies AND at least 2k per language (passes over the
+    frozen set re-seed until both hold).
+  - `full` gates: on_gist MDE ≤ 3 points overall and ≤ 5 per language; pairwise vs final2 (`--ref-final2`, final2 run
+    with `--legacy-prompt`) and vs the SFT checkpoint (`--ref-sft`) need ≥ 1000 pairs each and a win-rate interval
+    above 50%.
+- **Statistics** (`stats.py`): a chat is the unit.
+  - Every rate has a design-effect-adjusted Wilson 95% interval, its deff, and its MDE: the smallest difference vs
+    another eval of the same size detectable at alpha 0.05 and power 0.8.
+  - `--bootstrap B` adds a chat-level cluster bootstrap for the headline rows.
+  - `python -m moth.rl plan --deff D` prints the MDE table for planned sizes.
+- **Report rows:** ALL, held-out cards, the moth card (the shipped default) and its agent reactions (the headline
+  slice), then scenario, card group and language.
+- **Reward-hacking monitor:** `--monitor runs/x/hack.jsonl --step N` on the quick eval logs the reward judge's reward
+  next to the eval judge's on_gist and the win rate vs final2. It flags when the reward rises by ≥ `--monitor-rise`
+  over 3 evals while those stay flat (within their MDE) or fall (`monitor.py`).
+- **Gold set:** `python -m moth.rl gold-sheet --inputs <episodes.json | labelled_replies.jsonl> --out sheet.jsonl`
+  writes 600 replies (+ a .csv): 300 random and 300 stratified.
+  - Stratified means identity-suspect (matcher or any judge's self), borderline gist (judges disagree, or a
+    forward-pass P near 0.5), and at least 60 per language.
+  - Fill the `human` column, then pass `--gold sheet.jsonl`. Each judge's accuracy is reported with intervals on the
+    random and the stratified half separately.
 - **Languages:** cards and specs carry `lang` (core `cards.LANGS`: en/zh/es/fr/hi).
   - The simulator writes in it.
   - The format check forbids capitals only in cased scripts.
   - The assistant phrases are per language.
   - Length counts CJK by characters.
-  - The eval report has a slice per language.
 - **Frozen sets:**
-  - `eval_v4` is current: 216 specs, each held-out card chatting once in every language; the who-are-you probes
-    stay English.
-  - `eval_v3` is English only.
-  - `eval_v1`/`v2` are legacy: frozen under the old tools/home spec, kept untouched, and their home specs are skipped.
+  - `eval_v5` is current: 962 specs.
+    - All 135 held-out base cards (≥ 100; grown with `registry add --heldout`, which pins eval-growth batches to the
+      held-out pool, teacher batches included) chat once in every language, half of them in one of the 22 held-out
+      phrasings, plus one English who-are-you probe each.
+    - The moth card has 30 chats per language, 2/3 of them agent reactions.
+  - `eval_v4` (multilingual) and `eval_v3` (English) are the earlier small sets.
+  - `eval_v1`/`v2` are legacy (tools/home era).
 
 ## Plugging into tiny-agent GRPO
 
@@ -129,7 +152,8 @@ Differences from the task-GRPO path:
   - `signed_rebalance` and segment flags: a pure chatbot makes no tool calls.
   - `base_reward`.
 - **Staleness:** keep `roller.version` in the policy's extras and drop groups older than `--max_stale`, as before.
-- **Eval every N steps:** `moth.rl.evalrun.run_eval("v4", lambda: TinyAgentPolicy(model, tok), sim0, eval_judge, out, reward_judge=judge)`,
+- **Eval every N steps:** `s = moth.rl.evalrun.run_eval("v5", lambda: TinyAgentPolicy(model, tok), sim0, eval_judge,
+  out, reward_judge=judge, tier="quick", refs={"final2": F2})`, then `HackMonitor(log).update(step, s)`,
   where `sim0` is an `LLMSimulator` at temperature 0. Report `summary["heldout"]`; pairwise against the previous
   checkpoint goes through `ref=`.
 - **Cost:** `meter.per_episode()`, then `python -m moth.rl cost` with the measured tok/s and the box price.
