@@ -477,7 +477,10 @@ def cmd_decide(argv):
                 state = DECIDE_STATE.format(who=describe(it["card"] or MOTH_CARD), chat=it["chat"],
                                             language="" if lang == "en" else f"(The chat is in {LANG_NAMES[lang]}.)\n")
                 qs = [(k, w) for k in range(1, it["n"] + 1) for w in ("on", "self")]
-                ps = await asyncio.gather(*(one(state, DECIDE_Q[w].format(k=k)) for k, w in qs))
+                # one request first: its prefill puts the chat (the shared state) in the prefix cache; the other 2n-1
+                # then only prefill their question (vLLM doesn't share a prefix that is still being prefilled)
+                first = await one(state, DECIDE_Q[qs[0][1]].format(k=qs[0][0]))
+                ps = [first] + list(await asyncio.gather(*(one(state, DECIDE_Q[w].format(k=k)) for k, w in qs[1:])))
                 if any(p is None for p in ps):
                     labs = None
                 else:
