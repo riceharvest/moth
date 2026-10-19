@@ -217,29 +217,123 @@ def main(argv=None):
             for t in tags:
                 R.append(f"- {t}: " + "; ".join(f"{j}: {Q[t]['gen'][j]['cut_reasons']}" for j in judges))
 
-    # judge agreement
-    if len(judges) >= 2:
-        j1, j2 = judges[:2]
-        R += ["", f"## Judge agreement ({j1} vs {j2}, per reply, both sources)", "",
-              "| teacher | replies | on agree | on kappa | self agree | self kappa | on: j1 only / j2 only | self: j1 only / j2 only |",
-              "|---|---|---|---|---|---|---|---|"]
-        for t in tags + ["ALL"]:
-            A_on, B_on, A_s, B_s = [], [], [], []
-            for k, la in L[j1].items():
-                if (t != "ALL" and k[0] != t) or k not in L[j2] or len(L[j2][k]) != len(la):
-                    continue
-                for x, y in zip(la, L[j2][k]):
-                    A_on.append(x["on"])
-                    B_on.append(y["on"])
-                    A_s.append(x["self"])
-                    B_s.append(y["self"])
-            n = len(A_on)
-            if not n:
+    LANG = {(t, "gen", str(d["seed"])): (d.get("lang") or (d.get("card") or {}).get("lang") or "en")
+            for t in tags for d in dialogs[t]}
+
+    # judge agreement: every pair of judges, per reply, both sources
+    def aligned(ja, jb, t="ALL", lang=None):
+        A, Bv = [], []
+        for k, la in L[ja].items():
+            if (t != "ALL" and k[0] != t) or k not in L[jb] or len(L[jb][k]) != len(la):
                 continue
-            R.append(f"| {t} | {n} | {pct(sum(x == y for x, y in zip(A_on, B_on)) / n)} | {num(kappa(A_on, B_on), 2)} | "
-                     f"{pct(sum(x == y for x, y in zip(A_s, B_s)) / n)} | {num(kappa(A_s, B_s), 2)} | "
-                     f"{sum(x and not y for x, y in zip(A_on, B_on))}/{sum(y and not x for x, y in zip(A_on, B_on))} | "
-                     f"{sum(x and not y for x, y in zip(A_s, B_s))}/{sum(y and not x for x, y in zip(A_s, B_s))} |")
+            if lang is not None and LANG.get(k, "en") != lang:
+                continue
+            A += la
+            Bv += L[jb][k]
+        return A, Bv
+    if len(judges) >= 2:
+        R += ["", "## Judge agreement (per reply, all teachers, both sources)", "",
+              "| judge A | judge B | replies | on agree | on kappa | self agree | self kappa | on: A only / B only | self: A only / B only |",
+              "|---|---|---|---|---|---|---|---|---|"]
+        for x in range(len(judges)):
+            for y in range(x + 1, len(judges)):
+                A, Bv = aligned(judges[x], judges[y])
+                n = len(A)
+                if not n:
+                    continue
+                ao, bo = [u["on"] for u in A], [u["on"] for u in Bv]
+                asf, bsf = [u["self"] for u in A], [u["self"] for u in Bv]
+                R.append(f"| {judges[x]} | {judges[y]} | {n} | {pct(sum(p == q for p, q in zip(ao, bo)) / n)} | "
+                         f"{num(kappa(ao, bo), 2)} | {pct(sum(p == q for p, q in zip(asf, bsf)) / n)} | {num(kappa(asf, bsf), 2)} | "
+                         f"{sum(p and not q for p, q in zip(ao, bo))}/{sum(q and not p for p, q in zip(ao, bo))} | "
+                         f"{sum(p and not q for p, q in zip(asf, bsf))}/{sum(q and not p for p, q in zip(asf, bsf))} |")
+
+    # decision judges: calibration of p_on / p_self against each generative judge's labels
+    deciders = [j for j in judges if any("p_on" in (lb[0] if lb else {}) for lb in L[j].values())]
+    gens = [j for j in judges if j not in deciders]
+    if deciders:
+        R += ["", "## Decision judges: calibration against the generative labels", "",
+              "Brier score and expected calibration error (10 bins) of the decision probability, taking a generative judge's "
+              "label as the truth; AUC = how well the probability ranks that judge's yes above its no.", "",
+              "| decider | reference | field | n | base rate (ref) | mean p | Brier | ECE | AUC |", "|---|---|---|---|---|---|---|---|---|"]
+        for dj in deciders:
+            for gj in gens:
+                A, Bv = aligned(dj, gj)
+                for fld, pk in (("on", "p_on"), ("self", "p_self")):
+                    ps = [u[pk] for u in A]
+                    ys = [1.0 if v[fld] else 0.0 for v in Bv]
+                    if not ps:
+                        continue
+                    n = len(ps)
+                    brier = sum((p - y) ** 2 for p, y in zip(ps, ys)) / n
+                    ece = 0.0
+                    for b in range(10):
+                        idx = [i for i, p in enumerate(ps) if b / 10 <= p < (b + 1) / 10 or (b == 9 and p == 1.0)]
+                        if idx:
+                            ece += len(idx) / n * abs(sum(ps[i] for i in idx) / len(idx) - sum(ys[i] for i in idx) / len(idx))
+                    pos = [p for p, y in zip(ps, ys) if y]
+                    neg = [p for p, y in zip(ps, ys) if not y]
+                    auc = None
+                    if pos and neg:
+                        allp = sorted((p, y) for p, y in zip(ps, ys))
+                        rank_sum, r = 0.0, 0
+                        i = 0
+                        while i < len(allp):   # mid-ranks for ties
+                            jj = i
+                            while jj < len(allp) and allp[jj][0] == allp[i][0]:
+                                jj += 1
+                            mid = (i + 1 + jj) / 2
+                            rank_sum += mid * sum(1 for q in allp[i:jj] if q[1])
+                            i = jj
+                        auc = (rank_sum - len(pos) * (len(pos) + 1) / 2) / (len(pos) * len(neg))
+                    R.append(f"| {dj} | {gj} | {fld} | {n} | {pct(sum(ys) / n)} | {pct(sum(ps) / n)} | {brier:.3f} | {ece:.3f} | "
+                             f"{num(auc, 3)} |")
+        R += ["", "Reliability (decider p_on in bins vs the reference's ON rate):", ""]
+        for dj in deciders:
+            for gj in gens:
+                A, Bv = aligned(dj, gj)
+                cells = []
+                for b in range(10):
+                    idx = [i for i, u in enumerate(A) if b / 10 <= u["p_on"] < (b + 1) / 10 or (b == 9 and u["p_on"] == 1.0)]
+                    if idx:
+                        cells.append(f"{b / 10:.1f}-{(b + 1) / 10:.1f}: n={len(idx)} ref ON {pct(sum(Bv[i]['on'] for i in idx) / len(idx), 0)}")
+                R.append(f"- {dj} vs {gj}: " + "; ".join(cells))
+
+    # label speed (generative label pass vs decision judges)
+    R += ["", "## Label speed on the box (same chats)", "", "| judge | chats | replies labelled | seconds | reply-labels/s | "
+          "reply-labels per box-hour | decisions/s | concurrency |", "|---|---|---|---|---|---|---|---|"]
+    for j in judges:
+        sp = os.path.join(a.bdir, f"labels_{j}.jsonl.speed.json")
+        if os.path.exists(sp):
+            x = json.load(open(sp))
+            rl = x.get("reply_labels_per_s")
+            R.append(f"| {j} | {x.get('chats')} | {x.get('replies', (x.get('decisions') or 0) // 2)} | {x.get('seconds')} | {rl} | "
+                     f"{num(rl * 3600 if rl else None)} | {x.get('decisions_per_s', '-')} | {x.get('concurrency')} |")
+    for sp in sorted(glob.glob(os.path.join(a.bdir, "bench_*.jsonl.speed.json"))):
+        x = json.load(open(sp))
+        R.append(f"| {x['judge']} (bench, old chats) | {x.get('chats')} | {(x.get('decisions') or 0) // 2} | {x.get('seconds')} | "
+                 f"{x.get('reply_labels_per_s')} | {num((x.get('reply_labels_per_s') or 0) * 3600)} | {x.get('decisions_per_s')} | "
+                 f"{x.get('concurrency')} |")
+    if any(j.startswith("gev") for j in judges):
+        R += ["", "GEV-26B (Gemma terms treat models trained on Gemma outputs as derivatives): eval / agreement only, never "
+              "a filter or a reward."]
+
+    # per language (own chats; replay is English only)
+    R += ["", "## Per language (own chats, quality seeds; every 4th chat is zh/es/fr/hi)", "",
+          "| teacher | lang | chats | replies | " + " | ".join(f"on {j} | self {j}" for j in judges) + " |",
+          "|" + "---|" * (4 + 2 * len(judges))]
+    for t in tags:
+        for lg in ("en", "zh", "es", "fr", "hi"):
+            ds = [d for d in dialogs[t] if (d.get("lang") or (d.get("card") or {}).get("lang") or "en") == lg]
+            if not ds:
+                continue
+            cells = []
+            for j in judges:
+                flat = [lb for d in ds for lb in (L[j].get((t, "gen", str(d["seed"]))) or [])]
+                cells.append(f"{pct(sum(x['on'] for x in flat) / len(flat)) if flat else '-'} | "
+                             f"{pct(sum(x['self'] for x in flat) / len(flat), 2) if flat else '-'}")
+            nrep = sum(sum(bool(m.get("content")) for m in d["messages"] if m["role"] == "assistant") for d in ds)
+            R.append(f"| {t} | {lg} | {len(ds)} | {nrep} | " + " | ".join(cells) + " |")
 
     # pairwise
     R += ["", "## Blind pairwise on the scripted replay (each pair judged twice, positions swapped; a win needs both)", "",
@@ -260,6 +354,7 @@ def main(argv=None):
     audit = ["# Label audit", "", "## self=true where the friend asked about identity or files/home", ""]
     dis = ["", "## judges disagree (sample)", ""]
     from moth.gist import ASKED
+    allf = open(os.path.join(out, "labelled_replies.jsonl"), "w")   # every labelled reply, for a hand-labelled eval set
     for t in tags:
         rng = random.Random(7)
         items = []
@@ -285,6 +380,12 @@ def main(argv=None):
         def lab(k, ri, j):
             x = L[j].get(k)
             return x[ri] if x and ri < len(x) else None
+        for k, ri, u, say, card, typ in items:
+            labs = {j: lab(k, ri, j) for j in judges}
+            if any(labs.values()):
+                allf.write(json.dumps({"teacher": t, "src": k[1], "chat_id": k[2], "reply": ri + 1, "type": typ,
+                                       "card_id": card.get("id"), "lang": LANG.get(k, "en"), "card": card,
+                                       "friend": u, "text": say, "labels": labs}, ensure_ascii=False) + "\n")
         S = [f"# {t}: 30 sampled replies (gen + replay), with both judges' labels", ""]
         for k, ri, u, say, card, typ in rng.sample(items, min(30, len(items))):
             ls = "; ".join(f"{j}: {'ON' if (lb := lab(k, ri, j)) and lb['on'] else 'OFF' if lb else '?'}"
@@ -303,6 +404,7 @@ def main(argv=None):
                     dis.append(f"- {t} {k[1]} R{ri + 1} friend: {u[:200]!r} -> {say!r} | " + " | ".join(
                         f"{j}: on={labs[j]['on']} self={labs[j]['self']} ({labs[j]['why']})" for j in judges))
     open(os.path.join(out, "label_audit.md"), "w").write("\n".join(audit + dis) + "\n")
+    allf.close()
     print("\n".join(R))
 
 
