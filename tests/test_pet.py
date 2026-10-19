@@ -1703,7 +1703,7 @@ class PetSkinTrayUpdateTest(unittest.TestCase):
         if not QSystemTrayIcon.isSystemTrayAvailable():
             self.assertIsNone(seen["tray"])   # no tray offscreen: skipped silently
         self.assertEqual([t for t in seen["items"] if t],
-                         ["talking as: moth", "open chat page", "what did i miss", "mute bubbles", "mute harnesses",
+                         ["personality: moth", "open chat page", "what did i miss", "mute bubbles", "mute harnesses",
                           "quiet hours",
                           "sleep", "show moth in harnesses", "skin", "stay on this screen", "check for updates",
                           "quit"])   # (the first: the card's name, disabled)
@@ -2205,6 +2205,52 @@ class PetQolTest(unittest.TestCase):
         self.assertEqual(seen["jumper"], ("jumping", 0.0))   # its own jump: no extra lift
         self.assertEqual(seen["nojump"][0], "idle")
         self.assertLess(seen["nojump"][1], 0)                # no jump / wave row: lifted instead
+
+
+class CardMenuTest(unittest.TestCase):
+    """The personality menu's GUI-free parts: presets are valid cards, typed lines, and the save + POST /api/card."""
+
+    def test_card_value(self):
+        for _, line in P.PRESETS:
+            self.assertEqual(P.card_value(line), line)
+        self.assertEqual(P.card_value("  Moth "), "moth")
+        for bad in ("", "   ", None, "x" * 1001):
+            self.assertIsNone(P.card_value(bad))
+
+    def test_set_card_saves_and_posts(self):
+        seen = {}
+
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen["body"] = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                seen["tok"] = self.headers.get(P.TOKEN_HEADER)
+                code = seen.get("code", 200)
+                out = json.dumps({"card": {"name": "miso"}} if code == 200 else {"error": "x"}).encode()
+                self.send_response(code)
+                self.end_headers()
+                self.wfile.write(out)
+
+            def log_message(self, *a):
+                pass
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        url = f"http://127.0.0.1:{srv.server_address[1]}"
+        with tempfile.TemporaryDirectory() as d:
+            tf = os.path.join(d, "token")
+            patch = mock.patch.dict(os.environ, {"MOTH_CONFIG_FILE": os.path.join(d, "config.json")})
+            patch.start()
+            self.addCleanup(patch.stop)
+            self.assertIn("token", P.set_card(url, tf, "moth")[0])
+            with open(tf, "w") as f:
+                f.write("tok1")
+            self.assertEqual(P.set_card(url, tf, "you are a sleepy cat named miso."), (None, "miso"))
+            self.assertEqual(seen["body"], {"card": "you are a sleepy cat named miso."})
+            self.assertEqual(seen["tok"], "tok1")
+            self.assertEqual(P.config.lookup("card")[0], "you are a sleepy cat named miso.")
+            seen["code"] = 404
+            self.assertEqual(P.set_card(url, tf, "moth"), (P.NO_CARD, None))
 
 
 if __name__ == "__main__":

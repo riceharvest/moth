@@ -313,6 +313,60 @@ def send_chat(url: str, token_file: str, text: str) -> str | None:
     return None
 
 
+# --- the personality menu (the card; same store and request as `moth card set` and the chat page) -------------------
+PRESETS = [("moth", "moth"), ("miso the cat", "you are a sleepy cat named miso."),
+           ("ember the dragon", "you are a tiny dragon named ember who is scared of fire."),
+           ("fern the houseplant", "you are a houseplant named fern."),
+           ("bolt the robot", "you are a little robot named bolt who loves puns."),
+           ("boo the ghost", "you are a ghost named boo who is very polite.")]
+NO_CARD = "this brain can't change personality"
+
+
+def card_value(text) -> str | None:
+    """What a typed line or preset means as a card (config.parse_card + the CLI's check); None if empty or unusable."""
+    from moth import cards  # stdlib only
+    v = config.parse_card(text if isinstance(text, str) and text.strip() else None)
+    if not isinstance(v, str):
+        return None
+    if v not in ("moth", "blank"):
+        try:
+            cards.validate(cards.text_card(v))
+        except ValueError:
+            return None
+    return v
+
+
+def current_card_text(url: str, token_file: str) -> str:
+    """The running moth's identity line, to prefill the dialog ('' when unknown)."""
+    try:
+        c = http_json(f"{url.rstrip('/')}/api/card", read_token(token_file)).get("card") or {}
+        return c.get("text") if isinstance(c.get("text"), str) else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def set_card(url: str, token_file: str, value: str) -> tuple[str | None, str | None]:
+    """Save the card (~/.moth/config.json, like moth card set) and switch the running moth (POST /api/card, a new chat).
+    -> (error for the bubble or None, the new character name or None)."""
+    try:
+        config.write("card", value)
+    except OSError as e:
+        return f"i couldn't save that ({e})", None
+    tok = read_token(token_file)
+    if not tok:
+        return f"i can't find my token ({token_file}), so it starts with my next start", None
+    try:
+        got = http_json(f"{url.rstrip('/')}/api/card", tok, {"card": value}, timeout=CHAT_TIMEOUT)
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 405, 501):
+            return NO_CARD, None
+        return "my token doesn't match moth's (~/.moth/token)" if e.code == 401 else f"moth said no ({e.code})", None
+    except Exception:  # noqa: BLE001
+        return "i couldn't reach moth, so it starts with my next start", None
+    name = (got.get("card") or {}).get("name") if isinstance(got, dict) else None
+    return None, name.strip() if isinstance(name, str) and 0 < len(name.strip()) <= 40 else None
+
+
 # --- speech bubbles (stdlib) ----------------------------------------------------------------------------------
 def wrap_text(text: str, width: int = WRAP) -> list[str]:
     """moth's lowercase, except inside `backticks` (commands and names to copy: `pip install -U ...`)."""
@@ -2429,6 +2483,13 @@ def _run(a, on_ready, boot, decided: str, quit_now: list) -> int:
                         self.done_signal(now)
                 elif kind == "history":
                     self.missed.seed(val)
+                elif kind == "card":
+                    err, name = val
+                    if name:
+                        self.character = name
+                        if self.tray is not None:
+                            self.tray.setToolTip(name)
+                    self.say(err or f"hi, i'm {getattr(self, 'character', 'moth')} now", ttl=NOTICE_TTL, force=True)
                 elif kind == "character":
                     self.character = val
                     if self.tray is not None:
@@ -2669,8 +2730,14 @@ def _run(a, on_ready, boot, decided: str, quit_now: list) -> int:
             for sub in getattr(m, "_moth_subs", ()):
                 sub.deleteLater()
             m.clear()
-            who = m.addAction(f"talking as: {getattr(self, 'character', 'moth')}")   # the card's name (moth card)
-            who.setEnabled(False)
+            pers = self.make_menu()   # the card's name (moth card); one click sets it, like the chat page's card button
+            pers.setTitle(f"personality: {getattr(self, 'character', 'moth')}")
+            m.addMenu(pers)
+            for label, line in PRESETS:
+                pers.addAction(label).triggered.connect(lambda *_, v=line: self.pick_card(v))
+            pers.addSeparator()
+            pers.addAction("write your own…").triggered.connect(lambda *_: QTimer.singleShot(0, self.write_card))
+            pers.addAction("reset to moth").triggered.connect(lambda *_: self.pick_card("moth"))
             m.addAction("open chat page").triggered.connect(self.open_chat)
             m.addAction("what did i miss").triggered.connect(lambda *_: QTimer.singleShot(0, self.show_missed))
             m.addSeparator()
@@ -2782,6 +2849,23 @@ def _run(a, on_ready, boot, decided: str, quit_now: list) -> int:
         # -- what the menu does
         def open_chat(self, *_):
             QDesktopServices.openUrl(QUrl(url))
+
+        def pick_card(self, value):
+            """Switch the card off the GUI thread; the answer (error or new name) comes back as a 'card' event."""
+            def go():
+                err, name = set_card(url, tfile, value)
+                self.events.put(("card", (err, name)))
+            threading.Thread(target=go, daemon=True, name="moth-pet-card").start()
+
+        def write_card(self):
+            from PySide6.QtWidgets import QInputDialog
+            text, ok = QInputDialog.getText(None, "personality", "who should it be? e.g. you are a frog named fred who loves soup.",
+                                            text=current_card_text(url, tfile))
+            v = card_value(text) if ok else None
+            if ok and text.strip() and v is None:
+                self.say("i can't use that one", ttl=NOTICE_TTL, force=True)
+            elif v:
+                self.pick_card(v)
 
         def toggle_mute(self, *_):
             self.muted = not self.muted

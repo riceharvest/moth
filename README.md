@@ -40,7 +40,7 @@ The model card with the full details (example chats, how it was trained, eval nu
 - **Talks.** Short lowercase back-and-forth in English, Chinese, Spanish, French or Hindi. Pure chat: no tools, no
   files, no shell.
 - **Is whoever its card says.** `moth card` shows the card, `moth card set "<one line>"` or `--file card.json`
-  changes it (a running moth switches at once, the chat page and the pet show the new name), `moth card reset` goes
+  changes it (or right-click the pet, "personality", for presets and "write your own"; a running moth switches at once, the chat page and the pet show the new name), `moth card reset` goes
   back to moth.
 - **Keeps your agent company.** One way only: the agent never sees moth or what you tell it.
 - **Runs locally.** CPU is the target: XS with int8 weights by default (experts and linears int8, routers fp32,
