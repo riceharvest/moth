@@ -28,6 +28,9 @@ pipeline_tag: text-generation
 
 # moth
 
+> **A much better talker is on the way.** A new moth model, fully pretrained, then SFT'd and RL'd, is training right
+> now. It'll arrive as a normal `moth update`, no reinstall.
+
 Real chats with this model, hand-picked from its eval transcripts (temperature 0.7) and copied as generated.
 `[ran …]` marks a tool call. The last chat skips four turns of small talk, as marked. Nothing else is cut.
 
@@ -168,8 +171,9 @@ the chat page in your browser). Start it before the pet and the pet uses it.
   The server uses about 0.8 GB of RAM: the Engram tables stay in bf16, memory-mapped from `model.safetensors`, and
   the OS reads in only the rows moth uses. `--device cuda` or `--device xpu` work with `python -m moth` (the pet
   passes server flags on: `python -m moth.pet -- --device xpu`). Speed and the `--quant` flag: see below.
-- Coming soon: once moth is on PyPI, `pip install "moth-companion[pet]"` gives you the `moth` and `moth-pet`
-  commands, and `moth setup` downloads these weights from this repo (about 860 MB) and sets up the rest.
+- Or with pip: `pip install "moth-companion[pet]"` gives you the `moth` and `moth-pet` commands, and `moth setup`
+  downloads these weights from this repo (about 860 MB) and sets up the rest. On Linux, install the CPU build of
+  torch first (`pip install torch --index-url https://download.pytorch.org/whl/cpu`).
 - `python -m moth.cli` chats in the terminal instead.
 - moth's tools run in a tiny pure-Python shell that only knows `ls`, `cat`, `head`, `wc` and `echo`, plus a
   `write` tool, and can't leave the home folder. It runs no subprocess and needs no sandbox, so it works the same
@@ -177,11 +181,12 @@ the chat page in your browser). Start it before the pet and the pet uses it.
 - The server only listens on localhost. Everything that reads or drives the chat needs a per-install token
   (`~/.moth/token`, made on first run). The hooks read the token from that file.
 
-### Installers (coming with the release)
+### Installers
 
 No Python? Installers for Windows (setup `.exe`), macOS (`.dmg`, Apple silicon) and Linux (AppImage or tarball) are
-coming with the release. They bundle Python, CPU torch and the pet, and download these weights on first launch.
-They aren't published yet. Details: [docs/INSTALL.md](https://github.com/riceharvest/moth/blob/main/docs/INSTALL.md).
+on the [GitHub releases page](https://github.com/riceharvest/moth/releases/latest). They bundle Python, CPU torch
+and the pet, and download these weights on first launch. They aren't code-signed yet, so Windows and macOS warn the
+first time; [docs/INSTALL.md](https://github.com/riceharvest/moth/blob/main/docs/INSTALL.md) says how to get past it.
 
 ### Speed
 

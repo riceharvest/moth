@@ -3,7 +3,7 @@
 Two ways to get moth:
 
 - **The installers** (no Python needed): a Windows setup `.exe`, a macOS `.dmg` and a Linux AppImage (or tarball).
-  They come with the release; they aren't published yet.
+  They're on the [releases page](https://github.com/riceharvest/moth/releases/latest).
 - **Python**: the Hugging Face download or `pip install moth-companion` (see the [README](../README.md) and the
   [model card](../release/README.md)).
 
@@ -13,7 +13,7 @@ model weights (about 860 MB) aren't in the installer: moth downloads them once, 
 ## Installers
 
 Each installer is built and tested by `.github/workflows/installers.yml` on GitHub's own runners (Windows, macOS on
-Apple silicon, Ubuntu). For now the installers exist only as workflow artifacts. They'll be attached to the release.
+Apple silicon, Ubuntu). Each release has them attached: [releases page](https://github.com/riceharvest/moth/releases/latest).
 
 | | file | size |
 |---|---|---|
@@ -38,8 +38,6 @@ The first launch opens a small window, which is `moth setup` with buttons:
    `~/.cache/moth/<repo>/`, with a progress bar. If you already have them (`model.safetensors`, `config.json`,
    `tokenizer.json` in one folder), click **Use a folder on this computer…** instead. moth remembers that folder in
    `~/.moth/app.json`. Setting `MOTH_MODEL_DIR` to such a folder does the same.
-   Until the model is published on Hugging Face, the download fails with a plain message saying so; use the folder
-   button or `MOTH_MODEL_DIR` for now.
 2. **Coding agents.** One checkbox per agent found on this computer (Claude Code, Codex, Hermes, Pi, OpenCode, dsh).
    moth backs up and merges their configs, as `moth hook` does.
 3. **At login.** Start moth when you log in. This is the same entry `moth autostart on` writes.

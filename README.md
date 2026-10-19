@@ -1,5 +1,8 @@
 # moth
 
+> **A much better talker is on the way.** A new moth model, fully pretrained, then SFT'd and RL'd, is training right
+> now. It'll arrive as a normal `moth update`, no reinstall.
+
 **moth is a silly little companion, not an assistant.** It's a tiny 112M-parameter model that thinks it's a
 silkmoth living on your graphics card. It's a bit dim, gets things sweetly wrong, and will not fix your code. It
 keeps you company while your coding agent works: hook it up and it reacts to each agent turn's final message
@@ -17,13 +20,15 @@ This repo is the code: the app (local server, chat page, terminal chat, desktop 
 and the pipeline that made moth (character sheet, teacher-chat generation, filters, fine-tuning, eval). The
 weights are not in git.
 
-## Status
+## Get it
 
-- **Weights: coming to Hugging Face** as [`darioooooo0o/moth-112m`](https://huggingface.co/darioooooo0o/moth-112m).
-  They're not published yet. Until they are, a clone of this repo can run the tests but not moth itself.
-- **pip: not on PyPI yet.** Once it is, `pip install moth-companion` (or `"moth-companion[pet]"` for the desktop
-  pet) gives you the `moth` and `moth-pet` commands; then `moth setup` downloads the weights from the Hub and
-  sets the rest up.
+- **Installers** (no Python needed): Windows `.exe`, macOS `.dmg` (Apple silicon) and Linux AppImage or tarball on
+  the [releases page](https://github.com/riceharvest/moth/releases/latest). See [docs/INSTALL.md](docs/INSTALL.md).
+- **pip**: `pip install "moth-companion[pet]"` (on Linux, first
+  `pip install torch --index-url https://download.pytorch.org/whl/cpu`), then `moth setup`. It downloads the
+  weights from the Hub and sets the rest up.
+- **Hugging Face**: the weights and a runnable copy of this code are
+  [`darioooooo0o/moth-112m`](https://huggingface.co/darioooooo0o/moth-112m); see "Running it" below.
 
 The model card with the full details (example chats, how it was trained, eval numbers, limitations) is
 [`release/README.md`](release/README.md).
@@ -38,7 +43,7 @@ The model card with the full details (example chats, how it was trained, eval nu
   fp32, see the model card's "Speed"). The server listens on 127.0.0.1 only and
   needs a per-install token (`~/.moth/token`). It goes online only to download the weights or an update.
 
-## Running it (once the weights are out)
+## Running it
 
 From a Hugging Face download (`hf download darioooooo0o/moth-112m --local-dir moth-112m`):
 
@@ -115,14 +120,15 @@ Windows.
 
 ## Installers
 
-Installers that need no Python are coming with the release: a Windows setup `.exe` (per user, no admin), a macOS
-`.dmg` (Apple silicon) and a Linux AppImage or tarball. Each bundles everything except the weights, which download on
-first launch. CI builds and tests them already (`.github/workflows/installers.yml`), but they aren't published yet.
-How they work, the unsigned-app warnings and how to get past them: [docs/INSTALL.md](docs/INSTALL.md).
+Installers that need no Python are on the [releases page](https://github.com/riceharvest/moth/releases/latest): a
+Windows setup `.exe` (per user, no admin), a macOS `.dmg` (Apple silicon) and a Linux AppImage or tarball. Each
+bundles everything except the weights, which download on first launch. CI builds and tests them
+(`.github/workflows/installers.yml`). How they work, the unsigned-app warnings and how to get past them:
+[docs/INSTALL.md](docs/INSTALL.md).
 
 ## Licenses
 
-- Code: **Apache-2.0** ([`LICENSE`](LICENSE)). The weights will be Apache-2.0 too.
+- Code: **Apache-2.0** ([`LICENSE`](LICENSE)). The weights are Apache-2.0 too.
 - The moth art (the pet, its Petdex sprite sheet, the chat page icon) is "202206 Silkmoth adult female icon" by
   DataBase Center for Life Science (DBCLS), doi:10.7875/togopic.2022.231,
   [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), from
@@ -135,5 +141,10 @@ How they work, the unsigned-app warnings and how to get past them: [docs/INSTALL
 - The agent messages used in training and eval come from public datasets (NVIDIA Nemotron-SWE-v1 and Nebius
   SWE-rebench-openhands-trajectories under CC BY 4.0, Lambda hermes-agent-reasoning-traces under Apache-2.0). The
   full list is in [`release/NOTICE`](release/NOTICE).
+
+## Thanks
+
+The training data, training and evals ran on RTX 5090s from [CloudRift](https://cloudrift.ai) research credits.
+Inspired by [@gnostic_snakes](https://x.com/gnostic_snakes)' "bugger".
 
 Made by [@imdariotoo](https://x.com/imdariotoo).
