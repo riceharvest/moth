@@ -31,6 +31,8 @@ class TinyMoeBackend(Backend):
         template.check_tokenizer(self.tok)
         q = serve.resolve_quant(a)
         mode = {"none": "fp32", "int8": "int8", "bf16": "bf16"}[q]
+        if a.device != "cpu" and getattr(a, "quant", "auto") in ("auto", None):
+            mode = "bf16"   # a GPU's default: bf16 weights (untested path; the CPU is the target)
         self.model = weights.load(a.model, resolve_mode(mode, a.device), a.device)
         if self.model.cfg.vocab_size != self.tok.get_vocab_size():
             raise SystemExit(f"moth: {a.tokenizer} has {self.tok.get_vocab_size()} tokens, the model "

@@ -21,13 +21,13 @@ import shutil
 import sys
 from collections.abc import Mapping
 
+from moth.backends.manifest import XS_SAMPLING
 from moth.xs import config as xsconfig
 
 DROP = (".moe.load", ".moe.qsum", ".moe.nsum", ".moe.dropped", ".theta", ".fallback_frac")
 NEEDS_MOTH = "0.4.0"   # the first moth with the tiny-moe backend (moth.json "needs_moth"; older ones say "update")
 MANIFEST = {"backend": "tiny-moe", "character": "moth", "needs_moth": NEEDS_MOTH,
-            # the sampler XS's RL trains with: plain softmax at its serving temperature (manifest.XS_SAMPLING)
-            "sampling": {"temperature": 0.7, "top_p": 1.0, "rep_penalty": 1.0, "max_tokens": 200}}
+            "sampling": dict(XS_SAMPLING)}   # the sampler XS's RL trains with (one copy: backends/manifest.py)
 
 
 def read_config(folder: str) -> xsconfig.XSConfig:

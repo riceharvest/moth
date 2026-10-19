@@ -26,6 +26,7 @@ import platform
 import statistics
 import sys
 import time
+import zlib
 from collections.abc import Mapping
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -72,7 +73,7 @@ class RandomXS(Mapping):
             c = self.c
             return self._hash_table(c.vocab_size, c.n_routed, c.top_k_eff, self.hash[k]).int()
         shp = self.shapes[k]
-        g = torch.Generator().manual_seed(self.seed + hash(k) % 100003)
+        g = torch.Generator().manual_seed(self.seed + zlib.crc32(k.encode()) % 100003)   # (str hash() is per process)
         if k.endswith(("norm.weight",)):
             return torch.ones(shp, dtype=torch.bfloat16)
         if k.endswith((".sink", "e_bias")):
@@ -187,6 +188,68 @@ def bench_legacy(mode, a):
     return out
 
 
+def decoders(kind, mode, a, cfg):
+    """{ctx: decode() closure} for one model (XS random weights or the legacy folder), prefilled at each ctx."""
+    g = torch.Generator().manual_seed(1)
+    out = {}
+    if kind == "xs":
+        from moth.xs.generate import Decoder
+        from moth.xs.model import XSModel
+        from moth.xs.quant import resolve_mode
+        model = XSModel(cfg, RandomXS(cfg), resolve_mode(mode))
+        for ctx in a.ctx:
+            cache = model.new_cache(ctx + a.decode + 8)
+            model.forward(torch.randint(32, cfg.vocab_size, (ctx,), generator=g), cache)
+            L0, dec, lg = cache.len, Decoder(model, cache), model.forward([5, 6], model.new_cache(8))
+
+            def run(cache=cache, L0=L0, dec=dec, lg=lg):
+                cache.len = L0
+                cache.lens_cpu[0] = L0
+                dec.generate(lg, a.decode, stop=-1, temperature=0)
+            out[ctx] = run
+        return out
+    from tiny_agent import generate as G
+    from tiny_agent.checkpoint import load_model
+    model = load_model(a.legacy, device="cpu", dtype=torch.float32, low_mem=True).eval()
+    G.quantize_cpu(model, mode)
+    for ctx in a.ctx:
+        cache = G.KVCache(model, 1, ctx + a.decode + 8, "cpu", dtype=torch.float32)
+        lg = G.append(model, cache, torch.randint(32, model.cfg.vocab_size, (1, ctx), generator=g), [ctx])
+        L0, dec = int(cache.lens_cpu[0]), G.Decoder(model, cache, graph=False)
+
+        def run(cache=cache, L0=L0, dec=dec, lg=lg):
+            cache.lens_cpu[0] = L0
+            cache.lens[0] = L0
+            dec.generate(lg, a.decode, stop=-1, temperature=0)
+        out[ctx] = run
+    return out
+
+
+def interleave(a, cfg):
+    """XS and the legacy model, each format, measured round-robin in one process (the desktop's load drifts)."""
+    runs = {}
+    for mode in a.modes.split(","):
+        runs[f"xs-{mode}"] = decoders("xs", mode, a, cfg)
+        runs[f"final2-{mode}"] = decoders("legacy", mode, a, cfg)
+    for fns in runs.values():
+        for fn in fns.values():
+            fn()   # warm-up
+    times = {(k, ctx): [] for k in runs for ctx in a.ctx}
+    for _ in range(a.rounds):
+        for k, fns in runs.items():
+            for ctx, fn in fns.items():
+                t = time.perf_counter()
+                fn()
+                times[k, ctx].append((a.decode + 1) / (time.perf_counter() - t))
+    res = {}
+    for (k, ctx), v in times.items():
+        res[f"{k}_ctx{ctx}"] = {"median_tok_s": round(statistics.median(v), 1), "min": round(min(v), 1),
+                                "max": round(max(v), 1)}
+        print(f"{k:12} ctx {ctx:5}: median {statistics.median(v):6.1f} tok/s  (min {min(v):.1f}, max {max(v):.1f})",
+              flush=True)
+    return res
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=None, help="an XS model folder (default: random full-size XS weights)")
@@ -197,6 +260,8 @@ def main():
     ap.add_argument("--decode", type=int, default=128)
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--config", default="{}", help="XS config overrides as JSON (random weights only)")
+    ap.add_argument("--interleave", action="store_true", help="with --legacy: XS and the legacy model round-robin")
+    ap.add_argument("--rounds", type=int, default=3)
     a = ap.parse_args()
     a.ctx = [int(x) for x in a.ctx.split(",")]
     torch.set_num_threads(a.threads)
@@ -204,6 +269,10 @@ def main():
     cfg = XSConfig(**json.loads(a.config))
     res = {"what": "legacy " + a.legacy if a.legacy else (a.model or "XS random weights"), "threads": a.threads,
            "torch": torch.__version__, "cpu": platform.processor() or platform.machine(), "runs": []}
+    if a.interleave:
+        res["what"], res["interleaved"] = "XS random weights vs " + a.legacy, interleave(a, cfg)
+        print("RESULT " + json.dumps(res), flush=True)
+        return
     for mode in a.modes.split(","):
         r = bench_legacy(mode, a) if a.legacy else bench_xs(mode, a, cfg)
         print(json.dumps(r), flush=True)
