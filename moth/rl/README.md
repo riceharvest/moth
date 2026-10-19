@@ -1,18 +1,19 @@
 # moth.rl: multi-turn RL environment for the chat buddy
 
-A card (identity from the system prompt only) plus a scenario (talk, agent reaction, home, recall, or a scripted
-probe). A user simulator chats with the policy for N turns. One judge call then labels every reply, and each reply gets
+The buddy is a pure chatbot: no tools, no home folder, no files. An episode is a card (identity from the system
+prompt only) plus a scenario (talk, agent reaction, recall, or a scripted probe). A user simulator chats with the policy for N turns. One judge call then labels every reply, and each reply gets
 a reward vector plus a weighted scalar. Module map: `__init__.py`. Reward definition: `reward.py`.
 
 ```
 python -m moth.rl mock --episodes 3                         # the whole loop on CPU, no endpoint
 python -m moth.rl.registry add --line "you are a cat named bo"   # grow the card pool; freeze v3 when it has grown
-python -m moth.rl eval --version v2 --moth-model runs/x/model --sim-url URL --judge-url URL [--ref A/results.json]
+python -m moth.rl eval --version v3 --moth-model runs/x/model --sim-url URL --judge-url URL [--ref A/results.json]
 python -m pytest -q tests/test_rl_env.py
 ```
 
-Eval runs use simulator temperature 0 by default (training uses 1.0). Home specs only run for a policy that executes
-home tools itself (`uses_tools`, e.g. `MothPolicy`); an endpoint policy skips them, since it could only invent files.
+Eval runs use simulator temperature 0 by default (training uses 1.0). `eval_v3` is the current frozen set. `eval_v1`
+and `eval_v2` are legacy: they were frozen under the old tools/home spec and their system prompts are stale. They are
+kept untouched for old comparisons, and their "home" specs are skipped.
 
 ## Plugging into tiny-agent GRPO
 
@@ -38,8 +39,8 @@ that moves:
 - An `EnginePolicy.generate(messages)` call enqueues `(rollout_id, feed_ids)` and blocks on a `Future`.
 - One driver thread runs `engine.tick()`. When a slot emits `<|im_end|>` (or reaches `max_turn_tokens`), it resolves
   that future with `{"gen_ids", "logp", "version": engine.version}`.
-- The slot keeps its KV and waits in a new state, `"env"`, the chat equivalent of `"tools"`, until the next `feed_ids`
-  for that rollout arrive.
+- The slot keeps its KV and waits in a new state, `"env"` (in place of the task engine's `"tools"` state), until the
+  next `feed_ids` for that rollout arrive.
 - `start(spec)` takes a slot; the episode ending frees it. Slots therefore hold KV during simulator calls of roughly
   1–3 s. With 256 slots and `workers` ≈ slots, that is fine.
 
@@ -61,8 +62,7 @@ groups = grpo_rollouts(
     None, n_groups=a.n_tasks, G=a.G, sim=sim, judge=judge, registry=reg, split="train",
     rng=rng, level="utterance", agent_msgs=agent, meter=meter,
     policy_factory=lambda: EnginePolicy(engine),     # or TinyAgentPolicy(model, tok, ...) on CPU
-    workers=a.slots,                                 # rollouts in flight: the Engine sees parallel requests
-    tools=False)                                     # text turns only: no home scenarios
+    workers=a.slots)                                 # rollouts in flight: the Engine sees parallel requests
 # -> list[list[ep]]; groups without signal are already dropped (like has_signal); each group's G rollouts share
 #    their first simulated message (asked once, seeded by the spec), so reply 1 is a clean in-group comparison.
 ```
@@ -99,7 +99,7 @@ Differences from the task-GRPO path:
   utterance level, with the in-group baseline taken per reply position.
 - **Not used:**
   - `LengthPenalty`: length is a reward component.
-  - `signed_rebalance` and segment flags: there are no tool calls in text turns.
+  - `signed_rebalance` and segment flags: a pure chatbot makes no tool calls.
   - `base_reward`.
 - **Staleness:** keep `roller.version` in the policy's extras and drop groups older than `--max_stale`, as before.
 - **Eval every N steps:** `moth.rl.evalrun.run_eval("v2", lambda: TinyAgentPolicy(model, tok), sim0, judge, out)`,

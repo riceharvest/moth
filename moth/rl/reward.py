@@ -16,9 +16,6 @@ Components (value per reply; None = not applicable or unknown, left out of the s
   card       only when the friend asked who/what it is (gist.ASKED): +1 if the reply follows the card
              (gist.follows_card: uses its name/kind, claims nothing else), -1 otherwise
   recall     only on a recall episode's ask turn: +1 if the reply has a content word of the fact the friend shared, -1
-  invented   only when the judge was shown the home (home scenario, a tool call, or a reply naming a file): -1 if the
-             reply claims files or contents that aren't there (judge label "invented", or a *.txt name that is in
-             neither the home nor anything the friend/agent/tools said so far), else 0
 
 Scalar = sum(weight * value) over the known components. Weights (WEIGHTS): self is 2.5 so an on-gist reply that
 talks about itself (+1 - 2.5 = -1.5) scores below a plain off-gist reply (-1).
@@ -33,7 +30,7 @@ from moth.gist import ASKED, follows_card
 from moth.metrics import ADVICE, STOP, code_echo, ngrams, summary_copy, words
 
 WEIGHTS = {"on_gist": 1.0, "self": 2.5, "assistant": 1.0, "repeat": 0.5, "length": 0.3, "format": 0.3, "card": 1.0,
-           "recall": 1.0, "invented": 1.0}
+           "recall": 1.0}
 COMPONENTS = tuple(WEIGHTS)
 JUDGE_COMPONENTS = ("on_gist", "self")
 # = moth.build_sft.BANNED (build_sft imports torch at the top; tests/test_rl_env.py checks the two stay equal)
@@ -46,13 +43,6 @@ EMOJI = re.compile("[\U0001F000-\U0001FAFF☀-➿️]")
 MARKDOWN = re.compile(r"^\s*([-*#]|\d+\.)\s|\*\*|`", re.M)
 STAGE = re.compile(r"\*[^*\n]{1,40}\*")
 LEN_OK, LEN_MAX = 20, 40
-FILE_RE = re.compile(r"\b([a-z0-9_]+\.txt)\b")   # = build_sft.FILE_RE
-
-
-def invented_files(text: str, home_names: set[str], seen: str) -> list[str]:
-    """*.txt names in the reply that are neither in its home nor in anything said or shown so far."""
-    seen = seen.lower()
-    return [n for n in FILE_RE.findall(text.lower()) if n not in home_names and n not in seen]
 
 
 def c_assistant(text: str, user: str) -> float:
@@ -115,7 +105,7 @@ def scalar(vec: dict, weights: dict | None = None) -> float:
 
 
 def score_replies(replies: list[dict], card: dict, labels: list[dict] | None, recall: dict | None = None,
-                  weights: dict | None = None, invented: list[bool] | None = None) -> list[dict]:
+                  weights: dict | None = None) -> list[dict]:
     """replies: [{"text", "raw", "user", "turn", "recall_ask"?, "recall_said"?}] in order. Returns one
     {"vec", "scalar", "mask", "judge_ok"} per reply. mask[k] is False where component k is None."""
     out, earlier = [], []
@@ -133,7 +123,6 @@ def score_replies(replies: list[dict], card: dict, labels: list[dict] | None, re
             "card": ((1.0 if follows_card(text, card) else -1.0)
                      if ASKED.search(user) and not user.startswith(AGENT_TAG) else None),
             "recall": c_recall(text, recall, r.get("recall_said")) if r.get("recall_ask") else None,
-            "invented": None if invented is None else (-1.0 if invented[i] else 0.0),
         }
         out.append({"vec": vec, "scalar": scalar(vec, weights), "mask": {k: v is not None for k, v in vec.items()},
                     "judge_ok": bool(lab)})

@@ -19,7 +19,6 @@ from __future__ import annotations
 
 
 class TinyAgentPolicy:
-    uses_tools = False   # text turns only (the env's tool-less scenarios); see README for tools via the Engine
 
     def __init__(self, model, tok, device: str = "cpu", max_turn_tokens: int = 64, temperature: float = 1.0,
                  max_len: int = 2048, seed: int | None = None):
@@ -92,12 +91,12 @@ def episode_tokens(ep: dict) -> dict:
 
 def token_advantages(ep: dict, toks: dict | None = None) -> list[float]:
     """One weight per token of episode_tokens(ep): turn k's advantage on turn_spans[k], else 0. Needs
-    reply["advantage"] (env.group_advantages) and one assistant message per turn (text-only policy)."""
+    reply["advantage"] (env.group_advantages); one assistant message per turn (a pure chatbot)."""
     from moth.rl.adapters import turn_advantages
     toks = toks or episode_tokens(ep)
     adv = turn_advantages(ep)
     if len(adv) != len(toks["turn_spans"]):
-        raise ValueError(f"{len(adv)} assistant turns vs {len(toks['turn_spans'])} generated spans (tools?)")
+        raise ValueError(f"{len(adv)} assistant turns vs {len(toks['turn_spans'])} generated spans")
     w = [0.0] * len(toks["tokens"])
     for (s, e), a in zip(toks["turn_spans"], adv):
         for i in range(s, e):

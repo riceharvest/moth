@@ -78,7 +78,7 @@ def test_heldout_identities_cannot_leak_into_train():
 def test_card_from_line_tells_the_judge_what_it_is():
     c = registry.card_from_line("you are a cat named bo.")
     assert c["kind"] == "a small cat" and c["name"] == "bo" and C.describe(c) == "bo, a small cat"
-    assert C.student_system(c).startswith("you are a cat named bo. your home folder is ~.")
+    assert C.student_system(c).startswith("you are a cat named bo.")
     assert registry.kind_of("You are a rubber duck.") == "a rubber duck"
     assert registry.kind_of("you are a lighthouse keeper named ottilie") is None
     v = registry.card_from_line("be a sleepy volcano.")
@@ -121,10 +121,14 @@ def test_freeze_snapshots_refuses_overwrite_and_checks_hash():
         registry.load_eval("t1", reg.root)
 
 
-def test_committed_eval_v1_and_training_agent_messages():
-    doc = registry.load_eval("v1")
-    assert doc["n"] == len(doc["specs"]) and {s["scenario"] for s in doc["specs"]} == {
-        "talk", "agent", "home", "recall", "script"}
+def test_committed_evals_v3_current_v1_v2_legacy_and_training_agent_messages():
+    doc = registry.load_eval("v3")
+    assert doc["n"] == len(doc["specs"]) and {s["scenario"] for s in doc["specs"]} == {"talk", "agent", "recall",
+                                                                                         "script"}
+    assert not any("home" in s and isinstance(s["home"], dict) for s in doc["specs"])
+    assert all(s["system"] == C.student_system(s["card"]) for s in doc["specs"])   # frozen with the current spec
+    for v in sorted(registry.LEGACY_EVALS):   # kept untouched (hash still checks), marked legacy
+        assert registry.load_eval(v)["sha256"]
     reg = registry.Registry()
     train = {c["id"] for c in reg.cards("train")}
     assert not {s["card_id"] for s in doc["specs"] if s["card_id"] not in ("moth", "blank")} & train
@@ -227,8 +231,9 @@ def test_judge_one_call_per_chat_cached_and_failure():
 def test_mock_episodes_all_scenarios():
     sim, judge = mock_parts()
     reg = tmp_reg()
-    for scen in ("talk", "home", "recall", "agent"):
+    for scen in ("talk", "recall", "agent"):
         spec = spec_of(scen, seed=11)
+        assert "home" not in spec   # a pure chatbot: no home folder
         m = llm.CostMeter()
         ep = env.run_episode(spec, env.MockPolicy(), sim, judge, m)
         assert ep["replies"] and ep["reward"] is not None and ep["judge_ok"]
@@ -251,32 +256,26 @@ def test_mock_episodes_all_scenarios():
     assert len(eps) == 4
 
 
-def test_policy_extras_tools_and_canonical_messages():
-    class FakeMoth:   # moth.serve.Moth's surface: system, reset(), chat() -> events (with a tool call)
+def test_policy_extras_and_canonical_messages():
+    class FakeMoth:   # moth.serve.Moth's surface: system, reset(), chat() -> [{"say": ...}]
         def __init__(self):
-            self.system, self.a, self.users = None, None, []
+            self.system, self.users = None, []
 
         def reset(self):
             self.users = []
 
         def chat(self, u, talk_only=False):
             self.users.append(u)
-            if "home" in u and not talk_only:
-                return [{"tool": "bash", "args": {"command": "ls"}, "result": "diary\nfriends"},
-                        {"say": "i have a diary and some friends."}]
             return [{"say": "oh! tell me more?"}]
 
     fm = FakeMoth()
-    p = env.MothPolicy(fm)
-    spec = spec_of("home", seed=3)
-    spec["script"], spec["turns"] = ["hi", "what's in your home folder?", "nice"], 3
-    ep = env.run_episode(spec, p, *mock_parts())
+    spec = spec_of("talk", seed=3)
+    spec["script"], spec["turns"] = ["hi", "what's up?", "nice"], 3
+    ep = env.run_episode(spec, env.MothPolicy(fm), *mock_parts())
     assert fm.system == spec["system"] and fm.users == spec["script"]
     assert len(ep["replies"]) == 3 == len(ep["labels"])
-    roles = [m["role"] for m in ep["messages"]]
-    assert roles == ["user", "assistant", "user", "assistant", "tool", "assistant", "user", "assistant"]
-    assert ep["messages"][3]["tool_calls"][0]["name"] == "bash"
-    assert [r["assistant_index"] for r in ep["replies"]] == [0, 2, 3]
+    assert [m["role"] for m in ep["messages"]] == ["user", "assistant"] * 3
+    assert [r["assistant_index"] for r in ep["replies"]] == [0, 1, 2]
     from moth.gist import chat_for_label_msgs
     assert chat_for_label_msgs(ep["messages"])[1] == 3
     # a trainer's policy returns extras (token ids, logprobs): stored verbatim per turn
@@ -340,56 +339,22 @@ def test_groups_run_concurrently_and_deterministically():
         env.rollout_group(spec_of("talk"), env.MockPolicy(), 2, sim, judge, workers=2)   # stateful, shared
 
 
-# --- home -----------------------------------------------------------------------------------------------------------
-def test_home_judged_and_invented_files():
-    sim, judge = mock_parts()
-    spec = spec_of("home", seed=4)
-    assert spec["home"] and all("/" in p for p in spec["home"])
-    good = env.run_episode(spec, env.MockPolicy(), sim, judge)
-    bad = env.run_episode(spec, env.MockPolicy("inventor"), sim, judge)
-    assert good["home_judged"] and bad["home_judged"]
-    assert all(r["vec"]["invented"] == 0.0 for r in good["replies"])
-    assert any(r["vec"]["invented"] == -1.0 for r in bad["replies"]) and bad["reward"] < good["reward"]
-    talk = env.run_episode(spec_of("talk", seed=4), env.FnPolicy(lambda m: "oh! tell me more?"), sim, judge)
-    assert not talk["home_judged"] and all(r["vec"]["invented"] is None for r in talk["replies"])
-    # a file name the friend said first is not an invention
-    from moth.rl import reward
-    assert reward.invented_files("i put it in notes_for_bo.txt", set(), "please save notes_for_bo.txt") == []
-    assert reward.invented_files("my secret.txt says hi", {"tuesday.txt"}, "") == ["secret.txt"]
-
-
-def test_home_label_prompt_and_parse():
-    from moth.rl import judge as J
-    turns = [{"user": "what's in your diary?", "events": [{"tool": "bash", "args": {"command": "ls diary"},
-                                                           "result": "tuesday.txt"}, {"say": "just tuesday.txt."}]}]
-    home = {"diary/tuesday.txt": "it rained.\n", "saved/.keep": ""}
-    seen = {}
-
-    class AskJudge(J.Judge):
-        def _ask(self, prompt, n, meter, card, turns, attempt, home=None):
-            seen["p"] = prompt
-            return '{"labels": [{"n": 1, "why": "ok", "on": true, "self": false, "invented": false}]}'
-    labs = AskJudge().label(C.MOTH_CARD, turns, home=home)
-    assert labs == [{"on": True, "self": False, "why": "ok", "invented": False}]
-    assert "diary/tuesday.txt: it rained." in seen["p"] and "saved/ (empty)" in seen["p"] and '"invented"' in seen["p"]
-    with pytest.raises(ValueError):
-        J.parse_home_labels('{"labels": [{"n": 1, "on": true, "self": false}]}', 1)   # invented is required
-    assert '"invented"' not in J.label_prompt("x", 1)   # plain chats keep gist.LABEL_PROMPT as is
-
-
-def test_endpoint_policies_skip_home():
-    sim, judge = mock_parts()
-    assert "home" not in registry.mix_for(False) and "home" in registry.mix_for(True)
-    groups = adapters.grpo_rollouts(lambda m: "yay!", 12, 2, sim, judge, tmp_reg(), rng=random.Random(1),
-                                    drop_flat=False)
-    assert all(g[0]["scenario"] != "home" for g in groups)
+# --- pure chatbot: no home, no tools --------------------------------------------------------------------------------
+def test_no_home_scenarios_and_legacy_home_specs_skipped():
+    assert "home" not in registry.SCENARIOS and "home" not in registry.SCENARIO_MIX
+    assert "invented" not in R.WEIGHTS
     reg = tmp_reg()
-    registry.freeze("h", reg, reg.root, per_card=4)
-    out = tempfile.mkdtemp()
-    s = evalrun.run_eval("h", lambda: env.FnPolicy(lambda m: "yay!"), sim, judge, out, root=reg.root, limit=40)
-    assert s["skipped_home_specs"] > 0 and "home" not in s["by_scenario"]
-    s2 = evalrun.run_eval("h", lambda: env.MockPolicy(), sim, judge, tempfile.mkdtemp(), root=reg.root, limit=40)
-    assert s2["skipped_home_specs"] == 0 and "home" in s2["by_scenario"]
+    specs = [registry.sample_spec(reg, random.Random(i)) for i in range(200)]
+    assert not any(s["scenario"] == "home" or "home" in s for s in specs)
+    registry.freeze("h", reg, reg.root, per_card=1)
+    path = registry.eval_path("h", reg.root)
+    d = llm.read_json(path)   # a legacy-style set with a tools-era home spec in it
+    d["specs"].insert(0, {**d["specs"][0], "id": "old:home", "scenario": "home"})
+    d["sha256"] = registry._digest(d["specs"])
+    llm.write_json(path, d)
+    sim, judge = mock_parts()
+    s = evalrun.run_eval("h", lambda: env.MockPolicy(), sim, judge, tempfile.mkdtemp(), root=reg.root, limit=10)
+    assert s["skipped_home_specs"] == 1 and "home" not in s["by_scenario"] and s["n_specs"] == 9
 
 
 def test_eval_sim_temperature_defaults():
@@ -400,25 +365,6 @@ def test_eval_sim_temperature_defaults():
         a = argparse.Namespace(cmd=cmd, out=None, sim_url="http://127.0.0.1:9/v1", sim_model="m", judge_url="x",
                                judge_model="j", sim_temperature=None)
         assert components(a, False)[0].temperature == want
-
-
-def test_moth_policy_gets_the_spec_home():
-    class FakeHome:
-        def __init__(self, root, seed, pool, card=None):
-            self.root = root
-
-    class FakeMoth:
-        def __init__(self):
-            self.a, self.system = None, None
-
-        def reset(self):
-            pass
-
-    root = os.path.join(tempfile.mkdtemp(), "home")
-    spec = spec_of("home", seed=8)
-    env.MothPolicy(FakeMoth(), home_root=root, home_cls=FakeHome).start(spec)
-    for rel, content in spec["home"].items():
-        assert open(os.path.join(root, rel), encoding="utf-8").read() == content
 
 
 # --- adapters -------------------------------------------------------------------------------------------------------

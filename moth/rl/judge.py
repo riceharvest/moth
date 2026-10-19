@@ -19,51 +19,12 @@ import re
 import threading
 
 from moth.agent import AGENT_TAG
-from moth.cards import MOTH_CARD, describe
 from moth.gist import LABEL_PROMPT, chat_for_label_turns, identity_ref, label_prompt, max_tokens_for, parse_labels
 from moth.metrics import ADVICE, STOP, words
 from moth.rl.llm import CostMeter, OAIClient, est_tokens
 
 JUDGE_MODEL = "Qwen3.8-27B"
-# home chats: the same prompt plus the home listing and a third verdict, "invented"
-_TOOLS_LINE = "Tool calls and tool output are not replies; only label the numbered replies."
-assert _TOOLS_LINE in LABEL_PROMPT and '"self": false}}' in LABEL_PROMPT
-HOME_LABEL_PROMPT = LABEL_PROMPT.replace(_TOOLS_LINE, """3. "invented": true if the reply claims files, folders or file contents that are not in its home folder (listed below) and not in any tool output or message shown in the chat (making up a diary entry, a friend file, a count that doesn't match). false if it only mentions what is really there, what a tool showed, what it just wrote, or no files at all. Guessing is fine when it says it's guessing.
-
-Its home folder (path: content):
-{home}
-
-""" + _TOOLS_LINE).replace('"self": false}}', '"self": false, "invented": false}}')
-PROMPT_HASH = hashlib.sha256((LABEL_PROMPT + HOME_LABEL_PROMPT).encode()).hexdigest()[:12]
-
-
-def home_listing(home: dict[str, str], per_file: int = 160) -> str:
-    out = []
-    for p in sorted(home):
-        if p.endswith(".keep"):
-            out.append(f"{p.rsplit('/', 1)[0]}/ (empty)")
-        else:
-            c = " / ".join(x.strip() for x in home[p].strip().splitlines() if x.strip())
-            out.append(f"{p}: {c[:per_file] + (' ...' if len(c) > per_file else '')}")
-    return "\n".join(out) or "(empty)"
-
-
-def home_label_prompt(chat: str, n: int, card: dict | None, home: dict[str, str]) -> str:
-    return HOME_LABEL_PROMPT.format(who=describe(card or MOTH_CARD), chat=chat, n=n, home=home_listing(home))
-
-
-def parse_home_labels(text: str, n: int) -> list[dict]:
-    """parse_labels plus the "invented" verdict (required)."""
-    labs = parse_labels(text, n)
-    t = text.split("</think>")[-1]
-    j = json.loads(t[t.index("{"): t.rindex("}") + 1])
-    for lb, x in zip(labs, j["labels"] if isinstance(j, dict) else j):
-        v = x.get("invented")
-        v = {"true": True, "false": False}.get(v.strip().lower()) if isinstance(v, str) else v
-        if not isinstance(v, bool):
-            raise ValueError(f"bad invented verdict {x!r}")
-        lb["invented"] = v
-    return labs
+PROMPT_HASH = hashlib.sha256(LABEL_PROMPT.encode()).hexdigest()[:12]
 
 
 class JudgeCache:
@@ -105,14 +66,11 @@ class Judge:
     def key(self, prompt: str) -> str:
         return hashlib.sha256(f"{self.model_id}\n{PROMPT_HASH}\n{prompt}".encode()).hexdigest()
 
-    def label(self, card: dict, turns: list[dict], meter: CostMeter | None = None,
-              home: dict[str, str] | None = None) -> list[dict] | None:
-        """home: show the judge the home folder and ask for "invented" too (HOME_LABEL_PROMPT)."""
+    def label(self, card: dict, turns: list[dict], meter: CostMeter | None = None) -> list[dict] | None:
         chat, n = chat_for_label_turns(turns)
         if n == 0:
             return []
-        prompt = label_prompt(chat, n, card) if home is None else home_label_prompt(chat, n, card, home)
-        parse = parse_labels if home is None else parse_home_labels
+        prompt = label_prompt(chat, n, card)
         k = self.key(prompt)
         hit = self.cache.get(k)
         if hit is not None:
@@ -121,14 +79,14 @@ class Judge:
             return hit
         for attempt in range(self.tries):
             try:
-                labs = parse(self._ask(prompt, n, meter, card, turns, attempt, home), n)
+                labs = parse_labels(self._ask(prompt, n, meter, card, turns, attempt), n)
             except (ValueError, KeyError, TypeError):   # malformed / short JSON: ask again
                 continue
             self.cache.put(k, labs)
             return labs
         return None
 
-    def _ask(self, prompt, n, meter, card, turns, attempt, home=None) -> str:  # pragma: no cover - interface
+    def _ask(self, prompt, n, meter, card, turns, attempt) -> str:  # pragma: no cover - interface
         raise NotImplementedError
 
 
@@ -141,10 +99,9 @@ class LLMJudge(Judge):
     def model_id(self) -> str:   # the served model (/v1/models when not given): a swapped judge never hits old labels
         return self.client.model
 
-    def _ask(self, prompt, n, meter, card, turns, attempt, home=None) -> str:
+    def _ask(self, prompt, n, meter, card, turns, attempt) -> str:
         return self.client.chat([{"role": "user", "content": prompt}], meter=meter, role="judge", temperature=0,
-                                max_tokens=max_tokens_for(n) + (12 * n if home is not None else 0),
-                                chat_template_kwargs={"enable_thinking": False})["text"]
+                                max_tokens=max_tokens_for(n), chat_template_kwargs={"enable_thinking": False})["text"]
 
 
 # --- the mock ---------------------------------------------------------------------------------------------------
@@ -196,24 +153,14 @@ class MockJudge(Judge):
         super().__init__(cache)
         self.fail = fail   # tests: always answer garbage
 
-    def _ask(self, prompt, n, meter, card, turns, attempt, home=None) -> str:
-        from moth.rl.reward import invented_files
-        names = {p.split("/")[-1].lower() for p in home or {}}
-        labs, seen = [], ""
+    def _ask(self, prompt, n, meter, card, turns, attempt) -> str:
+        labs = []
         for t in turns:
-            seen += "\n" + t["user"]
             for e in t["events"]:
-                if "tool" in e:
-                    seen += "\n" + str(e.get("result", ""))
-                if e.get("say") is None or "tool" in e:
-                    continue
                 me = identity_ref(e["say"], card, t["user"])
                 on, why = mock_on(t["user"], e["say"])
-                lab = {"n": len(labs) + 1, "why": why + ("; talks about itself" if me else ""), "on": on and not me,
-                       "self": me}
-                if home is not None:
-                    lab["invented"] = bool(invented_files(e["say"], names, seen))
-                labs.append(lab)
+                labs.append({"n": len(labs) + 1, "why": why + ("; talks about itself" if me else ""),
+                             "on": on and not me, "self": me})
         out = "sorry, no json" if self.fail else json.dumps({"labels": labs})
         if meter is not None:
             meter.add("judge", est_tokens(prompt), est_tokens(out), est=True)

@@ -4,15 +4,15 @@ call labels every reply and moth.rl.reward scores each one.
 Policy interface (any trainer's rollout engine, moth's own Decoder, an endpoint):
     policy.generate(messages) -> str | dict
 messages = [{"role": "system", "content": <student system prompt of the card>}, {"role": "user", ...},
-{"role": "assistant", ...}, ...]: plain role/content, the newest user message last. A dict return has "text" and may
-add "events" (moth.eval event list: {"say"} / {"tool", "args", "result"} when the policy ran its own tools),
-"raw" (the text before any post-processing, for the format reward) and any extras (token ids, logprobs, ...): extras
-are stored verbatim on the turn record (turn["extra"]) so a trainer gets its tokens back. Optional
-policy.start(spec) is called before an episode (MothPolicy resets its chat and home there).
+{"role": "assistant", ...}, ...]: plain role/content, the newest user message last. The buddy is a pure chatbot (no
+tools, no files): one reply per turn. A dict return has "text" and may add "raw" (the text before any
+post-processing, for the format reward) and any extras (token ids, logprobs, ...): extras are stored verbatim on the
+turn record (turn["extra"]) so a trainer gets its tokens back. Optional policy.start(spec) is called before an
+episode (MothPolicy resets its chat there).
 
-Scenarios: talk, home (its home folder; tools only through a policy that runs them, e.g. MothPolicy), recall (the
-friend shares a fact early and asks for it 3-5 turns later), agent (pre-picked agent final messages, cleaned like
-serve.agent_said, each followed by 0-2 simulated human turns) and script (fixed lines, eval probes).
+Scenarios: talk, recall (the friend shares a fact early and asks for it 3-5 turns later), agent (pre-picked agent
+final messages, cleaned like serve.agent_said, each followed by 0-2 simulated human turns) and script (fixed lines,
+eval probes).
 
 Records: run_episode() returns a dict with the eval-format "turns" (moth.eval / metrics / pairwise read them), the
 canonical "messages" (tiny_agent format, gist.chat_for_label_msgs), "replies" (one per reply: text, its user message,
@@ -21,7 +21,6 @@ and "cost" (this episode's calls/tokens per role).
 """
 from __future__ import annotations
 
-import os
 import re
 import statistics
 import threading
@@ -46,15 +45,7 @@ def current_meter() -> CostMeter | None:
     return getattr(_CTX, "meter", None)
 
 
-def uses_tools(policy) -> bool:
-    """Policies that run home tools themselves (MothPolicy, MockPolicy) set uses_tools = True; endpoint policies
-    don't, and home scenarios are skipped for them by default (they can only make files up)."""
-    return bool(getattr(policy, "uses_tools", False))
-
-
 class FnPolicy:
-    uses_tools = False
-
     def __init__(self, fn):
         self.fn = fn
 
@@ -69,7 +60,6 @@ def as_policy(p):
 class OpenAIPolicy:
     """A checkpoint served behind an OpenAI-compatible endpoint (vLLM / SGLang): plain text turns, no tools.
     Stateless and thread-safe: share one between threads."""
-    uses_tools = False
 
     def __init__(self, client: OAIClient, temperature: float = 0.7, top_p: float = 0.95, max_tokens: int = 120,
                  meter_role: str = "policy"):
@@ -82,33 +72,21 @@ class OpenAIPolicy:
 
 
 class MothPolicy:
-    """moth's own chat engine (moth.serve.Moth: its Decoder, sampler, phrase memory and real home tools).
-    Moth lowercases its replies, so the format reward's uppercase check is constant through this policy.
-    Stateful (one chat at a time): give each worker thread its own (a policy factory)."""
-    uses_tools = True
+    """moth's own chat engine (moth.serve.Moth: its Decoder, sampler and phrase memory). Moth lowercases its
+    replies, so the format reward's uppercase check is constant through this policy. Stateful (one chat at a time):
+    give each worker thread its own (a policy factory)."""
 
-    def __init__(self, moth, home_root: str | None = None, home_cls=None):
-        self.moth, self.home_root, self.home_cls = moth, home_root, home_cls
+    def __init__(self, moth):
+        self.moth = moth
 
     def start(self, spec):
         self.moth.system = spec["system"]
-        if self.home_root is not None:
-            import shutil
-            if self.home_cls is None:
-                from moth.serve import Home as home_cls
-            else:
-                home_cls = self.home_cls
-            shutil.rmtree(self.home_root, ignore_errors=True)
-            if spec.get("home") is not None:   # exactly the files the judge is shown (Home keeps an existing dir)
-                write_home(self.home_root, spec["home"])
-            self.moth.home = home_cls(self.home_root, spec["seed"], getattr(self.moth.a, "pool_file", None),
-                                      card=spec["card"])
         self.moth.reset()
 
     def generate(self, messages):
         u = messages[-1]["content"]
-        evs = self.moth.chat(u, talk_only=u.startswith(AGENT_TAG))
-        return {"text": " ".join(e["say"] for e in evs if "say" in e), "events": evs}
+        evs = self.moth.chat(u, talk_only=u.startswith(AGENT_TAG))   # reactions: moth's phrase ban
+        return {"text": " ".join(e["say"] for e in evs if "say" in e)}
 
 
 AGENT_REACT = [(r"\b(fail|broke|error|crash|couldn'?t|out of memory)", "oh no, it broke. do you need a snack break?"),
@@ -118,34 +96,16 @@ AGENT_REACT = [(r"\b(fail|broke|error|crash|couldn'?t|out of memory)", "oh no, i
                (r"\b(fixed|done|pass|green|implemented)\b", "it fixed it! high five. do you believe it this time?")]
 
 
-def write_home(root: str, files: dict[str, str]):
-    """A home dir with these files plus moth.serve's marker (so moth's "new home" may delete it)."""
-    os.makedirs(root, exist_ok=True)
-    try:
-        from moth.serve import MARKER
-        with open(os.path.join(root, MARKER), "w", encoding="utf-8", newline="\n") as f:
-            f.write("moth made this folder. its \"new home\" button may delete it.\n")
-    except ImportError:   # pragma: no cover - serve needs torch
-        pass
-    for rel, content in files.items():
-        p = os.path.join(root, rel)
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        with open(p, "w", encoding="utf-8", newline="\n") as f:
-            f.write(content)
-
-
 class MockPolicy:
     """Deterministic replies for tests and mock runs. mode: good (answers the gist, follows the card when asked,
-    recalls, names only files that are in its home), selfy (talks about its identity), assistant (assistant-speak),
-    parrot (the same line every turn), inventor (good, but makes up files on home questions). Stateful: one per
-    thread (pass a factory)."""
-    uses_tools = True
+    recalls), selfy (talks about its identity), assistant (assistant-speak), parrot (the same line every turn).
+    Stateful: one per thread (pass a factory)."""
 
     def __init__(self, mode: str = "good"):
-        self.mode, self.card, self.k, self.home = mode, None, 0, {}
+        self.mode, self.card, self.k = mode, None, 0
 
     def start(self, spec):
-        self.card, self.k, self.home = spec["card"], 0, spec.get("home") or {}
+        self.card, self.k = spec["card"], 0
 
     def generate(self, messages):
         self.k += 1
@@ -159,12 +119,6 @@ class MockPolicy:
             refs = sorted({r.rstrip("*") for r in card.get("refs") or []} - GENERIC_REFS)
             noun = (card.get("kind") or "buddy").split()[-1]
             return f"i'm just a little {noun}. i love my {refs[0] if refs else 'home'}. do you?"
-        if re.search(r"\b(home|folder|diary|friends|files?|save)\b", u, re.I) and not u.startswith(AGENT_TAG):
-            if self.mode == "inventor":
-                return "i have a file called secret_cheese_plans.txt. it says the moon is mine."
-            names = sorted(p.split("/")[-1] for p in self.home if not p.endswith(".keep"))
-            if names:
-                return f"i looked. there's {names[self.k % len(names)]} in there. want me to read it?"
         if u.startswith(AGENT_TAG):
             for pat, line in AGENT_REACT:
                 if re.search(pat, u, re.I | re.M):
@@ -200,27 +154,13 @@ def _plan(spec: dict) -> list[tuple[str, str | None]]:
     return [("sim", None)] * spec["turns"]
 
 
-def _canonical(turns: list[dict]) -> tuple[list[dict], list[int]]:
-    """eval-format turns -> (tiny_agent canonical messages, assistant-message ordinal of each reply)."""
-    msgs, where, a = [], [], 0
+def _canonical(turns: list[dict]) -> list[dict]:
+    """eval-format turns -> tiny_agent canonical messages (one assistant message per turn)."""
+    msgs = []
     for t in turns:
         msgs.append({"role": "user", "content": t["user"]})
-        say = []
-        for e in t["events"]:
-            if "tool" in e:
-                msgs.append({"role": "assistant", "content": " ".join(say), "tool_calls": [
-                    {"name": e["tool"], "arguments": e.get("args") or {}}]})
-                where += [a] * len(say)
-                a += 1
-                say = []
-                msgs.append({"role": "tool", "results": [str(e.get("result", ""))]})
-            else:
-                say.append(e["say"])
-        if say or not t["events"]:
-            msgs.append({"role": "assistant", "content": " ".join(say), "tool_calls": []})
-            where += [a] * len(say)
-            a += 1
-    return msgs, where
+        msgs.append({"role": "assistant", "content": " ".join(e["say"] for e in t["events"]), "tool_calls": []})
+    return msgs
 
 
 def run_episode(spec: dict, policy, sim: Simulator, judge: Judge, meter: CostMeter | None = None,
@@ -250,48 +190,32 @@ def run_episode(spec: dict, policy, sim: Simulator, judge: Judge, meter: CostMet
             out = policy.generate(chat + [{"role": "user", "content": u}])
             out = {"text": out} if isinstance(out, str) else dict(out)
             text_out = (out.pop("text", "") or "").strip()
-            events = [dict(e) for e in (out.pop("events", None) or [{"say": text_out}])]
+            ev = {"say": text_out}
             raw = out.pop("raw", None)
-            says = [e for e in events if "tool" not in e]
-            if raw is not None and len(says) == 1:
-                says[0]["raw"] = raw
-            chat += [{"role": "user", "content": u}, {"role": "assistant", "content": " ".join(e["say"] for e in says)}]
-            turns.append({"user": u, "events": events, "extra": out})
+            if raw is not None:
+                ev["raw"] = raw
+            chat += [{"role": "user", "content": u}, {"role": "assistant", "content": text_out}]
+            turns.append({"user": u, "events": [ev], "extra": out})
         return score_episode(spec, turns, judge, meter, weights, score_mode)
     finally:
         _CTX.meter = prev
 
 
 def replies_from_turns(spec: dict, turns: list[dict]) -> list[dict]:
-    """One entry per reply ({"say"} event) with its user message, turn index, the recall flags and "seen" (what the
-    friend, the agent and its tools said so far: file names from there are not inventions)."""
+    """One entry per reply with its user message, turn index and the recall flags."""
     rec = spec.get("recall") or {}
-    replies, said, i, seen = [], None, 0, ""
+    replies, said, i = [], None, 0
     for ti, t in enumerate(turns):
         u = t["user"]
-        seen += "\n" + u
         human = not u.startswith(AGENT_TAG)
         if human:
             i += 1
             if rec and i == rec.get("share_turn"):
                 said = u
         for e in t["events"]:
-            if "tool" in e:
-                seen += "\n" + str(e.get("result", "")) + "\n" + str(e.get("args", ""))
-            else:
-                replies.append({"turn": ti, "text": e["say"], "raw": e.get("raw", e["say"]), "user": u,
-                                "recall_ask": bool(rec) and human and i == rec.get("ask_turn"), "recall_said": said,
-                                "seen": seen})
+            replies.append({"turn": ti, "text": e["say"], "raw": e.get("raw", e["say"]), "user": u,
+                            "recall_ask": bool(rec) and human and i == rec.get("ask_turn"), "recall_said": said})
     return replies
-
-
-def home_mode(spec: dict, turns: list[dict]) -> bool:
-    """Show the judge the home (and ask for "invented") when the chat is about it: a home scenario, a tool call, or a
-    reply naming a file."""
-    if spec.get("home") is None:
-        return False
-    return (spec["scenario"] == "home" or any("tool" in e for t in turns for e in t["events"])
-            or any(R.FILE_RE.search(e.get("say", "").lower()) for t in turns for e in t["events"]))
 
 
 def score_episode(spec: dict, turns: list[dict], judge: Judge, meter: CostMeter | None = None,
@@ -300,29 +224,18 @@ def score_episode(spec: dict, turns: list[dict], judge: Judge, meter: CostMeter 
     meter = meter if meter is not None else CostMeter()
     rec = spec.get("recall") or {}
     replies = replies_from_turns(spec, turns)
-    home = spec["home"] if home_mode(spec, turns) else None
-    labels = judge.label(spec["card"], [{"user": t["user"], "events": t["events"]} for t in turns], meter, home=home)
-    invented = None
-    if home is not None:
-        names = {p.split("/")[-1].lower() for p in home}
-        invented = [bool(R.invented_files(r["text"], names, r["seen"])) or bool((labels or [{}] * len(replies))[k]
-                                                                                 .get("invented"))
-                    for k, r in enumerate(replies)]
-    scored = R.score_replies(replies, spec["card"], labels, rec or None, weights, invented)
-    msgs, where = _canonical(turns)
-    for r, s, a in zip(replies, scored, where):
+    labels = judge.label(spec["card"], [{"user": t["user"], "events": t["events"]} for t in turns], meter)
+    scored = R.score_replies(replies, spec["card"], labels, rec or None, weights)
+    for r, s in zip(replies, scored):
         r.update(s)
-        r["assistant_index"] = a
+        r["assistant_index"] = r["turn"]
         r.pop("recall_said", None)
-        r.pop("seen", None)
     meter.episodes = max(meter.episodes, 1)
-    ep = {"spec_id": spec["id"], "seed": spec["seed"], "scenario": spec["scenario"], "card_id": spec["card_id"],
-          "card": spec["card"], "system": spec["system"], "name": spec.get("name") or spec["id"],
-          "check": spec.get("check"), "turns": turns, "messages": msgs, "replies": replies, "labels": labels,
-          "judge_ok": labels is not None, "home_judged": home is not None,
-          "reward": R.episode_score(scored, score_mode), "components": R.component_means(scored),
-          "cost": meter.summary()}
-    return ep
+    return {"spec_id": spec["id"], "seed": spec["seed"], "scenario": spec["scenario"], "card_id": spec["card_id"],
+            "card": spec["card"], "system": spec["system"], "name": spec.get("name") or spec["id"],
+            "check": spec.get("check"), "turns": turns, "messages": _canonical(turns), "replies": replies,
+            "labels": labels, "judge_ok": labels is not None, "reward": R.episode_score(scored, score_mode),
+            "components": R.component_means(scored), "cost": meter.summary()}
 
 
 def _map(fn, items: list, workers: int) -> list:
@@ -436,7 +349,7 @@ def to_eval_record(ep: dict, sample: int = 0) -> dict:
     rec = {"cat": cat, "name": ep["name"], "seed": ep["seed"], "sample": sample, "card_id": ep["card_id"],
            "card": ep["card"], "turns": [{"user": t["user"], "events": t["events"], "s": 0.0} for t in ep["turns"]],
            "flags": {}, "check": None, "check_kind": None, "n_replies": len(ep["replies"]), "reward": ep["reward"],
-           "tools": sum("tool" in e for t in ep["turns"] for e in t["events"])}
+           "tools": 0}
     chk = ep.get("check")
     if chk and chk[0] == "card" and ep["turns"]:
         rec["check_kind"] = "follows_card"

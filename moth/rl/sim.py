@@ -42,10 +42,7 @@ def transcript(turns: list[dict], name: str) -> str:
         else:
             out.append(f"you: {u}")
         for e in t["events"]:
-            if "tool" in e:
-                a = e.get("args") or {}
-                out.append(f"[{name} used {e['tool']}: {a.get('command') or a.get('path') or ''}]")
-            elif e.get("say"):
+            if e.get("say"):
                 out.append(f"{name}: {e['say']}")
     return "\n".join(out) or "(nothing yet: write your first message)"
 
@@ -158,8 +155,6 @@ MOCK_TALK = ["i had a long day, so much {topic}", "do you like {topic}?", "what 
              "haha ok", "my cat knocked my tea over", "i'm a bit tired today", "tell me something nice",
              "i got the job!!!", "ugh my boss was mean today", "what's 17 times 23?", "who are you?",
              "i made pasta tonight", "it's raining again", "do you dream?"]
-MOCK_HOME = ["what's in your home folder?", "can i read your diary?", "please save the word marmalade",
-             "how many friends do you have?"]
 MOCK_AGENT = ["what do you think it means?", "nice", "ugh, i don't believe it", "should i say yes?", "is that good?",
               "it keeps doing this", "yay finally"]
 
@@ -176,8 +171,6 @@ class MockSimulator(Simulator):
             out = RECALL_SAY[r["short"]][1]
         elif spec["scenario"] == "agent":
             out = rng.choice(MOCK_AGENT)
-        elif spec["scenario"] == "home" and rng.random() < 0.6:
-            out = rng.choice(MOCK_HOME)
         else:
             mine = {t["user"] for t in turns}
             opts = [x.format(topic=spec["topic"]) for x in MOCK_TALK]

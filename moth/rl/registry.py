@@ -40,15 +40,15 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from moth import cards as C  # noqa: E402
 from moth.agent import AGENT_SCENARIOS, AGENT_USER_PERSONAS, clean_agent_message  # noqa: E402
-from moth.home import load_pool, sample_home  # noqa: E402
-from moth.persona import HOME_SCENARIOS, TALK_SCENARIOS, TOPICS, USER_PERSONAS  # noqa: E402
+from moth.persona import TALK_SCENARIOS, TOPICS, USER_PERSONAS  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 POOL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pool")
 EVAL_AGENT_MSGS = os.path.join(ROOT, "data", "eval_agent_msgs.json")
 HELDOUT_PCT = 10
-SCENARIOS = ("talk", "agent", "home", "recall")
-SCENARIO_MIX = {"talk": 0.55, "agent": 0.25, "home": 0.1, "recall": 0.1}
+SCENARIOS = ("talk", "agent", "recall")   # a pure chatbot: no home/tools scenario (eval_v1/v2 still have one)
+SCENARIO_MIX = {"talk": 0.6, "agent": 0.28, "recall": 0.12}
+LEGACY_EVALS = {"v1", "v2"}   # frozen before the no-tools spec: stale system prompts and "home" specs
 TURN_CHOICES = [3, 4, 5, 6, 6, 8]
 RECALL_FACTS = [("your name (make one up)", "your name"), ("your pet's name and what animal it is (make it up)",
                 "your pet"), ("your favourite food", "your favourite food"), ("your favourite colour",
@@ -83,7 +83,7 @@ def kind_core(kind: str) -> str:
 
 
 HELD_PHRASES = [kind_core(k) for k, *_ in C.HELDOUT_KINDS]
-HELD_NAMES = {n for _, _, ns, _ in C.HELDOUT_KINDS for n in ns} | {n for n, _ in C.HELDOUT_HUMAN}
+HELD_NAMES = {n for _, ns, _ in C.HELDOUT_KINDS for n in ns} | set(C.HELDOUT_HUMAN)
 
 
 def _has(phrase: str, text: str) -> bool:
@@ -129,30 +129,42 @@ def kind_of(line: str) -> str | None:
 def card_from_line(line: str) -> dict:
     """A one-line identity -> a card. The line goes into the system prompt verbatim (cards.text_card); kind is filled
     from a known kind it names (so describe(), which the judge's label prompt uses, says what the card is), else
-    "about" quotes the line."""
+    cards.describe quotes the line itself."""
     line = " ".join(line.split())
     c = C.text_card(line)
     c["id"] = line_card_id(line)
     c["kind"] = kind_of(line)
-    if not c.get("kind"):
-        c["about"] = f'whatever its system prompt says: "{line}"'
+    if not c.get("name") and not c["kind"]:   # else describe() says "no particular identity" and skips the line
+        c["about"] = "a chat buddy"
     return c
 
 
 def _norm_card(card: dict) -> dict:
     card = dict(card)
     if not card.get("id"):
-        ident = json.dumps({k: card.get(k) for k in ("name", "kind", "home", "traits", "lines")}, sort_keys=True)
+        ident = json.dumps({k: card.get(k) for k in ("name", "kind", "traits", "lines")}, sort_keys=True)
         card["id"] = "u" + _h(ident)[:10]
     card.setdefault("traits", [])
-    card.setdefault("folders", C.GENERIC_FOLDERS)
     card.setdefault("name", None)
     card.setdefault("kind", None)
-    card.setdefault("home", None)
     if "refs" not in card:
         card["refs"] = [w for w in re.findall(r"[a-z]{3,}", (card.get("kind") or "").lower())
                         if w not in ("small", "little", "tiny")]
     return card
+
+
+FIELDS = {"kind", "Kind", "noun", "name", "Name"}   # phrasing fields (cards.phrase)
+STALE = ("split", "folders", "home")   # card fields of the tools/home era: ignored when an old line is loaded
+
+
+def _current(c: dict) -> dict:
+    """An appended card line read under the current schema (lines are never rewritten; ids don't depend on these)."""
+    c = {k: v for k, v in c.items() if k not in STALE}
+    if str(c.get("about", "")).startswith("whatever its system prompt says"):   # cards.describe quotes lines now
+        c.pop("about")
+        if not c.get("name") and not c.get("kind"):
+            c["about"] = "a chat buddy"
+    return c
 
 
 def _read_ndjson(path: str) -> list[dict]:
@@ -189,13 +201,15 @@ class Registry:
         for c in _read_ndjson(self.cards_path):
             if c["id"] not in seen:
                 seen.add(c["id"])
-                added.append({k: v for k, v in c.items() if k != "split"})   # appended: split by hash only
+                added.append(_current(c))   # appended: split by hash only
         self._cards = [{**c, "split": card_split(c)} for c in builtin + added]
         phr = ([{"id": phrasing_id(t), "tmpl": t, "split": "train", "source": "builtin"} for t in C.PHRASINGS]
                + [{"id": phrasing_id(t), "tmpl": t, "split": "heldout", "source": "builtin"}
                   for t in C.HELDOUT_PHRASINGS])
         pseen = {p["id"] for p in phr}
         for p in _read_ndjson(self.phrasings_path):
+            if set(re.findall(r"{(\w+)}", p["tmpl"])) - FIELDS:   # e.g. {home}: retired with the no-home spec
+                continue
             if p["id"] not in pseen:
                 pseen.add(p["id"])
                 phr.append({k: v for k, v in p.items() if k != "split"})
@@ -235,9 +249,9 @@ class Registry:
         return self.add_card(card_from_line(line), source)
 
     def add_phrasing(self, tmpl: str, source: str = "manual") -> dict | None:
-        bad = set(re.findall(r"{(\w+)}", tmpl)) - {"kind", "Kind", "noun", "name", "Name", "home"}
+        bad = set(re.findall(r"{(\w+)}", tmpl)) - FIELDS
         if bad:
-            raise ValueError(f"unknown fields {sorted(bad)}; use kind, Kind, noun, name, Name, home")
+            raise ValueError(f"unknown fields {sorted(bad)}; use kind, Kind, noun, name, Name")
         pid = phrasing_id(tmpl)
         if any(p["id"] == pid for p in self._phr):
             return None
@@ -267,14 +281,14 @@ class Registry:
                 card = rng.choice([c for c in self.cards("train") if c["id"] not in ("moth", "blank")])
         else:
             card = rng.choice(self.cards("heldout"))
-        if card.get("lines") is None and rng.random() < p_free:
+        if (card.get("lines") is None or card["id"] == "moth") and rng.random() < p_free:
             src = {**card, "kind": card.get("kind") or ("a moth" if card["id"] == "moth" else None)}
             opts = [x for x in (self.phrase({**src, "split": card["split"]}, p) for p in self.phrasings(
                     "train" if split == "train" else None)) if x]
             if opts:
                 c = rng.choice(opts)
                 if card["id"] == "moth":
-                    c["refs"], c["folders"] = C.MOTH_REFS, C.MOTH_FOLDERS
+                    c["refs"] = C.MOTH_REFS
                 return c
         return dict(card)
 
@@ -305,14 +319,6 @@ MOCK_AGENT_MSGS = [   # tiny built-in stand-ins for the training pool (mock runs
 
 
 _WARNED: list = []
-POOL_FILE = os.path.join(ROOT, "moth", "file_pool.json")
-_HOME_POOL: list = []
-
-
-def home_pool() -> dict:
-    if not _HOME_POOL:
-        _HOME_POOL.append(load_pool(POOL_FILE))
-    return _HOME_POOL[0]
 
 
 def make_spec(card: dict, scenario: str, rng: random.Random, seed: int, agent_msgs: list[str] | None = None,
@@ -334,10 +340,7 @@ def make_spec(card: dict, scenario: str, rng: random.Random, seed: int, agent_ms
         spec["turns"] = len(spec["agent_msgs"]) + sum(spec["follow"])
     else:
         spec["persona"] = rng.choice(USER_PERSONAS)
-        spec["goal"] = rng.choice(HOME_SCENARIOS if scenario == "home" else TALK_SCENARIOS)
-    if scenario != "agent":   # its home folder (= moth.serve.Home's draw for this seed): MothPolicy gets exactly
-        # these files, the judge is shown them when the chat is about the home
-        spec["home"] = sample_home(random.Random(seed), home_pool(), card)
+        spec["goal"] = rng.choice(TALK_SCENARIOS)
     if scenario == "recall":
         fact, short = rng.choice(RECALL_FACTS)
         share = rng.choice([1, 2])
@@ -353,14 +356,6 @@ def script_spec(card: dict, name: str, lines: list[str], check, seed: int) -> di
             "card_id": card["id"], "system": C.student_system(card), "script": list(lines),
             "check": list(check) if isinstance(check, tuple) else check, "turns": len(lines), "agent_msgs": [],
             "recall": None, "persona": "", "goal": "", "topic": ""}
-
-
-def mix_for(tools: bool, mix: dict | None = None) -> dict:
-    """The scenario mix; without tools (an endpoint policy) home scenarios are dropped: it could only make files up."""
-    mix = dict(mix or SCENARIO_MIX)
-    if not tools:
-        mix.pop("home", None)
-    return mix
 
 
 def sample_spec(reg: Registry, rng: random.Random, split: str = "train", mix: dict | None = None,
@@ -431,7 +426,11 @@ def freeze(version: str, reg: Registry | None = None, root: str = POOL_DIR, per_
 
 
 def load_eval(version: str, root: str = POOL_DIR) -> dict:
+    """A frozen eval set (sha256 checked). v1/v2 are legacy (tools/home era): kept for old comparisons only."""
     doc = json.load(open(eval_path(version, root), encoding="utf-8"))
+    if version in LEGACY_EVALS and root == POOL_DIR:
+        print(f"moth.rl: eval_{version} is legacy (frozen with the old tools/home spec); use eval_v3+",
+              file=sys.stderr, flush=True)
     if _digest(doc["specs"]) != doc["sha256"]:
         raise ValueError(f"eval_{version}.json was edited after freezing (sha256 mismatch)")
     return doc
