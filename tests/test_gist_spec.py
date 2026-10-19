@@ -1,4 +1,4 @@
-"""Gist-first spec, identity cards, the per-reply label pass and the fan-out merge (CPU only, no server).
+"""Gist-first pure-chat spec, identity cards, the per-reply label pass and the fan-out merge (CPU only, no server).
 
   python -m pytest tests/test_gist_spec.py -q
 """
@@ -34,17 +34,33 @@ def few_shot_replies():
 
 
 # --- cards ----------------------------------------------------------------------------------------------------------
-def test_moth_card_keeps_the_old_student_prompt():
-    assert cards.student_system(cards.MOTH_CARD) == OLD_STUDENT == persona.SYSTEM_STUDENT
-    assert cards.student_system(None) == OLD_STUDENT
+def test_pure_chat_student_prompt_and_legacy_prompt():
+    s = cards.student_system(cards.MOTH_CARD)
+    assert s == persona.SYSTEM_STUDENT == cards.student_system(None)
+    assert s == "you are moth, a small moth who lives on a graphics card. " + cards.STUDENT_TAIL
+    for bad in ("tool", "home folder", "~", "bash", "file"):
+        assert bad not in s.lower(), bad
+    # the released round-3 weights keep their tools/home prompt through serve.py
+    assert cards.student_system_v1(cards.MOTH_CARD) == OLD_STUDENT == cards.student_system_v1(None)
+    serve_src = open(os.path.join(ROOT, "moth", "serve.py")).read()
+    assert "self.system = student_system_v1(self.identity)" in serve_src
 
 
 def test_student_prompt_other_cards():
-    c = {"id": "x", "name": "pip", "kind": "a houseplant", "home": "on a kitchen windowsill", "traits": ["you love puns"]}
+    c = {"id": "x", "name": "pip", "kind": "a houseplant", "traits": ["you love puns"]}
     s = cards.student_system(c)
-    assert s.startswith("you are pip, a houseplant. you live on a kitchen windowsill. you love puns. your home folder is ~.")
-    assert cards.student_system(cards.BLANK_CARD).startswith("your home folder is ~.")
+    assert s == "you are pip, a houseplant. you love puns. " + cards.STUDENT_TAIL
+    assert cards.student_system(cards.BLANK_CARD) == cards.STUDENT_TAIL
     assert "moth" not in cards.student_system(c)
+    moth_lore = {**cards.MOTH_CARD, "traits": ["you like lamps and blinking lights"]}
+    assert "you like lamps and blinking lights." in cards.student_system(moth_lore)
+
+
+def test_cards_have_no_home_or_folders():
+    for c in cards.build_pool() + cards.heldout_cards() + cards.heldout_cards(free=True) + [cards.MOTH_CARD,
+                                                                                            cards.BLANK_CARD]:
+        assert "home" not in c and "folders" not in c, c
+    assert not any("{home}" in t for t in cards.PHRASINGS + cards.HELDOUT_PHRASINGS)
 
 
 def test_pool_deterministic_diverse_and_heldout_disjoint():
@@ -65,8 +81,9 @@ def test_free_form_phrasings_and_heldout_phrasings():
     free = [c for c in pool if c.get("lines")]
     assert 0.3 <= len(free) / len(pool) <= 0.5
     assert len({c["lines"][0].split()[0] for c in free}) >= 8     # many shapes, not one template
-    for c in free:   # the student prompt is the free line + the home/tools tail; fields it doesn't say are cleared
-        assert cards.student_system(c).startswith(c["lines"][0].rstrip(".!") ) and "~." in cards.student_system(c)
+    for c in free:   # the student prompt is the free line + the chat tail; fields it doesn't say are cleared
+        assert cards.student_system(c).startswith(c["lines"][0].rstrip(".!")) and \
+            cards.student_system(c).endswith(cards.STUDENT_TAIL)
         if c["kind"]:
             assert c["kind"].split()[-1] in c["lines"][0].lower()
     held = cards.heldout_cards(free=True)
@@ -81,7 +98,7 @@ def test_free_form_phrasings_and_heldout_phrasings():
 def test_text_card():
     c = cards.text_card("you are a cat named bo")
     assert c["name"] == "bo" and "cat" in c["refs"]
-    assert cards.student_system(c).startswith("you are a cat named bo. your home folder is ~.")
+    assert cards.student_system(c) == "you are a cat named bo. " + cards.STUDENT_TAIL
     assert cards.load_card("text:You are Pip, a hamster.")["name"] == "pip"
     assert gist.follows_card("i'm bo! a cat.", c) and not gist.follows_card("i'm a moth", c)
     assert not gist.claims_other_identity("i'm a cat, silly", c)
@@ -101,27 +118,27 @@ def test_load_card_file_and_specs():
         p = os.path.join(d, "pip.json")
         json.dump({"name": "pip", "kind": "a houseplant"}, open(p, "w"))
         c = cards.load_card(p)
-    assert c["id"] == "pip" and "houseplant" in c["refs"] and c["folders"] == cards.GENERIC_FOLDERS
+    assert c["id"] == "pip" and "houseplant" in c["refs"] and "folders" not in c
     assert cards.load_card("moth")["id"] == "moth" and cards.load_card("heldout:0")["id"] == "h000"
     with pytest.raises(SystemExit):
         cards.load_card("nope-not-a-card")
 
 
-def test_homes():
+def test_legacy_homes_for_the_released_model():
+    """serve.py's home for the released tools model: the moth card still gets moth's six folders."""
     pool = load_pool(None)
     assert sample_home(random.Random(5), pool) == sample_home(random.Random(5), pool, cards.MOTH_CARD)
     h = sample_home(random.Random(5), pool, cards.build_pool()[1])
     assert {p.split("/")[0] for p in h} == set(cards.GENERIC_FOLDERS)
-    assert not any(w in " ".join(h.values()) for w in ("lamp", "graphics card", "moth", "fan"))
-    own = {"c0001": {"diary/rainy.txt": "it rained on my leaves."}}
-    h2 = sample_home(random.Random(5), pool, cards.build_pool()[1], own)
-    assert h2["diary/rainy.txt"].startswith("it rained")
 
 
 # --- the teacher sheet ----------------------------------------------------------------------------------------------
-def test_core_is_identity_free_and_lenses_gone():
+def test_core_is_identity_free_tool_free_and_lenses_gone():
     assert not hasattr(agent, "AGENT_LENSES")
     core = persona.TEACHER_CORE.lower()
+    for bad in ("home folder", "tool", "`ls", "cat friends", "write a short lowercase file"):
+        assert bad not in core, bad
+    assert not any(w in " ".join(persona.SCENARIOS + persona.USER_PERSONAS) for w in ("home folder", "folder", "diary"))
     assert "moth" not in core and "graphics card" not in core and "lens" not in core
     assert "pick one plain" not in core and "vary your imagery" not in core
     assert "{lens}" not in agent.AGENT_REMIND
@@ -170,7 +187,7 @@ def test_reminders_gate_identity_talk():
 
 
 def test_shared_prefix_fills_one_cache_block():
-    """tools + TEACHER_CORE just over one 1568-token block (Qwen3.8's hybrid prefix cache), when the tokenizer is here."""
+    """TEACHER_CORE just over one 1568-token block (Qwen3.8's hybrid prefix cache), when the tokenizer is here."""
     toks = sorted(glob.glob("/mnt/ssd/huggingface/hub/models--Qwen--Qwen3.8-27B/snapshots/*"))
     if not toks:
         pytest.skip("no Qwen3.8-27B tokenizer on disk")
@@ -185,19 +202,23 @@ def test_shared_prefix_fills_one_cache_block():
 # --- labels ---------------------------------------------------------------------------------------------------------
 CHAT = [{"role": "user", "content": "i burned my toast"},
         {"role": "assistant", "content": "oh no! was it very black?", "tool_calls": []},
-        {"role": "user", "content": "check your diary"},
-        {"role": "assistant", "content": "", "tool_calls": [{"name": "bash", "arguments": {"command": "ls diary"}}]},
-        {"role": "tool", "results": ["tuesday.txt"]},
-        {"role": "assistant", "content": "just tuesday in there.", "tool_calls": []},
+        {"role": "user", "content": "what are you doing"},
+        {"role": "assistant", "content": "just chatting with you. and thinking about toast.", "tool_calls": []},
         {"role": "user", "content": agent.agent_turn("The box is still booting.")},
         {"role": "assistant", "content": "a box is a tiny nap spot.", "tool_calls": []}]
+OLD_TOOL_ROWS = [{"role": "assistant", "content": "", "tool_calls": [{"name": "bash", "arguments": {"command": "ls"}}]},
+                 {"role": "tool", "results": ["diary"]}]
 
 
 def test_label_prompt_numbers_only_replies():
     text, n = gist.chat_for_label_msgs(CHAT)
-    assert n == 3 and "[R3] a box is a tiny nap spot." in text and "(it used bash: ls diary)" in text
+    assert n == 3 and "[R3] a box is a tiny nap spot." in text
     p = gist.label_prompt(text, n, cards.MOTH_CARD)
     assert "exactly 3 entries" in p and "the box is still booting" in p.lower()
+    for bad in ("tool", "file", "home folder"):
+        assert bad not in gist.LABEL_PROMPT.lower(), bad
+    old = CHAT[:3] + OLD_TOOL_ROWS + CHAT[3:]   # old tools data: tool rows are not shown and not numbered
+    assert gist.chat_for_label_msgs(old) == (text, n)
 
 
 def test_parse_labels():
@@ -216,14 +237,14 @@ def test_parse_labels():
 def test_build_sft_cuts_at_first_off_reply():
     pytest.importorskip("torch")
     from moth import build_sft
-    d = {"seed": 1, "type": "talk", "home": {"diary/tuesday.txt": "x"}, "card": cards.MOTH_CARD,
-         "messages": [m for m in CHAT[:6]] + [{"role": "user", "content": "lol"},
+    d = {"seed": 1, "type": "talk", "card": cards.MOTH_CARD,
+         "messages": [m for m in CHAT[:4]] + [{"role": "user", "content": "lol"},
                                               {"role": "assistant", "content": "you laughed!", "tool_calls": []}]}
     on = [{"on": True, "self": False, "why": ""}] * 3
     why = collections.Counter()
     assert len(build_sft.keep(d, why, on)) == len(d["messages"])
     out = build_sft.keep(d, why, on[:2] + [{"on": False, "self": False, "why": "x"}])
-    assert out[-1]["content"] == "just tuesday in there." and why["off_gist:cut"] == 1
+    assert out[-1]["content"] == "just chatting with you. and thinking about toast." and why["off_gist:cut"] == 1
     assert len(build_sft.keep(d, why, None)) == len(d["messages"])        # unlabelled: no cut
     assert len(build_sft.keep(d, why, on[:1])) == len(d["messages"]) and why["labels_mismatch"] == 1
 
@@ -235,7 +256,7 @@ def test_build_sft_drops_chats_with_unprompted_identity_talk():
     for u, r in [("hi", "hi! what are you up to?"), ("how are you", "good. tired."),
                  ("what did you eat", "soup. and some dust off the lamp.")]:
         msgs += [{"role": "user", "content": u}, {"role": "assistant", "content": r, "tool_calls": []}]
-    d = {"seed": 2, "type": "talk", "home": {}, "card": cards.MOTH_CARD, "messages": msgs}
+    d = {"seed": 2, "type": "talk", "card": cards.MOTH_CARD, "messages": msgs}
     why = collections.Counter()
     assert build_sft.keep(d, why) is None and why["identity_ref:drop"] == 1          # unlabelled: the word matcher
     lab = [{"on": True, "self": False, "why": ""}] * 3
@@ -244,6 +265,19 @@ def test_build_sft_drops_chats_with_unprompted_identity_talk():
     d2 = {**d, "messages": msgs[:4] + [{"role": "user", "content": "nice"}, {"role": "assistant", "content": "yes!",
                                                                           "tool_calls": []}]}
     assert build_sft.keep(d2, why, lab2) is None and why["identity_label:drop"] == 1
+
+
+def test_build_sft_pure_chat_drops_tool_rows_and_file_talk():
+    pytest.importorskip("torch")
+    from moth import build_sft
+    why = collections.Counter()
+    d = {"seed": 3, "type": "talk", "card": cards.MOTH_CARD, "messages": CHAT[:3] + OLD_TOOL_ROWS + CHAT[3:4]}
+    assert build_sft.keep(d, why) is None and why["tool_use:drop"] == 1
+    msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hi! how are you?", "tool_calls": []},
+            {"role": "user", "content": "good"}, {"role": "assistant", "content": "i wrote it in saved/notes.txt!",
+                                                   "tool_calls": []}]
+    assert build_sft.keep({"seed": 4, "type": "talk", "card": cards.MOTH_CARD, "messages": msgs}, why) is None
+    assert why["file_talk:drop"] == 1
 
 
 def test_identity_ref():

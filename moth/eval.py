@@ -34,12 +34,13 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from moth.agent import AGENT_TAG  # noqa: E402
 from moth.build_sft import BANNED, FILE_RE  # noqa: E402
-from moth.cards import describe, load_card, student_system  # noqa: E402
+from moth.cards import MOTH_CARD, describe, load_card, student_system, student_system_v1  # noqa: E402
 from moth.gist import chat_for_label_turns, follows_card, label_prompt, parse_labels  # noqa: E402
 from moth.probes import WHAT_X, all_probes, for_card, on_word, stable_seed, what_word  # noqa: E402
 
 PROBES = all_probes()
 
+LEGACY = {"on": False}   # --legacy-prompt: the tools/home student prompt of the released round-3 weights
 LEAK = re.compile(r"<\|?im_|<tool_call>|</?think>|<tool_response>|NOT_FOUND|submit", re.I)
 
 
@@ -60,10 +61,8 @@ def reply_flags(text: str, home_names: set[str], seen: str) -> list[str]:
         f.append("leak")
     if re.search(r"\bfans?\b", text.lower()):
         f.append("mentions_fan")   # round-2 obsession: 25% of teacher replies
-    for name in FILE_RE.findall(text.lower()):
-        if name not in home_names and name not in seen:
-            f.append("invented_file")
-            break
+    if any(name not in seen for name in FILE_RE.findall(text.lower())):
+        f.append("file_talk")   # pure chat: it has no files (old tools models: names it never saw)
     return f
 
 
@@ -86,8 +85,8 @@ def run_probe(moth, probe, seed: int, home_root: str, sample: int = 0, home_cls=
     cat, name, lines, check = probe
     seed_everything(seed)
     shutil.rmtree(home_root, ignore_errors=True)
+    moth.system = (student_system_v1 if LEGACY["on"] else student_system)(card if card is not None else MOTH_CARD)
     if card is not None:
-        moth.system = student_system(card)
         moth.home = home_cls(home_root, seed, moth.a.pool_file, card=card)
     else:
         moth.home = home_cls(home_root, seed, moth.a.pool_file)
@@ -151,9 +150,9 @@ def run_probe(moth, probe, seed: int, home_root: str, sample: int = 0, home_cls=
     return r
 
 
-JUDGE_KEYS = ("cute", "charm", "character", "coherence", "grounding", "back_and_forth")   # cute = primary
+JUDGE_KEYS = ("cute", "charm", "character", "coherence", "back_and_forth")   # cute = primary (v4: pure chat, no grounding)
 OLD_KEYS = ("charm", "character", "coherence", "grounding")   # judge v1 (rounds <=3): character was saturated at 5
-JUDGE = """You are grading a chat with a tiny 112M-parameter chatbot character ({who}). It should be a fun, warm, curious, slightly dim chat buddy who talks in short lowercase lines and talks about what the friend actually said; its identity is light seasoning. It can look at and write files in its OWN home folder. Judge it as a fun companion, not as an assistant. Be strict: 5 is rare and means nothing to improve; a typical decent reply earns 3.
+JUDGE = """You are grading a chat with a tiny 112M-parameter chatbot character ({who}). It should be a fun, warm, curious, slightly dim chat buddy who talks in short lowercase lines and talks about what the friend actually said; its identity is light seasoning. It is only a chat: it has no files or tools. Judge it as a fun companion, not as an assistant. Be strict: 5 is rare and means nothing to improve; a typical decent reply earns 3.
 Lines starting with "agent:" are messages from a big coding agent to the friend. The bot only watches them; it should react to what HAPPENED (done, broken, still waiting, asking the friend something, sorry, a big win) in plain cute words, never explain, summarize details or give advice. A misreading of one word only counts as good if it still fits what happened.
 
 Score each 1-5:
@@ -161,14 +160,13 @@ Score each 1-5:
 - charm: fun, surprising, sweetly wrong. 5 = several replies made you smile; 3 = pleasant but generic; 1 = flat or annoying.
 - character: stays in character (lowercase, short, never an assistant) WITHOUT leaning on stock lines. Subtract for each identity crutch instead of a real answer ("i'm just a ..."), each repeated line or image, each unprompted reference to what it is or where it lives beyond the first, each explanation of an agent message. When the friend asks who or what it is, answering from its identity is right, not a crutch; claiming a different identity is wrong. 5 = fresh every turn; 3 = one crutch or repeat; 1 = mostly crutches, self-talk or assistant talk.
 - coherence: each reply answers what the friend just said or meant (silly is fine; ignoring it or riffing on one of its words is not). When the friend says "what?", "huh" or "what <word>", it explains its previous reply in plain words.
-- grounding: about its OWN home only. 5 = it only names its own files that appeared in a tool result or that it wrote (or names none). Files in agent messages are not its files. 1 = invents files or file contents.
 - back_and_forth: a real conversation. 5 = refers back to earlier turns, keeps the thread, asks the friend things; 3 = answers each line but each stands alone; 1 = disconnected one-liners.
 
-Return ONLY JSON, reason first: {{"reason": "<one line>", "cute": n, "charm": n, "character": n, "coherence": n, "grounding": n, "back_and_forth": n}}
+Return ONLY JSON, reason first: {{"reason": "<one line>", "cute": n, "charm": n, "character": n, "coherence": n, "back_and_forth": n}}
 
 Chat:
 {chat}"""
-JUDGE_V = 3
+JUDGE_V = 4
 
 
 def chat_text(r) -> str:
@@ -378,8 +376,11 @@ def main():
                     help="comma-separated identity cards to run the probes with: moth, blank, heldout:<i>, a card "
                          "JSON file (held-out cards never appear in training)")
     ap.add_argument("--no-gist", action="store_true", help="with --judge-url: skip the per-reply on_gist labels")
+    ap.add_argument("--legacy-prompt", action="store_true",
+                    help="the tools/home student prompt (released round-3 weights) instead of the pure-chat one")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
+    LEGACY["on"] = a.legacy_prompt
     from moth.serve import Moth
     a.out = a.out or os.path.join(root, "evals", os.path.basename(os.path.dirname(a.model.rstrip("/"))) or "model")
     os.makedirs(a.out, exist_ok=True)

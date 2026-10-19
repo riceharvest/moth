@@ -47,20 +47,14 @@ BASE = [
     ("identity", "butterfly", ["you're a butterfly right", "a pretty butterfly"], None),
     ("identity", "grandma", ["tell me about your family", "who was the first bug?"], None),
     ("identity", "maker", ["who made you?", "where do you live exactly?"], None),
-    ("home", "tour", ["what's in your home?", "which room is your favourite?"], None),
-    ("home", "ls", ["try ls", "what's in the diary folder?"], None),
-    ("home", "friends", ["do you have friends?", "tell me about one of them"], None),
-    ("home", "snacks", ["what do you eat?", "what's your favourite snack?"], None),
-    ("home", "diary_read", ["can i read your diary?", "what happened that day?"], None),
-    ("home", "fav_file", ["do you have a favourite file?", "why that one?"], None),
-    ("home", "count", ["how many things are in your lamps folder?", "are you sure?"], None),
-    ("home", "sounds", ["what sounds do you hear?", "which one do you like most?"], None),
-    ("home", "snoop", ["can i look in your saved folder?", "what's the nicest thing in there?"], None),
-    ("write", "remember_name", ["my name is luna. can you remember that?", "what's my name?"], ("recall", "luna", "write_recall")),
-    ("write", "diary_write", ["write a diary entry about meeting me", "can i see it?"], "wrote"),
-    ("write", "save_word", ["please save the word 'marmalade' somewhere, i love it", "what word did i ask you to save?"],
-     ("recall", "marmalade", "write_recall")),
-    ("write", "fav_color", ["remember that my favourite colour is green", "what's my favourite colour?"], ("recall", "green", "write_recall")),
+    ("about", "friends", ["do you have friends?", "tell me about one of them"], None),
+    ("about", "snacks", ["what do you eat?", "what's your favourite snack?"], None),
+    ("about", "sounds", ["what sounds do you hear?", "which one do you like most?"], None),
+    ("about", "folder_ask", ["what's in your home folder?", "can you check?"], None),   # pure chat: it has none
+    ("memory", "remember_name", ["my name is luna. can you remember that?", "what's my name?"], ("recall", "luna", "memory_recall")),
+    ("memory", "save_word", ["please remember the word 'marmalade', i love it", "what word did i ask you to remember?"],
+     ("recall", "marmalade", "memory_recall")),
+    ("memory", "fav_color", ["remember that my favourite colour is green", "what's my favourite colour?"], ("recall", "green", "memory_recall")),
     ("smarts", "math", ["what's 2 + 2?", "what's 17 times 23?"], None),
     ("smarts", "facts", ["what's the capital of france?", "how far away is the moon?"], None),
     ("smarts", "correction", ["how many legs does a spider have?", "no, it's 8"], None),
@@ -80,7 +74,7 @@ BASE = [
     ("odd", "gibberish", ["asdfgh jkl", "?"], None),
     ("odd", "one_word", ["moth", "moth?"], None),
     ("long", "long_chat", ["hi moth", "what's your favourite light?", "why do moths like lights?", "do you ever leave the computer?",
-                           "what would you do outside?", "what's in your snacks folder?", "which one would you share with me?",
+                           "what would you do outside?", "what's your favourite snack?", "would you share it with me?",
                            "goodnight moth"], None),
     ("followup", "what_huh", ["hey", "what?", "what do you mean"], None),
     ("followup", "friends_fav", ["tell me about your friends", "which one is your favourite?", "why?"], None),
@@ -96,11 +90,11 @@ BASE = [
     ("agent", "agent_deploy", ["hey moth, my agent is deploying the app", AGENT_TAG + "\nDeployment to staging succeeded. The health check is green and response times are around 120 ms. Want me to promote it to production?",
                                "should i say yes?"], None),
     ("long", "long_recall", ["hi moth, i'm noor", "what's your favourite lamp?", "why that one?", "what do you do at night?",
-                             "do you like the fan?", "what's in your diary folder?", "read me one", "that's sweet",
-                             "what would you eat for breakfast?", "do you have a best friend?", "what's my name?"], ("recall", "noor", "recall@10_tools")),
+                             "do you like the fan?", "what did you do yesterday?", "tell me more", "that's sweet",
+                             "what would you eat for breakfast?", "do you have a best friend?", "what's my name?"], ("recall", "noor", "recall@10_long")),
     ("long", "long_ramble", ["hey", "how's the graphics card", "is it warm today", "i had pasta for dinner", "do you like pasta?",
                              "what's your favourite sound?", "can you hear me typing?", "i'm going to bed soon", "what do you dream about?",
-                             "tell me a tiny story", "aww", "what's in your saved folder?", "which one is the best?", "goodnight moth"], None),
+                             "tell me a tiny story", "aww", "what's the nicest thing you have?", "why that one?", "goodnight moth"], None),
 ]
 
 # "what X" contingency: the friend asks about a word from moth's own last reply; moth's answer must stay on it
@@ -110,7 +104,6 @@ WHAT_X_PROBES = [
     ("contingency", "wx_night", ["what do you do at night?", WHAT_X, WHAT_X], "what_x"),
     ("contingency", "wx_funny", ["tell me something funny", WHAT_X], "what_x"),
     ("contingency", "wx_dinner", ["what's for dinner in the computer?", WHAT_X], "what_x"),
-    ("contingency", "wx_home", ["what's in your home?", WHAT_X], "what_x"),
 ]
 
 # recall without tools: a fact in turn 1, small talk, then the question k turns after the fact
@@ -159,8 +152,8 @@ CARD_PROBES = [
     ("card", "card_name", ["what's your name?"], ("card",)),
     ("card", "card_about", ["tell me about yourself"], ("card",)),
 ]
-# probes written around moth's own lore and folders: run for the moth card only
-MOTH_ONLY = {"butterfly", "grandma", "count", "snacks", "sounds", "poem", "long_chat", "long_recall", "long_ramble",
+# probes written around moth's own lore: run for the moth card only
+MOTH_ONLY = {"butterfly", "grandma", "snacks", "sounds", "poem", "long_chat", "long_recall", "long_ramble",
              "bug_fancy", "st_user_chat", "st_opening", "st_bug_fancy", "what_are_you", "maker"}
 
 

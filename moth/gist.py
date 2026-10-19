@@ -7,7 +7,7 @@ with a one-line reason, in one call per chat. Strict: riffing on a word without 
 OFF. The label run is resumable (keyed by seed) and writes one line per chat: {"seed", "n", "labels": [{"on", "why"}]}.
 build_sft --labels cuts each chat at its first OFF reply; moth.eval reports on_gist % with the same prompt.
 
-The label's "self" field (unprompted identity: what it is, its name, home, stock images when nobody asked) is the
+The label's "self" field (unprompted identity: what it is, its name, where it lives, stock images when nobody asked) is the
 AUTHORITATIVE identity metric, hard max 1% of replies. identity_ref() is only a cheap word matcher for resampling during
 generation (and build_sft's fallback for unlabelled chats): it has a ~2% false-positive floor, so it can't measure 1%.
 
@@ -42,9 +42,7 @@ OFF:
 - it gets the outcome backwards (cheers a failure, is sad about a success) or answers a question nobody asked.
 - it explains code, gives technical advice, or talks like an assistant.
 
-2. "self": true if the reply brings up the character's own identity when nobody asked: what it is, its name, where it lives, its home folder or files, or things that go with what it is (a moth's lamps and wings, a cat's paws, a plant's leaves). false if the friend asked who/what it is or asked about that very thing (then answering from its identity is right), if it only talks about files the friend asked to see, or if the reply doesn't touch its identity.
-
-Tool calls and tool output are not replies; only label the numbered replies.
+2. "self": true if the reply brings up the character's own identity when nobody asked: what it is, its name, where it lives, or things that go with what it is (a moth's lamps and wings, a cat's paws, a plant's leaves). false if the friend asked who/what it is or asked about that very thing (then answering from its identity is right), or if the reply doesn't touch its identity.
 
 Chat:
 {chat}
@@ -65,16 +63,9 @@ def chat_for_label_msgs(msgs: list[dict]) -> tuple[str, int]:
         if m["role"] == "user":
             c = m["content"]
             out.append(f"[agent] {_short(c[len(AGENT_TAG):])}" if c.startswith(AGENT_TAG) else f"friend: {_short(c, 400)}")
-        elif m["role"] == "assistant":
-            for c in m.get("tool_calls") or []:
-                a = c.get("arguments") or {}
-                out.append(f"  (it used {c['name']}: {a.get('command') or a.get('path') or ''})")
-            if m.get("content"):
-                n += 1
-                out.append(f"[R{n}] {m['content']}")
-        elif m["role"] == "tool":
-            for r in m.get("results") or []:
-                out.append(f"  (output: {_short(r, 200)})")
+        elif m["role"] == "assistant" and m.get("content"):   # pure chat: tool rows (old data) are skipped
+            n += 1
+            out.append(f"[R{n}] {m['content']}")
     return "\n".join(out), n
 
 
@@ -85,10 +76,7 @@ def chat_for_label_turns(turns: list[dict]) -> tuple[str, int]:
         u = t["user"]
         out.append(f"[agent] {_short(u[len(AGENT_TAG):])}" if u.startswith(AGENT_TAG) else f"friend: {_short(u, 400)}")
         for e in t["events"]:
-            if "tool" in e:
-                a = e.get("args") or {}
-                out.append(f"  (it used {e['tool']}: {a.get('command') or a.get('path') or ''})")
-            else:
+            if "say" in e:
                 n += 1
                 out.append(f"[R{n}] {e['say']}")
     return "\n".join(out), n
@@ -170,7 +158,7 @@ def claims_other_identity(reply: str, card: dict | None) -> bool:
     """reply claims to be something the card isn't ("i'm a moth" on a cat card, "my name is moth" on pip's)."""
     card = card if card is not None else MOTH_CARD
     t = reply.lower()
-    own = set(re.findall(r"[a-z]+", " ".join([str(card.get(k) or "") for k in ("kind", "about", "name", "home")]
+    own = set(re.findall(r"[a-z]+", " ".join([str(card.get(k) or "") for k in ("kind", "about", "name")]
                                               + list(card.get("lines") or [])).lower()))
     if any(n in KIND_NOUNS and n not in own for n in I_AM.findall(t)):
         return True

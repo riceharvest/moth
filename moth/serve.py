@@ -48,7 +48,7 @@ from tiny_agent.tools import BASH_TIMEOUT_S, Workspace, truncate  # noqa: E402
 from moth.agent import AGENT_TAG, agent_turn  # noqa: E402
 from moth.home import load_pool, sample_home  # noqa: E402
 from moth.norepeat import PhraseMemory, vocab_classes  # noqa: E402
-from moth.cards import load_card, student_system  # noqa: E402
+from moth.cards import load_card, student_system_v1  # noqa: E402
 from moth.shell import MARKER, Shell, _windows_unsafe  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -322,9 +322,11 @@ class Moth:
     def setup(self, a):
         """Everything but the weights (tests build a Moth with a fake model and call this)."""
         self.a = a
-        # who it is comes only from the system prompt: --card (default: the moth card = the old fixed prompt)
+        # who it is comes only from the system prompt: --card (default: the moth card = the old fixed prompt).
+        # The released weights are the round-3 tools model: the legacy tools/home prompt (cards.student_system_v1)
+        # until a pure-chat model ships with its own serve path.
         self.identity = load_card(getattr(a, "card", None))
-        self.system = student_system(self.identity)
+        self.system = student_system_v1(self.identity)
         self.im_end = self.tok.token_to_id("<|im_end|>")
         self.ban = [self.tok.token_to_id(t) for t in ("<tool_call>", "<think>")]   # for turns where moth must talk
         self.lock = threading.RLock()

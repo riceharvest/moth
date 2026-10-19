@@ -1,6 +1,6 @@
 """Offline check of the teacher prompts (no server, no GPU): renders what the teacher sees for a few seeds and, when
-the Qwen3.8-27B tokenizer is on disk, measures the shared prefix (tools + TEACHER_CORE) against the hybrid prefix
-cache's 1568-token blocks.
+the Qwen3.8-27B tokenizer is on disk, measures the shared prefix (TEACHER_CORE as the chat template renders it; pure
+chat since 2026-10-19, so no tools block) against the hybrid prefix cache's 1568-token blocks.
 
   python tests/render_prompts.py [--seeds 1,2,3] [--tokenizer DIR] [--full]
 
@@ -33,12 +33,12 @@ TOK_GLOB = os.path.expanduser("/mnt/ssd/huggingface/hub/models--Qwen--Qwen3.8-27
 
 
 def prefix_tokens(tok_dir: str) -> tuple[int, int]:
-    """(tokens of tools + TEACHER_CORE as the chat template renders them, cached tokens with whole 1568-blocks)."""
+    """(tokens of TEACHER_CORE as the chat template renders it, cached tokens with whole 1568-blocks)."""
     from transformers import AutoTokenizer
     t = AutoTokenizer.from_pretrained(tok_dir)
     mark = "⁣ZZMARK"
     s = t.apply_chat_template([{"role": "system", "content": TEACHER_CORE + mark}, {"role": "user", "content": "hi"}],
-                              tools=G.OAI_TOOLS, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+                              tokenize=False, add_generation_prompt=True, enable_thinking=False)
     n = len(t.encode(s[:s.index(mark)]))
     return n, n // BLOCK * BLOCK
 
@@ -63,7 +63,7 @@ def main():
         print(v["user"])
     if a.tokenizer and os.path.isdir(a.tokenizer):
         n, cached = prefix_tokens(a.tokenizer)
-        print(f"\nshared prefix (tools + TEACHER_CORE): {n} tokens; cached with {BLOCK}-token blocks: {cached} "
+        print(f"\nshared prefix (TEACHER_CORE): {n} tokens; cached with {BLOCK}-token blocks: {cached} "
               f"({cached / n:.0%}), cold per call {n - cached}")
     else:
         print("\n(no Qwen tokenizer on disk: prefix size not measured)")

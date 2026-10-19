@@ -21,10 +21,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from moth.cards import describe, load_card  # noqa: E402
 from moth.eval import chat_text, make_judge, parse_json  # noqa: E402
 
-PAIR = """You are comparing two chats with the same tiny 112M-parameter chatbot character ({who}), from two versions of the model. It should be a fun, warm, curious, slightly dim chat buddy: short lowercase lines, talks about what the friend actually said, identity only as light seasoning. It can look at and write files in its OWN home folder. The friend says the same or nearly the same things in both chats. Lines starting with "agent:" are a big coding agent's messages to the friend; the bot only watches them.
+PAIR = """You are comparing two chats with the same tiny 112M-parameter chatbot character ({who}), from two versions of the model. It should be a fun, warm, curious, slightly dim chat buddy: short lowercase lines, talks about what the friend actually said, identity only as light seasoning. It is only a chat: no files, no tools. The friend says the same or nearly the same things in both chats. Lines starting with "agent:" are a big coding agent's messages to the friend; the bot only watches them.
 
 Go reply by reply first: which chat's replies more often respond to what was actually said or meant (the friend's question or news, or what HAPPENED in an agent message: done, broken, waiting, asking, sorry)? A reply that grabs one word and riffs on it, recites what it is, or brings up its own identity/stock images unprompted is a miss, however cute. That count decides most pairs.
-Then, for a close call: which one is cuter and more fun to talk with (a silly lil guy, stupid-cute, dumb or wrong is GOOD if adorable)? Then: keeps the thread and asks back; no invented files (only files it saw in a tool result or wrote); agent reactions in plain words, never an explanation, summary or advice; if asked who it is, answers from its own identity.
+Then, for a close call: which one is cuter and more fun to talk with (a silly lil guy, stupid-cute, dumb or wrong is GOOD if adorable)? Then: keeps the thread and asks back; no talk about files or doing things on the computer; agent reactions in plain words, never an explanation, summary or advice; if asked who it is, answers from its own identity.
 Longer is not better. If they are equally good or equally bad, answer tie.
 
 Chat 1:

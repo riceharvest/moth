@@ -4,10 +4,12 @@
       [--labels results/r4/a.labels.jsonl,...]
 
 Walks each chat to its first bad reply (assistant-speak, a crutch line, a repeated motif, unprompted identity talk
-past the first, a complex command, an explained agent message, an OFF-gist label from moth.gist, ...) or made-up
+past the first, file talk, an explained agent message, an OFF-gist label from moth.gist, ...) or made-up
 "what X" question, and keeps the part BEFORE that exchange if it still has >= 2 replies. Each chat is encoded with
 its own card's student system prompt (cards.student_system; chats without a card: the moth card). Lowercases replies. Writes data/sft/{train,val}.pt: lists of (ids, loss_mask) where the mask
-covers moth's turns (tool calls and replies), not the system/user/tool tokens. Prints the effective mix first.
+covers moth's replies, not the system/user tokens. Prints the effective mix first.
+Pure chat (2026-10-19): the student has no tools and no home folder, so a chat with any tool call or tool row (old
+data) is dropped whole, and a reply that talks about files (a .txt name or a folder/ path the friend didn't say) too.
 """
 from __future__ import annotations
 
@@ -29,7 +31,7 @@ from tiny_agent.chat import render  # noqa: E402
 from moth.agent import AGENT_TAG, clean_agent_message  # noqa: E402
 from moth.cards import MOTH_CARD, student_system  # noqa: E402
 from moth.gist import identity_ref, load_labels  # noqa: E402
-from moth.persona import FOLDERS, SYSTEM_STUDENT  # noqa: E402,F401
+from moth.persona import SYSTEM_STUDENT  # noqa: E402,F401
 
 MAX_WORDS = 40
 BANNED = ("as an ai", "assistant", "how can i help", "let me know", "feel free", "i'm here to help",
@@ -55,21 +57,6 @@ def clean_reply(t: str) -> str | None:
         return None
     return t
 
-
-def known_names(d: dict) -> set[str]:
-    names = set((d.get("card") or {}).get("folders") or FOLDERS)
-    for p in list(d["home"]) + list(d.get("home_after") or {}):
-        parts = p.split("/")
-        names.update(parts)
-    return names
-
-
-COMPLEX_CMD = re.compile(r"\bfor\b|\bwhile\b|\||&&|;|\*|-la\b|2>|\$\(|\becho\b|<<|\s-\w*R")
-# moth looks with one tiny command: ls [-1|-a] [dirs], cat <file(s)>, wc/head on one file (~/ and dir/ allowed).
-# Anything else (echo, ls -R, grep, find, absolute paths, heredocs) counts as complex.
-_P = r"(?:~/)?(?:[\w.-]+/)?[\w.-]+"
-TINY_CMD = re.compile(rf"\s*(?:ls(?: -[1a])?(?: (?:~/?|(?:~/)?[\w-]+/?))*|cat {_P}(?: {_P})*|"
-                      rf"(?:wc|head)(?: -[a-z]*\d*| -n \d+)? {_P})\s*")
 
 # moth's crutch images: each may come up in at most one reply per chat, and at most 2 replies per chat may use any
 # of them (r2's moth talked about the fan in a quarter of all replies; r3's about the card/glow/warmth).
@@ -227,10 +214,11 @@ def keep(d: dict, why: collections.Counter, labels: list[dict] | None = None) ->
     remain), lowercased replies; None if the whole chat goes. Counts `<reason>:cut` / `<reason>:drop` in why.
     labels: moth.gist labels of this chat (one per reply with content, in order); an OFF one ends the usable part.
     None = not labelled (unknown, no cut): gen_dialogs calls keep() mid-chat, before any label exists."""
-    names = known_names(d)
     msgs = d["messages"]
+    if any(m["role"] == "tool" or m.get("tool_calls") for m in msgs):
+        why["tool_use:drop"] += 1   # pure chat: no tool rows in training
+        return None
     out = []
-    seen_text = ""
     ctx = {"is_agent": chat_type(d) == "agent", "user": "", "agent_msg": "", "after_agent": False, "bug_said": False,
            "tool_text": "", "topic": str(d.get("topic") or ""), "n_replies": 0, "identity": 0,
            "motif": collections.Counter(), "motif_replies": 0, "card": d.get("card") or MOTH_CARD, "use_matcher": True}
@@ -265,22 +253,7 @@ def keep(d: dict, why: collections.Counter, labels: list[dict] | None = None) ->
             if x is not None and not x_in(x, prev_reply + " " + ctx["agent_msg"]):
                 reason = "made_up_what"
                 break
-        if m["role"] == "tool":
-            seen_text += "\n".join(m["results"]).lower()
-            ctx["tool_text"] += " " + "\n".join(m["results"]).lower()
         if m["role"] == "assistant":
-            for c in m.get("tool_calls") or []:
-                if c["name"] not in ("bash", "read", "write"):
-                    why["bad_tool:drop"] += 1
-                    return None
-                cmd = str(c["arguments"].get("command", ""))
-                if c["name"] == "bash" and (COMPLEX_CMD.search(cmd) or not TINY_CMD.fullmatch(cmd)):
-                    reason = "complex_cmd"   # moth should look with one simple command at a time
-                    break
-                if c["name"] == "write":
-                    seen_text += " " + str(c["arguments"].get("path", "")).lower()
-            if reason:
-                break
             if m.get("content"):
                 orig_j += 1
                 if labels is not None and not labels[orig_j]["on"]:
@@ -290,11 +263,10 @@ def keep(d: dict, why: collections.Counter, labels: list[dict] | None = None) ->
                 if t is None:
                     reason = "style"
                     break
-                if any(f not in names and f not in seen_text for f in FILE_RE.findall(t)):
-                    why["invented_file:drop"] += 1
-                    return None
-                if any(f not in names and f not in seen_text and f not in ("and", "or") for f in DIR_RE.findall(t)):
-                    why["invented_dir:drop"] += 1
+                said = ctx["user"]
+                if any(f not in said for f in FILE_RE.findall(t)) or \
+                        any(f not in said and f not in ("and", "or") for f in DIR_RE.findall(t)):
+                    why["file_talk:drop"] += 1   # a pure chatbot has no files to talk about
                     return None
                 reason = reply_problem(t.replace("’", "'"), ctx)
                 if reason:
@@ -388,10 +360,8 @@ def has_name(d_or_msgs) -> bool:
 
 
 def stitchable(item: dict) -> bool:
-    """Talk chats only, no tools (each chat has its own home folder) and no given name."""
-    return (item["type"] == "talk" and "name" not in item.get("scenario", "")
-            and not any(m.get("tool_calls") for m in item["messages"] if m["role"] == "assistant")
-            and not has_name(item["messages"]))
+    """Talk chats only and no given name."""
+    return item["type"] == "talk" and "name" not in item.get("scenario", "") and not has_name(item["messages"])
 
 
 def mix_report(items: list[dict]) -> dict:
@@ -414,8 +384,6 @@ def mix_report(items: list[dict]) -> dict:
                     wx_ok += x_in(x, prev)
             if m["role"] == "user":
                 last_user = m["content"]
-            if m["role"] == "tool":
-                last_user += " " + " ".join(m["results"])
             if m["role"] == "assistant" and m.get("content"):
                 t = m["content"].replace("’", "'")
                 n += 1
@@ -513,7 +481,7 @@ def filter_chats(paths: list[str], why: collections.Counter, cutoff: dict | None
             b["kept"] += 1
             b["cut"] += n_replies(msgs) < orig
             items.append({"seed": d["seed"], "type": typ, "src": src, "scenario": d.get("scenario", ""),
-                          "messages": msgs, "home": d["home"], "card": d.get("card")})
+                          "messages": msgs, "card": d.get("card")})
     return items, by_len
 
 
@@ -642,9 +610,7 @@ def main():
         for k in kept:
             f.write(json.dumps(k, ensure_ascii=False) + "\n")
     toks = sum(len(r[0]) for r in rows)
-    tool = sum(any(m.get("tool_calls") for m in k["messages"]) for k in kept)
-    print(f"{toks / 1e6:.2f}M tokens, {sum(sum(r[1]) for r in rows) / 1e6:.2f}M trained, "
-          f"{tool / max(len(kept), 1):.0%} of chats use tools")
+    print(f"{toks / 1e6:.2f}M tokens, {sum(sum(r[1]) for r in rows) / 1e6:.2f}M trained")
 
 
 if __name__ == "__main__":

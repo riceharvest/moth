@@ -95,7 +95,7 @@ def sample_home(rng: random.Random, pool: dict[str, dict[str, str]], card: dict 
     """{relative path: content}. 2-6 files per folder; now and then a folder is empty (kept via .keep).
     card None or the moth card: moth's folders from `pool` (same draws as before cards existed). Any other card: its
     folders from card_files[card id] (falling back to GENERIC_SEED per folder)."""
-    if card is not None and list(card.get("folders") or GENERIC_FOLDERS) != list(FOLDERS):
+    if card is not None and card.get("id") != "moth" and list(card.get("folders") or GENERIC_FOLDERS) != list(FOLDERS):
         return _card_home(rng, card, (card_files or {}).get(card.get("id"), {}))
     files = {}
     for f in FOLDERS:

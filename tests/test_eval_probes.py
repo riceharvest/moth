@@ -219,9 +219,9 @@ def test_judge_all_with_fake_ask():
 
     def ask(prompt):
         seen.append(prompt)
-        return 'sure: {"reason": "ok", "cute": 5, "charm": 4, "character": 3, "coherence": 4, "grounding": 5, "back_and_forth": 2}'
+        return 'sure: {"reason": "ok", "cute": 5, "charm": 4, "character": 3, "coherence": 4, "back_and_forth": 2}'
     judge_all(rs, None, ask=ask)
-    assert rs[0]["judge"]["back_and_forth"] == 2.0 and rs[0]["judge"]["v"] == 3 and rs[0]["judge"]["cute"] == 5.0
+    assert rs[0]["judge"]["back_and_forth"] == 2.0 and rs[0]["judge"]["v"] == 4 and "grounding" not in rs[0]["judge"] and rs[0]["judge"]["cute"] == 5.0
     assert "cute (the main score)" in seen[0]
     with tempfile.TemporaryDirectory() as d:
         rep = report(rs, d, "fake")

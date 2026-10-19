@@ -1,14 +1,12 @@
 """Write moth training chats with a teacher behind an OpenAI-compatible server (vLLM).
 
-  python -m moth.gen_dialogs --pool  --n-per-folder 250          # teacher-written home files -> out/file_pool.json
   python -m moth.gen_dialogs --dialogs 12000 --start 0           # chats -> out/dialogs.jsonl (resumable)
 
-One chat: sample an identity card (cards.py), a home and a (persona, scenario, length); the teacher plays the human
-(USER_SIM_PROMPT) and the chat buddy (teacher_system(card) = the shared TEACHER_CORE + the card, with real
-bash/read/write tools run in the sandbox). Records use tiny_agent's canonical message format plus "card";
-filtering and lowercasing happen later in build_sft.py (with the per-reply labels of moth.gist, if given).
-
-  python -m moth.gen_dialogs --card-files 800                   # each pool card's own home files -> out/card_files.json
+A PURE chatbot (2026-10-19): no tools, no home folder. One chat: sample an identity card (cards.py) and a (persona,
+scenario, length); the teacher plays the human (USER_SIM_PROMPT) and the chat buddy (teacher_system(card) = the
+shared TEACHER_CORE + the card). Chat kinds: talk (some long, some with a recall check) and agent reactions. Records
+use tiny_agent's canonical message format (assistant tool_calls always empty) plus "card"; filtering and lowercasing
+happen later in build_sft.py (with the per-reply labels of moth.gist, if given).
 """
 from __future__ import annotations
 
@@ -25,33 +23,14 @@ import time
 from openai import AsyncOpenAI
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from moth import _tools as tools  # noqa: E402  (vendored copy of tiny_agent/tools.py)
 from moth.agent import (AGENT_CHAT_REMIND, AGENT_LENGTHS, AGENT_PROMPT, AGENT_REMIND,  # noqa: E402
                         AGENT_RULES, AGENT_SCENARIOS, AGENT_TAG, AGENT_TASKS, AGENT_USER_PERSONAS, HARNESS_STYLES,
                         OUTCOMES, agent_turn)
-from moth.cards import build_pool, describe, display_name, sample_card  # noqa: E402
+from moth.cards import describe, display_name, sample_card  # noqa: E402
 from moth.gist import ASKED, identity_ref  # noqa: E402
-from moth.home import load_pool, sample_home  # noqa: E402
-from moth.persona import (CARD_FILES_PROMPT, FILE_POOL_PROMPT, FOLDER_HINTS, FOLDERS, HOME_SCENARIOS,  # noqa: E402
-                          SCENARIOS, TALK_SCENARIOS, TEACHER_BIBLE, TOPICS, USER_PERSONAS, USER_SIM_PROMPT,
+from moth.persona import (SCENARIOS, TEACHER_BIBLE, TOPICS, USER_PERSONAS, USER_SIM_PROMPT,  # noqa: E402
                           teacher_system)
 
-if os.environ.get("MOTH_NO_BWRAP") == "1":   # box without user namespaces: plain bash in the workspace
-    def _plain(workdir, command, timeout):
-        return ["timeout", "-k", "1", str(timeout), "env", "-i", f"HOME={workdir}", "PATH=/usr/bin:/bin",
-                "LANG=C.UTF-8", "bash", "-c", f"cd {workdir} && ulimit -t {timeout}; {command}"]
-    tools.bwrap_cmd = _plain
-
-OAI_TOOLS = [
-    {"type": "function", "function": {"name": "bash", "description": "Run a shell command in your home folder ~ (ls, cat, wc, grep...).",
-     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
-    {"type": "function", "function": {"name": "read", "description": "Read a file with line numbers.",
-     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "offset": {"type": "integer"},
-                                                     "limit": {"type": "integer"}}, "required": ["path"]}}},
-    {"type": "function", "function": {"name": "write", "description": "Create or overwrite a file.",
-     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
-                    "required": ["path", "content"]}}},
-]
 SIM_SWITCH = ("[DIRECTOR NOTE: for this message only, you are NOT the chat-buddy character. You write the HUMAN side of "
               "the chat. Output only the human's next message.]\n\n")
 SIM_SYSTEM = ("You write one side of a chat for a story: the HUMAN who is chatting with a tiny cute chatbot. "
@@ -94,20 +73,16 @@ NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
 # teacher view only (appended to each human turn, never in the training text). TALK_REMIND_ID when the friend asked
 # who/what it is, else TALK_REMIND: unprompted identity talk is capped at 1% of replies (label pass "self")
 TALK_REMIND = ("\n\n(answer what they just said or meant first, in one short lowercase line, usually under 15 words. "
-               "no talk about what you are, your name, where you live or your home folder: they didn't ask. files only "
-               "if they ask about your home or want something saved: one tiny command.)")
+               "no talk about what you are, your name or where you live: they didn't ask.)")
 TALK_REMIND_ID = ("\n\n(answer what they just said first, one short lowercase line. they asked who or what you are: "
-                  "answer from WHO YOU ARE in a few plain words, then back to them. files only if they ask about your "
-                  "home or want something saved: one tiny command.)")
+                  "answer from WHO YOU ARE in a few plain words, then back to them.)")
 MOTH_REMIND = TALK_REMIND   # old name
 QBACK = ("\n(this time hand the turn back, on the same line: end with one small question about them, or bring back "
          "something they told you earlier.)")
 NO_QBACK = "\n(this time just answer: no question at the end, unless a game needs one.)"   # r4 test: 61% asked back
 RECALL_REMIND = "\n(they told you this earlier in this chat: answer from the chat.)"
-CARD_FILES: dict[str, dict[str, str]] = {}   # --card-file-path: each pool card's own home files (gen --card-files)
-LEAKS = ("<think>", "</think>", "<|tool_call", "<|im_")   # reasoning or raw tool-call markup in the reply = broken call
+LEAKS = ("<think>", "</think>", "<|tool_call", "<tool_call>", "<function", "<|im_")   # reasoning or raw tool-call markup in the reply = broken call
 TURNS = [3, 4, 5, 6, 6, 7, 8, 8, 9, 10, 12, 14]   # back-and-forth: the thing round 2 couldn't do
-HOME_SHARE = {"p": 0.15}      # --home-share: fraction of chats about moth's files
 THINK = {"on": False, "budget": 256}   # --think: teacher always reasons first (LFM2.5), capped at --think-budget tokens
 TURN_CHOICES: list[int] = []   # --turns: override the chat-length distribution (e.g. long chats)
 SCENARIO_IDS: list[int] = []   # --scenario-ids: restrict a run to some scenarios (e.g. small talk only)
@@ -145,24 +120,13 @@ def sft_problem(meta: dict, msgs: list[dict], text: str) -> str | None:
     def cut(t):
         why = collections.Counter()
         m = msgs + [{"role": "assistant", "think": None, "content": t, "tool_calls": []}]
-        out = SFT_KEEP({**meta, "home_after": {}, "messages": m}, why)
+        out = SFT_KEEP({**meta, "messages": m}, why)
         return None if out is not None and len(out) == len(m) else (next(iter(why), "cut").split(":")[0])
     try:
         r = cut(text)
         return r if r and not cut("ok.") else None   # "ok." cut too: the problem is earlier (a user turn), not here
     except Exception:  # noqa: BLE001
         return None
-
-
-def coerce(name: str, args: dict) -> dict:
-    if name == "read":
-        for k in ("offset", "limit"):
-            if k in args:
-                try:
-                    args[k] = int(args[k])
-                except (TypeError, ValueError):
-                    args.pop(k)
-    return args
 
 
 def transcript(msgs: list[dict], name: str = "moth") -> str:
@@ -173,15 +137,8 @@ def transcript(msgs: list[dict], name: str = "moth") -> str:
             out.append("[your AI agent's latest message to you, which moth can also see]\n" + body[:600])
         elif m["role"] == "user":
             out.append(f"you: {m['content']}")
-        elif m["role"] == "assistant":
-            for c in m.get("tool_calls") or []:
-                a = c["arguments"]
-                out.append(f"[{name} used {c['name']}: {a.get('command') or a.get('path')}]")
-            if m.get("content"):
-                out.append(f"{name}: {m['content']}")
-        elif m["role"] == "tool":
-            for r in m["results"]:
-                out.append("[output]\n" + (r if len(r) < 400 else r[:400] + " ..."))
+        elif m["role"] == "assistant" and m.get("content"):
+            out.append(f"{name}: {m['content']}")
     return "\n".join(out) or "(nothing yet: write your first message)"
 
 
@@ -201,10 +158,6 @@ async def chat(client, model, messages, budget=None, **kw):
 
 META = re.compile(r"\bthe user\b|\bin character\b|\bmoth (should|would|is asked)\b|\blet me (think|check|re)|"
                   r"\bno markdown\b|\bkeep it (short|simple)\b|\b\d+ words\b|\blet me try\b|\bmisunderstand", re.I)
-COMPLEX_CMD = re.compile(r"\bfor\b|\bwhile\b|\||&&|;|\*|-la\b|2>|\$\(|\becho\b|<<|\s-\w*R")   # = build_sft: those
-_P = r"(?:~/)?(?:[\w.-]+/)?[\w.-]+"                                                        # chats get dropped
-TINY_CMD = re.compile(rf"\s*(?:ls(?: -[1a])?(?: (?:~/?|(?:~/)?[\w-]+/?))*|cat {_P}(?: {_P})*|"
-                      rf"(?:wc|head)(?: -[a-z]*\d*| -n \d+)? {_P})\s*")
 # agent chats: build_sft's TECHY (copied, it imports torch) + over 25 words + the "i'm just a moth / can't understand" dodge
 AGENT_BAD = re.compile(r"\b[a-z]\w*_\w+\b|\w\(\)|\b\w+\.(?:py|js|ts|tsx|json|csv|md|ya?ml|toml|sh|rs|go|html|css|sql|cfg|ini)\b|"
                        r"\b(?:ruff|mypy|pytest|npm|pip|git|github|docker|eslint|webpack|cargo|kubectl|ci|lint|linter|"
@@ -251,17 +204,6 @@ def agent_stale(text: str, msgs: list[dict]) -> bool:
     if not last.startswith(AGENT_TAG):
         return False
     return bool(BUG.search(text) and not re.search(r"\bbugs?\b", last, re.I))
-
-
-def complex_cmd(cmd: str) -> bool:
-    return bool(cmd) and bool(COMPLEX_CMD.search(cmd) or not TINY_CMD.fullmatch(cmd))   # "" = read/write call
-
-
-def bash_cmd(tc) -> str:
-    try:
-        return str(json.loads(tc.function.arguments or "{}").get("command", "")) if tc.function.name == "bash" else ""
-    except (json.JSONDecodeError, AttributeError):
-        return ""
 
 
 def id_allowed(u: str, card: dict | None) -> bool:
@@ -329,11 +271,11 @@ async def user_turn(client, model, persona, scenario, turns, i, msgs, topic="any
             p += SIM_SHORT.format(mood=random.choice(SHORT_MOODS))
         r = await chat(client, model, [{"role": "system", "content": SIM_SYSTEM}, {"role": "user", "content": p}],
                        budget=0, temperature=1.0, top_p=0.95, max_tokens=100)
-    else:   # same system + tools as moth's calls: Qwen3.x's hybrid prefix cache reuses only whole ~1.5k-token blocks,
+    else:   # same system prompt as moth's calls: Qwen3.x's hybrid prefix cache reuses only whole ~1.5k-token blocks,
         # so both roles share one identical leading block (the character sheet) and only the tail is prefilled
         r = await chat(client, model, [{"role": "system", "content": system or TEACHER_BIBLE},
                                        {"role": "user", "content": SIM_SWITCH + p}],
-                       tools=OAI_TOOLS, tool_choice="none", temperature=1.0, top_p=0.95, max_tokens=80)
+                       temperature=1.0, top_p=0.95, max_tokens=80)
     t = reply_text(r, cut_ok=True)
     if not t or "[END]" in t:
         return None
@@ -353,57 +295,23 @@ async def user_turn(client, model, persona, scenario, turns, i, msgs, topic="any
 
 
 def turn_context(msgs: list[dict]) -> str:
-    """The last human/agent message plus any tool output since: words from there are "prompted"."""
-    i = max(j for j, m in enumerate(msgs) if m["role"] == "user")
-    out = [msgs[i]["content"]]
-    for m in msgs[i + 1:]:
-        if m["role"] == "tool":
-            out += m["results"]
-    return "\n".join(out)
+    """The last human/agent message: words from there are "prompted"."""
+    return next(m["content"] for m in reversed(msgs) if m["role"] == "user")
 
 
-async def moth_turn(client, model, oai: list[dict], msgs: list[dict], ws, stats, talk_only=False, must=None,
+async def moth_turn(client, model, oai: list[dict], msgs: list[dict], stats, talk_only=False, must=None,
                     meta=None, card=None) -> bool | str:
-    """Extend oai (teacher view) and msgs (canonical) with the buddy's reply to the last user message."""
-    avoid: list[str] = []   # agent chats: rejected lines, shown back to the teacher (else it resamples the same one)
-    for k in range(8 if talk_only else 5):   # up to 3 looks, broken replies are resampled; late rounds may only talk
-        # agent chats may not call tools. LFM: no tools at all (it ran `echo hi` after agent messages, and with
-        # tool_choice="none" it still wrote tool-call markup). Qwen: the tools with tool_choice="none", so the call
-        # keeps the shared tools+core prefix (hybrid prefix cache, whole 1568-token blocks)
-        if talk_only:
-            tk = {} if THINK["on"] else {"tools": OAI_TOOLS, "tool_choice": "none"}
-        else:
-            tk = {"tools": OAI_TOOLS, "tool_choice": "auto" if k < 3 else "none"}
+    """Extend oai (teacher view) and msgs (canonical) with the buddy's reply to the last user message (no tools: a
+    reply with tool-call or reasoning markup counts as broken and is resampled)."""
+    avoid: list[str] = []   # rejected lines, shown back to the teacher (else it resamples the same one)
+    for k in range(8 if talk_only else 5):
         view = oai if not avoid else oai[:-1] + [{**oai[-1], "content": oai[-1]["content"] + "\n(not these, they are "
                                                   "stale, off the point, about yourself or too techy: "
                                                   + " / ".join(avoid[-3:]) + ")"}]
         r = await chat(client, model, view, temperature=1.0 if avoid else 0.85, top_p=0.95,
-                       max_tokens=THINK["budget"] + 300 if THINK["on"] else 400, **tk)
-        m = r.choices[0].message
-        if r.choices[0].finish_reason == "length":
-            continue
-        if m.tool_calls and THINK["on"] and any(complex_cmd(bash_cmd(tc)) for tc in m.tool_calls):
-            continue   # LFM loves `ls -la` and pipes: resample rather than keep a chat build_sft will drop
-        if m.tool_calls:
-            calls, results, oai_calls = [], [], []
-            for tc in m.tool_calls[:3]:
-                try:
-                    args = coerce(tc.function.name, json.loads(tc.function.arguments or "{}"))
-                except json.JSONDecodeError:
-                    return False
-                if tc.function.name not in ("bash", "read", "write"):
-                    return False
-                res = await asyncio.to_thread(ws.call, tc.function.name, args)
-                calls.append({"name": tc.function.name, "arguments": args})
-                results.append(res)
-                oai_calls.append({"id": tc.id, "type": "function",
-                                  "function": {"name": tc.function.name, "arguments": json.dumps(args)}})
-            oai.append({"role": "assistant", "content": None, "tool_calls": oai_calls})
-            for tc, res in zip(oai_calls, results):
-                oai.append({"role": "tool", "tool_call_id": tc["id"], "content": res})
-            msgs.append({"role": "assistant", "think": None, "content": "", "tool_calls": calls})
-            msgs.append({"role": "tool", "results": results})
-            stats["tool_calls"] += len(calls)
+                       max_tokens=THINK["budget"] + 300 if THINK["on"] else 400)
+        if r.choices[0].finish_reason == "length" or r.choices[0].message.tool_calls:
+            stats["broken_resample"] += 1
             continue
         text = re.sub(r"^moth\s*:\s*", "", reply_text(r) or "", flags=re.I)
         if not text or META.search(text):   # empty, cut off, or the teacher's reasoning spilled into the reply
@@ -456,7 +364,7 @@ async def agent_message(client, model, rng) -> tuple[str, str]:
     return reply_text(r) or "", "teacher"
 
 
-async def agent_dialog(client, model, seed, rng, files, stats, card=None) -> dict | None:
+async def agent_dialog(client, model, seed, rng, stats, card=None) -> dict | None:
     """The buddy watches a big coding agent: agent message -> its gist-first take -> the human vents or chats -> repeat."""
     persona, scenario = rng.choice(AGENT_USER_PERSONAS), rng.choice(AGENT_SCENARIOS)
     msgs: list[dict] = []
@@ -467,57 +375,51 @@ async def agent_dialog(client, model, seed, rng, files, stats, card=None) -> dic
     async def say(u: str, remind: str) -> bool:
         msgs.append({"role": "user", "content": u})
         oai.append({"role": "user", "content": teacher_view(u, remind)})
-        if await moth_turn(client, model, oai, msgs, ws, stats, talk_only=True,
-                           meta={"type": "agent", "home": files, "topic": "", "card": card}, card=card):
+        if await moth_turn(client, model, oai, msgs, stats, talk_only=True,
+                           meta={"type": "agent", "topic": "", "card": card}, card=card):
             return True
         msgs.pop()   # no fresh line after all retries: end the chat before this message
         return False
 
-    with tools.Workspace(files) as ws:
-        ok = True
-        for k in range(rng.randint(2, 4)):
-            if k == 0 and rng.random() < 0.4:   # sometimes the human says something first
-                u = await user_turn(client, model, persona, scenario, 6, 1, msgs, "the AI agent", card=card, system=system)
-                if u and not (ok := await say(u, AGENT_CHAT_REMIND)):
-                    break
-            raw, src = await agent_message(client, model, rng)
-            if not raw:
+    ok = True
+    for k in range(rng.randint(2, 4)):
+        if k == 0 and rng.random() < 0.4:   # sometimes the human says something first
+            u = await user_turn(client, model, persona, scenario, 6, 1, msgs, "the AI agent", card=card, system=system)
+            if u and not (ok := await say(u, AGENT_CHAT_REMIND)):
                 break
-            if not (ok := await say(agent_turn(raw), AGENT_REMIND)):
+        raw, src = await agent_message(client, model, rng)
+        if not raw:
+            break
+        if not (ok := await say(agent_turn(raw), AGENT_REMIND)):
+            break
+        sources.append(src)
+        for j in range(rng.choice([0, 1, 1, 2, 3])):
+            u = await user_turn(client, model, persona, scenario, 6, j + 2, msgs, "the AI agent", card=card,
+                                system=system)
+            if u is None or not (ok := await say(u, AGENT_CHAT_REMIND)):
                 break
-            sources.append(src)
-            for j in range(rng.choice([0, 1, 1, 2, 3])):
-                u = await user_turn(client, model, persona, scenario, 6, j + 2, msgs, "the AI agent", card=card,
-                                    system=system)
-                if u is None or not (ok := await say(u, AGENT_CHAT_REMIND)):
-                    break
-            if not ok:
-                break
+        if not ok:
+            break
     if not sources:   # moth never reacted to an agent message
         stats["bad"] += 1
         return None
     stats["agent_cut"] += not ok
     return {"seed": seed, "type": "agent", "persona": persona, "scenario": scenario, "agent_sources": sources,
-            "turns": len(msgs), "card": card, "home": files, "home_after": files, "messages": msgs}
+            "turns": len(msgs), "card": card, "messages": msgs}
 
 
-async def one_dialog(client, model, seed, pool, stats) -> dict | None:
+async def one_dialog(client, model, seed, stats) -> dict | None:
     rng = random.Random(seed)
     card = sample_card(rng)
-    files = sample_home(rng, pool, card, CARD_FILES)
     if not SCENARIO_IDS and rng.random() < AGENT_SHARE["p"]:
-        return await agent_dialog(client, model, seed, rng, files, stats, card)
-    if SCENARIO_IDS:
-        scen = [SCENARIOS[i] for i in SCENARIO_IDS]
-    else:   # the product is conversation: most chats are pure talk, a few use moth's home folder
-        scen = HOME_SCENARIOS if rng.random() < HOME_SHARE["p"] else TALK_SCENARIOS
+        return await agent_dialog(client, model, seed, rng, stats, card)
+    scen = [SCENARIOS[i] for i in SCENARIO_IDS] if SCENARIO_IDS else SCENARIOS
     persona, scenario, turns = rng.choice(USER_PERSONAS), rng.choice(scen), rng.choice(TURN_CHOICES or TURNS)
     topic = rng.choice(TOPICS)
-    talk = scen is TALK_SCENARIOS
-    if talk and not TURN_CHOICES and rng.random() < LONG_SHARE["p"]:
+    if not TURN_CHOICES and rng.random() < LONG_SHARE["p"]:
         turns = rng.randint(16, 24)   # r3 had no chat over 14 turns
     recall = None
-    if talk and rng.random() < RECALL_SHARE["p"]:   # r3: ~50 of 21k chats asked for something back
+    if rng.random() < RECALL_SHARE["p"]:   # r3: ~50 of 21k chats asked for something back
         fact, short = rng.choice(RECALL_FACTS)
         fi = rng.choice([1, 2])
         recall = {"fact": short, "share_turn": fi, "ask_turn": fi + rng.randint(5, 8)}
@@ -525,54 +427,45 @@ async def one_dialog(client, model, seed, pool, stats) -> dict | None:
     msgs: list[dict] = []
     system = teacher_system(card)
     oai = [{"role": "system", "content": system}]
-    with tools.Workspace(files) as ws:
-        for i in range(1, turns + 1):
-            directive, extra = "", QBACK if rng.random() < 0.2 else NO_QBACK
-            if recall and i == recall["share_turn"]:
-                directive = f"\n\nIn THIS message, casually tell moth {fact}."
-            elif recall and i == recall["ask_turn"]:
-                directive = (f"\n\nIn THIS message, ask moth if it remembers {short} (you told it earlier). Ask in your "
-                             "own words and don't give the answer.")
-                extra = RECALL_REMIND
-            if (recall and i < recall["ask_turn"]) or (turns >= 16 and i < turns - 3):
-                directive += "\n\nThe chat is not finished: do not write [END] yet."
+    for i in range(1, turns + 1):
+        directive, extra = "", QBACK if rng.random() < 0.2 else NO_QBACK
+        if recall and i == recall["share_turn"]:
+            directive = f"\n\nIn THIS message, casually tell moth {fact}."
+        elif recall and i == recall["ask_turn"]:
+            directive = (f"\n\nIn THIS message, ask moth if it remembers {short} (you told it earlier). Ask in your "
+                         "own words and don't give the answer.")
+            extra = RECALL_REMIND
+        if (recall and i < recall["ask_turn"]) or (turns >= 16 and i < turns - 3):
+            directive += "\n\nThe chat is not finished: do not write [END] yet."
+        u = await user_turn(client, model, persona, scenario, turns, i, msgs, topic, directive, card, system)
+        for _ in range(3 if "[END]" in directive else 0):   # long / recall chat: broken sim calls (leaked
+            if u is not None:                                 # reasoning) ended 13 of 20 long chats early
+                break
             u = await user_turn(client, model, persona, scenario, turns, i, msgs, topic, directive, card, system)
-            for _ in range(3 if "[END]" in directive else 0):   # long / recall chat: broken sim calls (leaked
-                if u is not None:                                 # reasoning) ended 13 of 20 long chats early
-                    break
-                u = await user_turn(client, model, persona, scenario, turns, i, msgs, topic, directive, card, system)
-            if u is None:
-                break
-            if recall and i == recall["share_turn"]:
-                recall["said"] = u
-            must = None
-            if recall and i == recall["ask_turn"] and recall.get("said"):
-                recall["asked"] = u
-                must = stems(recall["said"]) - FACT_WORDS or None
-            msgs.append({"role": "user", "content": u})
-            oai.append({"role": "user", "content": teacher_view(u, extra=extra, card=card)})
-            r = await moth_turn(client, model, oai, msgs, ws, stats, must=must, card=card,
-                                meta={"type": "home" if scen is HOME_SCENARIOS else "talk", "home": files, "topic": topic,
-                                      "card": card})
-            if not r:
-                stats["bad"] += 1
-                return None
-            if r == "stop":
-                break
-        if not any(m["role"] == "assistant" for m in msgs):
+        if u is None:
+            break
+        if recall and i == recall["share_turn"]:
+            recall["said"] = u
+        must = None
+        if recall and i == recall["ask_turn"] and recall.get("said"):
+            recall["asked"] = u
+            must = stems(recall["said"]) - FACT_WORDS or None
+        msgs.append({"role": "user", "content": u})
+        oai.append({"role": "user", "content": teacher_view(u, extra=extra, card=card)})
+        r = await moth_turn(client, model, oai, msgs, stats, must=must, card=card,
+                            meta={"type": "talk", "topic": topic, "card": card})
+        if not r:
+            stats["bad"] += 1
             return None
-        final = {}
-        for root, _, names in os.walk(ws.root):
-            for n in names:
-                p = os.path.join(root, n)
-                final[os.path.relpath(p, ws.root)] = open(p, errors="replace").read()[:2000]
-    return {"seed": seed, "type": "home" if scen is HOME_SCENARIOS else "talk", "persona": persona,
-            "scenario": scenario, "topic": topic, "turns": turns, "recall": recall, "card": card, "home": files,
-            "home_after": final, "messages": msgs}
+        if r == "stop":
+            break
+    if not any(m["role"] == "assistant" for m in msgs):
+        return None
+    return {"seed": seed, "type": "talk", "persona": persona, "scenario": scenario, "topic": topic, "turns": turns,
+            "recall": recall, "card": card, "messages": msgs}
 
 
 async def run_dialogs(a, client, model):
-    pool = load_pool(a.pool_file)
     path = os.path.join(a.out, "dialogs.jsonl")
     done = set()
     if os.path.exists(path):
@@ -582,7 +475,7 @@ async def run_dialogs(a, client, model):
             except (ValueError, KeyError):
                 pass
     todo = [s for s in range(a.start, a.start + a.dialogs) if s not in done]
-    stats = collections.Counter(ok=0, bad=0, err=0, tool_calls=0, agent_resample=0, agent_stale=0, agent_cut=0,
+    stats = collections.Counter(ok=0, bad=0, err=0, broken_resample=0, agent_resample=0, agent_stale=0, agent_cut=0,
                                 recall_resample=0, id_resample=0)
     sem = asyncio.Semaphore(a.concurrency)
     f = open(path, "a")
@@ -591,7 +484,7 @@ async def run_dialogs(a, client, model):
     async def go(seed):
         async with sem:
             try:
-                d = await one_dialog(client, model, seed, pool, stats)
+                d = await one_dialog(client, model, seed, stats)
             except Exception as e:  # noqa: BLE001
                 stats["err"] += 1
                 print(f"seed {seed}: {type(e).__name__}: {e}", flush=True)
@@ -608,65 +501,6 @@ async def run_dialogs(a, client, model):
     print(f"done {stats} in {(time.time() - t0) / 60:.1f} min", flush=True)
 
 
-async def run_pool(a, client, model):
-    path = a.pool_file
-    pool = json.load(open(path)) if os.path.exists(path) else {}
-    sem = asyncio.Semaphore(a.concurrency)
-
-    async def batch(folder, k):
-        async with sem:
-            have = list(pool.get(folder, {}))
-            avoid = ", ".join(random.Random(k).sample(have, min(40, len(have)))) or "none"
-            p = FILE_POOL_PROMPT.format(n=10, folder=folder, hint=FOLDER_HINTS[folder], avoid=avoid, bible=TEACHER_BIBLE)
-            try:
-                r = await chat(client, model, [{"role": "user", "content": p}], temperature=1.0, top_p=0.95,
-                               max_tokens=6000 if THINK["on"] else 1500)
-                txt = r.choices[0].message.content or ""
-                items = json.loads(txt[txt.index("["): txt.rindex("]") + 1])
-            except Exception:  # noqa: BLE001
-                return
-            for it in items:
-                name = re.sub(r"[^a-z0-9_.]", "_", str(it.get("name", "")).lower().strip())
-                if not name.endswith(".txt") or len(name) > 48 or not it.get("content"):
-                    continue
-                pool.setdefault(folder, {}).setdefault(name, str(it["content"]).strip()[:400])
-
-    await asyncio.gather(*(batch(fo, k) for fo in FOLDERS for k in range(a.n_per_folder // 10)))
-    json.dump(pool, open(path, "w"), indent=1, ensure_ascii=False)
-    print("pool sizes:", {k: len(v) for k, v in pool.items()}, flush=True)
-
-
-async def run_card_files(a, client, model):
-    """Each of the first --card-files pool cards gets its own little home (one teacher call per card)."""
-    path = a.card_file_path
-    have = json.load(open(path)) if os.path.exists(path) else {}
-    cards = [c for c in build_pool()[:a.card_files] if c["id"] not in have]
-    sem = asyncio.Semaphore(a.concurrency)
-
-    async def one(card):
-        async with sem:
-            folders = card.get("folders") or []
-            p = CARD_FILES_PROMPT.format(who=describe(card), folders=" ".join(f + "/" for f in folders), n=12)
-            try:
-                r = await chat(client, model, [{"role": "user", "content": p}], temperature=1.0, top_p=0.95,
-                               max_tokens=6000 if THINK["on"] else 1500)
-                txt = r.choices[0].message.content or ""
-                items = json.loads(txt[txt.index("{"): txt.rindex("}") + 1])
-            except Exception:  # noqa: BLE001
-                return
-            files = {}
-            for k, v in items.items():
-                k = re.sub(r"[^a-z0-9_./]", "_", str(k).lower().strip())
-                if k.count("/") == 1 and k.split("/")[0] in folders and k.endswith(".txt") and len(k) < 60 and v:
-                    files[k] = str(v).strip()[:400]
-            if files:
-                have[card["id"]] = files
-
-    await asyncio.gather(*(one(c) for c in cards))
-    json.dump(have, open(path, "w"), indent=1, ensure_ascii=False)
-    print(f"card files: {len(have)} cards, {sum(map(len, have.values()))} files -> {path}", flush=True)
-
-
 SAMPLE_OPENERS = ["hey, i burned my toast this morning", "ok and?", "hiii what are you up to", "i'm so tired today",
                   "my cat keeps sitting on my keyboard", "Good evening. How was your day?", "what are you?",
                   "can you remember my name? it's lena"]
@@ -679,14 +513,12 @@ def first_teacher_view(seed: int) -> dict:
     chat type and reminder logic as one_dialog / agent_dialog; the human's line is a stand-in for the simulator's."""
     rng = random.Random(seed)
     card = sample_card(rng)
-    sample_home(rng, load_pool(None), card, CARD_FILES)
     if rng.random() < AGENT_SHARE["p"]:
         u = agent_turn(SAMPLE_AGENT)
         return {"type": "agent", "card": card, "system": teacher_system(card), "user": teacher_view(u, AGENT_REMIND)}
-    scen = HOME_SCENARIOS if rng.random() < HOME_SHARE["p"] else TALK_SCENARIOS
-    persona, scenario = rng.choice(USER_PERSONAS), rng.choice(scen)
+    persona, scenario = rng.choice(USER_PERSONAS), rng.choice(SCENARIOS)
     u = SAMPLE_OPENERS[seed % len(SAMPLE_OPENERS)]
-    return {"type": "home" if scen is HOME_SCENARIOS else "talk", "card": card, "system": teacher_system(card),
+    return {"type": "talk", "card": card, "system": teacher_system(card),
             "user": teacher_view(u, extra=NO_QBACK, card=card),
             "sim": SIM_SWITCH + sim_prompt(persona, scenario, 6, 1, [], rng.choice(TOPICS), card)}
 
@@ -696,9 +528,6 @@ def main():
     ap.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
     ap.add_argument("--model", default=None)
     ap.add_argument("--out", default="out")
-    ap.add_argument("--pool", action="store_true")
-    ap.add_argument("--n-per-folder", type=int, default=250)
-    ap.add_argument("--pool-file", default=None)
     ap.add_argument("--dialogs", type=int, default=0)
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--concurrency", type=int, default=96)
@@ -707,20 +536,16 @@ def main():
     ap.add_argument("--eval-agent-msgs", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                                                "data", "eval_agent_msgs.json"),
                     help="held-out eval agent messages: dropped from the agent pool")
-    ap.add_argument("--home-share", type=float, default=0.15, help="fraction of chats about moth's home/files")
     ap.add_argument("--recall-share", type=float, default=0.15, help="talk chats: share a fact early, ask 5+ turns later")
     ap.add_argument("--long-share", type=float, default=0.15, help="talk chats with 16-24 user turns")
     ap.add_argument("--think", action="store_true", help="teacher always reasons first (LFM2.5): cap it, split it off")
     ap.add_argument("--think-budget", type=int, default=256, help="--think: max reasoning tokens per moth/agent call")
     ap.add_argument("--turns", default="", help="comma-separated user-turn counts to sample from")
     ap.add_argument("--scenario-ids", default="", help="comma-separated indexes into persona.SCENARIOS")
-    ap.add_argument("--card-files", type=int, default=0, help="write the home files of the first N pool cards")
-    ap.add_argument("--card-file-path", default=None, help="cards' own home files (default <out>/card_files.json)")
     a = ap.parse_args()
     SCENARIO_IDS.extend(int(x) for x in a.scenario_ids.split(",") if x)
     TURN_CHOICES.extend(int(x) for x in a.turns.split(",") if x)
     THINK["on"], THINK["budget"] = a.think, a.think_budget
-    HOME_SHARE["p"] = a.home_share
     RECALL_SHARE["p"], LONG_SHARE["p"] = a.recall_share, a.long_share
     AGENT_SHARE["p"] = a.agent_share
     if os.path.exists(a.agent_pool):   # final messages only: drop mid-run narration ("Now let me...", "Phase 2", "...:")
@@ -736,20 +561,10 @@ def main():
             print(f"agent pool: WARNING no eval file at {a.eval_agent_msgs}, nothing held out", flush=True)
         print(f"agent pool: {len(AGENT_POOL)} final messages", flush=True)
     os.makedirs(a.out, exist_ok=True)
-    a.pool_file = a.pool_file or os.path.join(a.out, "file_pool.json")
-    a.card_file_path = a.card_file_path or os.path.join(a.out, "card_files.json")
-    if os.path.exists(a.card_file_path) and not a.card_files:
-        CARD_FILES.update(json.load(open(a.card_file_path)))
-        print(f"card files: {len(CARD_FILES)} cards with their own home", flush=True)
     client = AsyncOpenAI(base_url=a.base_url, api_key="x", timeout=300)
 
     async def run():
         model = a.model or (await client.models.list()).data[0].id
-        if a.pool:
-            await run_pool(a, client, model)
-        if a.card_files:
-            await run_card_files(a, client, model)
-            CARD_FILES.update(json.load(open(a.card_file_path)))
         if a.dialogs:
             await run_dialogs(a, client, model)
     asyncio.run(run())

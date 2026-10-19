@@ -9,12 +9,13 @@ Run on the box by runbook/job_bakeoff.sh (one teacher at a time behind vLLM on :
   python -m moth.bakeoff pairwise --judge TAG --out DIR --pairs a:b,... [--auto-top LABELS ...] TEACHER_DIR ...
   python -m moth.bakeoff report  results/bakeoff                         # tables (local)
 
-gen = moth.gen_dialogs with two changes for the seeds [S, S+N): a fixed chat-type mix (talk/agent/home/talk/recall/agent
+Pure chat (2026-10-19): no tools, no home folder.
+gen = moth.gen_dialogs with two changes for the seeds [S, S+N): a fixed chat-type mix (talk/agent/talk/recall/agent/long
 by seed) and every 5th chat on a held-out identity card (template or held-out free-form phrasing), so every teacher
 writes the same card/persona/scenario per seed. Seeds past S+N are the speed run (natural mix). Each record gets "bk"
 (quality flag, forced kind, completion time). The teacher also plays the human, so chats diverge after turn 1: the
 controlled comparison is `replay` = moth.probes' scripted user lines, answered through gen_dialogs.moth_turn (same
-reminders, resampling and tools), written in moth.eval's results.json shape (moth.pairwise, moth.metrics and
+reminders and resampling), written in moth.eval's results.json shape (moth.pairwise, moth.metrics and
 gist.chat_for_label_turns read it unchanged).
 """
 from __future__ import annotations
@@ -30,8 +31,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-KINDS6 = ["talk", "agent", "home", "talk", "recall", "agent"]
-DEFAULT_SHARES = {"agent": 0.25, "home": 0.15, "recall": 0.15}
+KINDS6 = ["talk", "agent", "talk", "recall", "agent", "long"]
+DEFAULT_SHARES = {"agent": 0.25, "recall": 0.15, "long": 0.15}
 
 
 # --- judge calls (Qwen non-thinking; gpt-oss always reasons: give it room and a fixed effort) ------------------------
@@ -53,11 +54,11 @@ def cmd_smoke(argv):
     ap.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
     ap.add_argument("--out", required=True)
     ap.add_argument("--think", action="store_true")
-    ap.add_argument("--plain-only", action="store_true", help="judges: one plain call (no tools), judge settings")
+    ap.add_argument("--plain-only", action="store_true", help="judges: one plain call, judge settings")
     a = ap.parse_args(argv)
     from openai import OpenAI
 
-    from moth.gen_dialogs import LEAKS, NO_THINK, OAI_TOOLS
+    from moth.gen_dialogs import LEAKS, NO_THINK
     c = OpenAI(base_url=a.base_url, api_key="x", timeout=300)
     model = c.models.list().data[0].id
     extra = {"thinking_token_budget": 256} if a.think else NO_THINK
@@ -94,27 +95,17 @@ def cmd_smoke(argv):
         sys.exit(0 if res["pass"] else 1)
     p = call("plain", [sysm, {"role": "user", "content": "hi! how was your day?"}])
     res["plain"]["ok"] = bool(p.get("content")) and not any(x in (p.get("content") or "") for x in LEAKS)
-    t = call("tool_auto", [sysm, {"role": "user", "content": "please use the bash tool to run `ls` in your home folder"}],
-             tools=OAI_TOOLS, tool_choice="auto")
-    res["tool_auto"]["ok"] = bool(t.get("tool_calls"))
-    if t.get("tool_calls"):
-        name, args = t["tool_calls"][0]
-        rt = call("tool_result", [sysm, {"role": "user", "content": "please use the bash tool to run `ls` in your home folder"},
-                                  {"role": "assistant", "content": None, "tool_calls": [
-                                      {"id": "c1", "type": "function", "function": {"name": name, "arguments": args}}]},
-                                  {"role": "tool", "tool_call_id": "c1", "content": "diary\nfriends\nnotes\nsaved"}],
-                  tools=OAI_TOOLS, tool_choice="auto")
-        res["tool_result"]["ok"] = bool(rt.get("content")) and not any(x in (rt.get("content") or "") for x in LEAKS)
-    n = call("tool_none", [sysm, {"role": "user", "content": "what's your favourite colour?"}], tools=OAI_TOOLS,
-             tool_choice="none")
-    res["tool_none"]["ok"] = bool(n.get("content")) and not any(x in (n.get("content") or "") for x in LEAKS) \
-        and not n.get("tool_calls")
+    turns = [sysm, {"role": "user", "content": "hi! how was your day?"}, {"role": "assistant", "content": "good! sleepy."},
+             {"role": "user", "content": "what?"}]
+    m2 = call("multi_turn", turns)
+    res["multi_turn"]["ok"] = bool(m2.get("content")) and not any(x in (m2.get("content") or "") for x in LEAKS) \
+        and not m2.get("tool_calls")
     res["model"] = model
-    res["pass"] = bool(res["plain"]["ok"] and res["tool_none"]["ok"])
+    res["pass"] = bool(res["plain"]["ok"] and res["multi_turn"]["ok"])
     os.makedirs(a.out, exist_ok=True)
     json.dump(res, open(os.path.join(a.out, "smoke.json"), "w"), indent=1, ensure_ascii=False)
     print(json.dumps({k: (v.get("ok") if isinstance(v, dict) else v) for k, v in res.items()}), flush=True)
-    for k in ("plain", "tool_auto", "tool_result", "tool_none"):
+    for k in ("plain", "multi_turn"):
         if k in res:
             print(f"  {k}: {json.dumps(res[k], ensure_ascii=False)[:300]}", flush=True)
     sys.exit(0 if res["pass"] else 1)
@@ -136,16 +127,16 @@ def cmd_gen(argv):
         c = orig_sample(rng, pool)   # always draw, so the seed's rng stream is the same with or without forcing
         return dict(force["card"]) if force["card"] is not None else c
 
-    async def one_dialog(client, model, seed, pool, stats):
+    async def one_dialog(client, model, seed, stats):
         i = seed - a.quality_start
         q = 0 <= i < a.quality_n
         kind = KINDS6[i % 6] if q else None
         force["card"] = held[(i // 5) % len(held)] if q and i % 5 == 2 else None
         # read synchronously by one_dialog/agent_dialog before their first await: no other chat runs in between
         G.AGENT_SHARE["p"] = (1.0 if kind == "agent" else 0.0) if q else DEFAULT_SHARES["agent"]
-        G.HOME_SHARE["p"] = (1.0 if kind == "home" else 0.0) if q else DEFAULT_SHARES["home"]
         G.RECALL_SHARE["p"] = (1.0 if kind == "recall" else 0.0) if q else DEFAULT_SHARES["recall"]
-        d = await orig_one(client, model, seed, pool, stats)   # its sync prefix runs now, with the settings above
+        G.LONG_SHARE["p"] = (1.0 if kind == "long" else 0.0) if q else DEFAULT_SHARES["long"]
+        d = await orig_one(client, model, seed, stats)   # its sync prefix runs now, with the settings above
         if d:
             d["bk"] = {"quality": q, "kind": kind, "heldout": q and i % 5 == 2, "t": time.time()}
         return d
@@ -187,43 +178,38 @@ def to_turns(msgs: list[dict]) -> list[dict]:
     return turns
 
 
-async def replay_one(client, model, probe, card, pool, card_files, stats, sem):
+async def replay_one(client, model, probe, card, stats, sem):
     import moth.gen_dialogs as G
-    from moth import _tools as tools
     from moth.agent import AGENT_CHAT_REMIND, AGENT_REMIND, AGENT_TAG
-    from moth.home import sample_home
     from moth.persona import teacher_system
     from moth.probes import WHAT_X, stable_seed, what_word
     cat, name, lines, check = probe
     seed = stable_seed(f"{card['id']}:{name}", 0)
-    rng = random.Random(seed)
-    files = sample_home(rng, pool, card, card_files)
     agent = any(str(u).startswith(AGENT_TAG) for u in lines)
     msgs: list[dict] = []
     oai = [{"role": "system", "content": teacher_system(card)}]
     what_x, broken, t0 = [], 0, time.time()
     async with sem:
-        with tools.Workspace(files) as ws:
-            for ti, u in enumerate(lines):
-                word = None
-                if u == WHAT_X:
-                    last = G.last_moth(msgs)
-                    word = what_word(last, random.Random(f"{seed}:{ti}"), avoid={w["word"] for w in what_x})
-                    u = f"what {word}?" if word else "what?"
-                msgs.append({"role": "user", "content": u})
-                if agent:
-                    view = G.teacher_view(u, AGENT_REMIND if u.startswith(AGENT_TAG) else AGENT_CHAT_REMIND)
-                else:
-                    extra = G.QBACK if random.Random(f"{seed}:q{ti}").random() < 0.2 else G.NO_QBACK
-                    view = G.teacher_view(u, extra=extra, card=card)
-                oai.append({"role": "user", "content": view})
-                ok = await G.moth_turn(client, model, oai, msgs, ws, stats, talk_only=agent, card=card,
-                                       meta={"type": "agent" if agent else "talk", "home": files, "topic": "", "card": card})
-                if not ok:
-                    broken += 1
-                    oai.append({"role": "assistant", "content": "hm?"})   # keep the teacher's view in turn order
-                if lines[ti] == WHAT_X:
-                    what_x.append({"turn": ti, "word": word, "on": None})
+        for ti, u in enumerate(lines):
+            word = None
+            if u == WHAT_X:
+                last = G.last_moth(msgs)
+                word = what_word(last, random.Random(f"{seed}:{ti}"), avoid={w["word"] for w in what_x})
+                u = f"what {word}?" if word else "what?"
+            msgs.append({"role": "user", "content": u})
+            if agent:
+                view = G.teacher_view(u, AGENT_REMIND if u.startswith(AGENT_TAG) else AGENT_CHAT_REMIND)
+            else:
+                extra = G.QBACK if random.Random(f"{seed}:q{ti}").random() < 0.2 else G.NO_QBACK
+                view = G.teacher_view(u, extra=extra, card=card)
+            oai.append({"role": "user", "content": view})
+            ok = await G.moth_turn(client, model, oai, msgs, stats, talk_only=agent, card=card,
+                                   meta={"type": "agent" if agent else "talk", "topic": "", "card": card})
+            if not ok:
+                broken += 1
+                oai.append({"role": "assistant", "content": "hm?"})   # keep the teacher's view in turn order
+            if lines[ti] == WHAT_X:
+                what_x.append({"turn": ti, "word": word, "on": None})
     r = {"cat": cat, "name": name, "seed": seed, "sample": 0, "turns": to_turns(msgs), "flags": {}, "check": None,
          "check_kind": None, "card": card, "card_id": card["id"], "broken": broken, "s": round(time.time() - t0, 1)}
     if what_x:
@@ -238,18 +224,13 @@ def cmd_replay(argv):
     ap.add_argument("--cards", default="moth,heldout_free:4")
     ap.add_argument("--think", action="store_true")
     ap.add_argument("--concurrency", type=int, default=64)
-    ap.add_argument("--pool-file", default=None)
-    ap.add_argument("--card-file-path", default=None)
     ap.add_argument("--max-probes", type=int, default=0, help="0 = all of a card's probes")
     a = ap.parse_args(argv)
     from openai import AsyncOpenAI
 
     import moth.gen_dialogs as G
-    from moth.home import load_pool
     from moth.probes import all_probes, for_card
     G.THINK["on"] = a.think
-    pool = load_pool(a.pool_file)
-    card_files = json.load(open(a.card_file_path)) if a.card_file_path and os.path.exists(a.card_file_path) else {}
     jobs = []
     for card in replay_cards(a.cards):
         ps = for_card(all_probes(), card)
@@ -261,7 +242,7 @@ def cmd_replay(argv):
         model = (await client.models.list()).data[0].id
         sem = asyncio.Semaphore(a.concurrency)
         t0 = time.time()
-        out = await asyncio.gather(*(replay_one(client, model, p, c, pool, card_files, stats, sem) for p, c in jobs),
+        out = await asyncio.gather(*(replay_one(client, model, p, c, stats, sem) for p, c in jobs),
                                    return_exceptions=True)
         good = [r for r in out if isinstance(r, dict)]
         errs = [repr(r)[:200] for r in out if not isinstance(r, dict)]
