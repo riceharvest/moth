@@ -49,6 +49,17 @@ hf download darioooooo0o/moth-112m --local-dir /tmp/moth-hubtest    # the real f
 cd /tmp/moth-hubtest/code && python -m moth update --check           # should say up to date (exit 0)
 ```
 
+Then tag that Hub commit with the version, so a pip install or installer whose code can't run a newer model falls
+back to the model made for it on first run (moth/weights.py `compatible`):
+
+```bash
+hf repos tag create darioooooo0o/moth-112m v0.3.1 --repo-type model   # tags main, right after the upload
+```
+
+If a new model needs newer code (a new architecture), say so in its `moth.json` (`"needs_moth": "<version>"`) and
+publish that moth on PyPI and the releases page at the same time: pip / installer installs won't fetch it until they
+upgrade, and they tell the user how.
+
 A later update is the same `hf upload` command: bump `moth/VERSION`, add a `## Changelog` entry to the card (that
 section is what `moth update --check` prints), rebuild `release/hf`, upload. `moth update` compares file hashes
 against the newest Hub revision, so users get exactly the changed files with `python -m moth update`. The pet's

@@ -22,6 +22,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)   # code/ (Hub download), the project (dev checkout) or site-packages (pip)
 REPO_ID = "darioooooo0o/moth-112m"
 FILES = ("model.safetensors", "config.json", "tokenizer.json")
+OPTIONAL = ("moth.json",)   # a model's manifest (moth/backends/manifest.py), when the repo has one
 DEV_MODEL = os.path.join(ROOT, "runs", "sft1", "model")
 DEV_TOKENIZER = os.path.join(ROOT, "data", "tiny-agent-112m", "tokenizer.json")
 REVISION_FILE = ".moth-version"   # same file and format as moth/update.py
@@ -122,11 +123,12 @@ def ensure(folder: str | None = None, repo_id: str | None = None, revision: str 
         raise SystemExit("moth needs huggingface_hub to download its weights:  pip install -U huggingface_hub")
     try:
         info = hub.HfApi().model_info(repo_id, revision=revision)
-        sha = info.sha   # pin the download to one commit
     except Exception as e:
         raise SystemExit(f"moth: can't get {repo_id}{'@' + revision if revision else ''} from the Hugging Face Hub "
                          f"({type(e).__name__}: {_first_line(e)}). Check your connection, or set MOTH_REPO / "
                          "MOTH_REVISION, or pass --model and --tokenizer.")
+    info = compatible(hub, repo_id, info, pinned=bool(revision))
+    sha = info.sha   # pin the download to one commit
     size = f" ({SIZE_HINT})" if repo_id == REPO_ID else ""
     endpoint = (os.environ.get("HF_ENDPOINT") or "https://huggingface.co").rstrip("/")
     print(f"moth: first run, downloading the model{size} from {endpoint}/{repo_id} "
@@ -135,7 +137,7 @@ def ensure(folder: str | None = None, repo_id: str | None = None, revision: str 
     os.makedirs(folder, exist_ok=True)
     drop_orphans(folder)   # what killed first runs left
     try:
-        hub.snapshot_download(repo_id=repo_id, revision=sha, local_dir=folder, allow_patterns=list(FILES))
+        hub.snapshot_download(repo_id=repo_id, revision=sha, local_dir=folder, allow_patterns=list(FILES + OPTIONAL))
     except Exception as e:
         raise SystemExit(f"moth: download failed ({type(e).__name__}: {_first_line(e)}); run moth again to resume")
     gone = missing(folder)
@@ -147,10 +149,34 @@ def ensure(folder: str | None = None, repo_id: str | None = None, revision: str 
         raise SystemExit(f"moth: download incomplete ({', '.join(gone)} missing; the Hub stopped answering?); "
                          "run moth again to resume")
     with open(os.path.join(folder, REVISION_FILE), "w") as f:
-        json.dump({"revision": sha, "files": sorted(FILES)}, f, indent=1)
+        json.dump({"revision": sha, "files": sorted(FILES + tuple(x for x in OPTIONAL if os.path.isfile(
+            os.path.join(folder, x))))}, f, indent=1)
         f.write("\n")
     print("moth: model downloaded", file=sys.stderr, flush=True)
     return folder
+
+
+def compatible(hub, repo_id: str, info, pinned: bool = False):
+    """info, unless the model at that revision is too new for this code (moth/backends/compat.py): then, when no
+    revision was asked for, the one tagged v<this moth's version> if the repo has it; else exit saying how to get
+    newer code. Never downloads more than the model's config.json / moth.json to decide."""
+    from moth.backends import compat
+    names = {s.rfilename for s in (info.siblings or [])}
+    why = compat.remote_problem(hub, repo_id, info.sha, names)
+    if not why:
+        return info
+    tag = "v" + compat.version()
+    if not pinned:
+        try:
+            old = hub.HfApi().model_info(repo_id, revision=tag)
+        except Exception:  # noqa: BLE001  no such tag (or no network): nothing to fall back to
+            old = None
+        if old is not None and not compat.remote_problem(hub, repo_id, old.sha, {s.rfilename for s in
+                                                                              (old.siblings or [])}):
+            print(f"moth: the newest model on the Hub is too new for this moth ({why}); using the one made for moth "
+                  f"{compat.version()} ({tag}). For the new one: {compat.upgrade_hint()}", file=sys.stderr, flush=True)
+            return old
+    raise SystemExit(compat.message(f"{repo_id}@{info.sha[:12]}", why))
 
 
 def drop_orphans(folder: str, min_age: float = 300.0) -> int:

@@ -79,8 +79,8 @@ The pet rereads these settings every 30 s, so `python -m moth config ...` applie
 
 Updates: once a day (config update_check, default on; last_update_check in ~/.moth/config.json) and on "check for
 updates", `python -m moth update --check` runs in a child process off the UI thread. A new version is said in a
-bubble ("run `python -m moth update`", or `pip install -U moth-companion` for newer pip code); nothing is ever
-installed by the pet. HF_HUB_OFFLINE=1 or MOTH_OFFLINE=1: no check.
+bubble ("run `python -m moth update`", `pip install -U moth-companion` for newer pip code, the releases page for
+the installers' app); nothing is ever installed by the pet. HF_HUB_OFFLINE=1 or MOTH_OFFLINE=1: no check.
 
 Only stdlib is needed for the logic (Wander, BubbleQueue, Poller, skin lookup and the row mapping); PySide6 is
 imported when a window or a sprite sheet is made, so the logic is testable without a display.
@@ -1612,8 +1612,9 @@ def check_for_update(timeout: float = UPDATE_TIMEOUT) -> tuple[str, str]:
         return "error", str(e)
     out = p.stdout or ""
     if p.returncode == 10:
-        if "newer code:" in out:
-            return "update", PIP_HINT
+        if "newer code:" in out:   # pip / the installers' app: moth update can't bring code
+            from moth.backends import compat   # stdlib only
+            return "update", compat.RELEASES if compat.install_kind() == "app" else PIP_HINT
         return "update", "moth update" if launch.weights.mode() == "pip" else "python -m moth update"
     if p.returncode == 0:
         return "none", ""
@@ -1622,6 +1623,8 @@ def check_for_update(timeout: float = UPDATE_TIMEOUT) -> tuple[str, str]:
 
 
 def update_line(hint: str) -> str:
+    if hint.startswith("https://"):   # the installers' app: a new installer
+        return f"there's a new me! get it at {hint}"
     return f"there's a new me! `{hint}`" if hint == PIP_HINT else f"there's a new me! run `{hint}`"
 
 

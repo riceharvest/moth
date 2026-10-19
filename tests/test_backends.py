@@ -130,6 +130,58 @@ class Manifests(Tmp):
         self.assertEqual(M.apply_args(a, M.parse({"context": 1024})).ctx_budget, 500)   # --ctx-budget wins
 
 
+class Compat(Tmp):
+    """moth/backends/compat.py: a model newer than this code is caught before torch loads it, with how to upgrade."""
+
+    def test_tiny_agent_keys_match_model_config(self):
+        try:
+            import dataclasses
+            from tiny_agent.model import ModelConfig
+        except Exception as e:  # noqa: BLE001  no (or a stub) torch
+            self.skipTest(f"no tiny_agent.model ({type(e).__name__})")
+        from moth.backends import compat
+        self.assertEqual(compat.TINY_AGENT_KEYS, {f.name for f in dataclasses.fields(ModelConfig)})
+
+    def test_problem(self):
+        from moth.backends import compat
+        ours = json.load(open(os.path.join(ROOT, "runs", "final2", "ckpt_100", "config.json"))) \
+            if os.path.isfile(os.path.join(ROOT, "runs", "final2", "ckpt_100", "config.json")) else {"d_model": 768}
+        self.assertIsNone(compat.problem(self.folder("empty")))
+        self.assertIsNone(compat.problem(self.folder("ours", config=ours)))
+        self.assertIsNone(compat.problem(self.folder("hf", config={"model_type": "gpt2", "n_embd": 8})))
+        self.assertIsNone(compat.problem(self.folder("old_enough", {"needs_moth": "0.0.1"}, ours)))
+        self.assertIn("doesn't know (n_experts, router_topk): a newer model architecture",
+                      compat.problem(self.folder("moe", config=dict(ours, n_experts=8, router_topk=2))))
+        self.assertEqual(compat.problem(self.folder("v9", {"needs_moth": "9.0.0"}, ours)), "it needs moth 9.0.0 or newer")
+        self.assertIn("'mamba' backend", compat.problem(self.folder("mamba", {"backend": "mamba"})))
+
+    def test_hints_and_require(self):
+        from moth.backends import compat
+        self.assertIn(compat.RELEASES, compat.upgrade_hint("app"))
+        self.assertTrue(compat.upgrade_hint("pip").startswith("pip install -U moth-companion"))
+        self.assertIn("python -m moth update", compat.upgrade_hint("hf"))
+        with mock.patch.object(sys, "frozen", True, create=True):
+            self.assertEqual(compat.install_kind(), "app")
+        d = self.folder("v9", {"needs_moth": "9.0.0"})
+        with self.assertRaises(SystemExit) as cm:
+            compat.require(d)
+        self.assertIn(f"is newer than this moth ({compat.version()}): it needs moth 9.0.0 or newer. To get a moth "
+                      "that can run it:", str(cm.exception))
+        self.assertTrue(compat.newer("0.3.1", "0.10.0") and not compat.newer("0.3.1", "0.3.1"))
+
+    def test_serve_refuses_a_too_new_folder_with_the_hint(self):
+        from moth import serve
+        d = self.folder("v9", {"backend": "mamba"})
+        with self.assertRaises(SystemExit) as cm:
+            serve.parse_args(["--model", d])
+        self.assertIn("'mamba' backend this moth doesn't have", str(cm.exception))
+        self.assertNotIn("Traceback", str(cm.exception))
+
+    def test_needs_moth_is_a_known_key(self):
+        m = M.parse({"needs_moth": "0.4.0"})
+        self.assertEqual((m.needs_moth, m.notes), ("0.4.0", ()))
+
+
 class Specs(Tmp):
     def test_parse_spec(self):
         self.assertEqual(backends.parse_spec("openai:http://127.0.0.1:11434/v1#qwen3:0.6b"),

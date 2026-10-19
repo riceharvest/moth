@@ -1372,6 +1372,11 @@ class SkinLogicTest(unittest.TestCase):
             return mock.patch.object(P.subprocess, "run", return_value=subprocess.CompletedProcess([], rc, out, err))
         with fake(10, "newer code: moth 0.3.0 -> 0.4.0:  pip install -U moth-companion"):
             self.assertEqual(P.check_for_update(), ("update", P.PIP_HINT))
+        from moth.backends import compat
+        with fake(10, "newer code: moth 0.3.0 -> 0.4.0:  install the newest moth from ..."), \
+                mock.patch.object(sys, "frozen", True, create=True):   # the installers' app: a new installer
+            self.assertEqual(P.check_for_update(), ("update", compat.RELEASES))
+        self.assertEqual(P.update_line(compat.RELEASES), f"there's a new me! get it at {compat.RELEASES}")
         with fake(10, "update available: moth 0.3.0 -> 0.4.0"), mock.patch.object(L.weights, "mode",
                                                                                  return_value="hub"):
             self.assertEqual(P.check_for_update(), ("update", "python -m moth update"))

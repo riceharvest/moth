@@ -1046,6 +1046,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     a = build_parser().parse_args(argv)
     from moth import backends
     spec = a.model if _given(argv, "--model") else (backends.configured() or a.model)
+    kind, val = backends.parse_spec(spec or "")
+    if kind == "folder":   # a model newer than this code: say how to upgrade, not a traceback from the model code
+        from moth.backends import compat
+        compat.require(val)
     try:
         m = backends.resolve(spec)
     except backends.ManifestError as e:
@@ -1078,6 +1082,8 @@ def main(argv=None, on_ready=None):
     if a.manifest.backend == "tiny-agent":
         weights.ensure_default(a.model)   # pip install, first run: download the model files
         backends.prepare(a.manifest)      # a tiny-agent model from another Hub repo: the same first-run download
+        from moth.backends import compat
+        compat.require(a.model)
     if not a.manifest.is_default:
         print(f"moth: model {a.manifest.describe()}", flush=True)
         for n in a.manifest.notes:

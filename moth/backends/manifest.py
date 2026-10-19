@@ -54,6 +54,7 @@ class Manifest:
     tokenizer: str | None = None       # tiny-agent: tokenizer.json (relative to the folder)
     repo: str | None = None            # HF repo id `moth update` refreshes this model from
     version: str | None = None         # the model's own version (shown by doctor)
+    needs_moth: str | None = None      # the oldest moth code that can run it (moth/backends/compat.py checks it)
     # where it came from (not keys of the file)
     folder: str | None = None          # the folder moth.json (or the weights) is in
     source: str = "default"            # "file", "default" (no moth.json), "spec" (openai:..., a bare HF repo id)
@@ -111,7 +112,7 @@ def _norm_sampling(v, where: str) -> dict:
 
 TYPES = {"backend": str, "character": str, "chat_format": str, "system": str, "agent_card": str, "reaction": str,
          "tools": bool, "lowercase": bool, "context": int, "model": str, "base_url": str, "api_key_env": str,
-         "tokenizer": str, "repo": str, "version": str}
+         "tokenizer": str, "repo": str, "version": str, "needs_moth": str}
 
 
 def parse(data: dict, folder: str | None = None, where: str = FILE) -> Manifest:

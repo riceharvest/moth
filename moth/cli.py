@@ -32,12 +32,17 @@ def main():
     ap.add_argument("--threads", type=int, default=None, help="CPU threads (default: min(8, CPUs))")
     a = ap.parse_args()
     from moth import backends, weights
+    from moth.backends import compat
+    kind, val = backends.parse_spec(a.model or "")
+    if kind == "folder":   # a model newer than this code: say how to upgrade (moth/backends/compat.py)
+        compat.require(val)
     a.manifest = backends.resolve(a.model)
     if a.manifest.backend == "tiny-agent":
         if a.manifest.folder:
             a.model = a.manifest.folder
         weights.ensure_default(a.model)   # pip install, first run: download the model files
         backends.prepare(a.manifest)
+        compat.require(a.model)
     import torch
     torch.set_num_threads(a.threads or default_threads())
     moth = make_engine(a)

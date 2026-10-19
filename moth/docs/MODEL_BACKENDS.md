@@ -62,6 +62,7 @@ newer manifest still loads on an older moth). A key with the wrong type stops mo
 | `tokenizer` | `tokenizer.json` in the folder | tiny-agent: the tokenizer file, relative to the folder |
 | `repo` | none (moth-112m: its own repo) | the HF repo `moth update` refreshes this model from |
 | `version` | none | the model's own version, shown by doctor and the serve log |
+| `needs_moth` | none | the oldest moth that can run this model, e.g. `"0.4.0"`: an older moth says how to upgrade instead of loading it, and a pip install's `moth update` won't fetch it |
 
 ### moth-112m (today's model, no file needed)
 
@@ -92,7 +93,9 @@ A folder without `moth.json` is exactly this. Spelled out:
 }
 ```
 
-Upload it with `model.safetensors`, `config.json` and `tokenizer.json`. Users then run
+Upload it with `model.safetensors`, `config.json` and `tokenizer.json`. If it needs code an older moth doesn't
+have (a new architecture), set `"needs_moth"` to the first moth version that can run it. A `config.json` with
+settings an older moth doesn't know is caught too: that moth says how to upgrade rather than failing to load. Users then run
 `moth config model darioooooo0o/moth-2`. The weights download on first start, and `moth update` keeps them current
 from that repo.
 

@@ -43,7 +43,7 @@ from moth import weights
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))   # moth-112m/ in the download: code/moth/update.py
 REPO_ID = weights.REPO_ID   # one place for the repo id (moth/weights.py)
-WEIGHTS = {"model.safetensors", "config.json", "tokenizer.json"}
+WEIGHTS = {"model.safetensors", "config.json", "tokenizer.json", "moth.json"}   # what a pip install fetches
 INTEGRATIONS = "code/moth/integrations/"
 BACKUP, REVISION_FILE = ".moth-backup", ".moth-version"
 STAGING, JOURNAL, LOCK = ".moth-update", ".moth-swap", ".moth-update.lock"
@@ -380,6 +380,10 @@ def check(root: str, repo: str, rev: str | None, pip: bool = False) -> int:
         print(f"files missing from this download of {version_line(root)}: {describe(files)}")
         print("\nrun  python -m moth update  to fetch them")
         return 10
+    if docs_only(files, removed):   # a card edit is no new moth: no "update available" (nor the pet's bubble)
+        print(f"up to date: {version_line(root)}  (only the docs changed upstream: {', '.join((files + removed)[:4])}"
+              f"{' ...' * (len(files) + len(removed) > 4)}; python -m moth update fetches them)")
+        return 0
     new = _remote_text(hub, repo, info.sha, "code/moth/VERSION").strip() or "?"
     print(f"update available: moth {version(root)} -> {new}  (revision {(mine or 'unknown')[:12]} -> {info.sha[:12]})")
     print(f"changes: {describe(files, removed)}")
@@ -404,15 +408,30 @@ def _plan(hub, repo: str, root: str, sibs, mine: str | None, sha: str):
 
 
 def _newer(a: str, b: str) -> bool:
-    """Version b is newer than a (dotted numbers; anything else: just different)."""
-    try:
-        return tuple(map(int, b.split("."))) > tuple(map(int, a.split(".")))
-    except ValueError:
-        return bool(b) and b != a
+    from moth.backends import compat   # stdlib only
+    return compat.newer(a, b)
+
+
+def docs_only(files, removed=()) -> bool:
+    """Only the model card / docs differ (README.md, LICENSE, NOTICE, *.md under code/): nothing moth runs."""
+    allf = list(files) + list(removed)
+    return bool(allf) and all(f not in WEIGHTS and (not f.startswith("code/") or f.endswith(".md")) for f in allf)
+
+
+def _too_new(hub, repo: str, info) -> str | None:
+    """A pip / app install fetches only the model files: why this code can't run the Hub's model, if it can't."""
+    from moth.backends import compat
+    return compat.remote_problem(hub, repo, info.sha, {s.rfilename for s in info.siblings})
 
 
 def _pip_check(cache: str, hub, repo: str, info, files: list[str], removed: list[str]) -> int:
+    from moth.backends import compat
     rc, mine = 0, revision(cache)
+    why = _too_new(hub, repo, info) if files or removed else None
+    if why:
+        print(f"a newer model is on the Hub (revision {info.sha[:12]}), but it needs newer moth code: {why}")
+        print(f"newer code: {compat.upgrade_hint()}, then  moth update  fetches the model")
+        return 10
     if files or removed:
         rc = 10
         print(f"newer weights on the Hub: revision {(mine or 'none')[:12]} -> {info.sha[:12]}  ({repo})")
@@ -426,10 +445,9 @@ def _pip_check(cache: str, hub, repo: str, info, files: list[str], removed: list
     new = _remote_text(hub, repo, info.sha, "code/moth/VERSION").strip()
     if _newer(version(), new):
         rc = 10
-        print(f"newer code: moth {version()} -> {new}:  pip install -U moth-companion  "
-              "(uv tool upgrade moth-companion / pipx upgrade moth-companion)")
+        print(f"newer code: moth {version()} -> {new}:  {compat.upgrade_hint()}")
     else:
-        print(f"code: moth {version()}; pip install -U moth-companion gets the newest release")
+        print(f"code: moth {version()}; {compat.upgrade_hint(short=True)} gets the newest release")
     return rc
 
 
@@ -768,6 +786,12 @@ def _update(hub, root: str, repo: str, rev: str | None, yes: bool, pip: bool) ->
         print(f"up to date: {version_line(root)}")
         _say_edits(kept, [])
         return 0
+    why = _too_new(hub, repo, info) if pip else None
+    if why:   # the model files alone would leave this code unable to start moth
+        from moth.backends import compat
+        print(f"the model at revision {info.sha[:12]} needs newer moth code ({why}): {compat.upgrade_hint()}, then "
+              "run  moth update  again. Nothing was changed.")
+        return 1
     print(f"update {root}: {describe(files, removed)}  (revision {(mine or 'unknown')[:12]} -> {info.sha[:12]})")
     _say_edits(kept, edited)
     try:
@@ -813,7 +837,8 @@ def _update(hub, root: str, repo: str, rev: str | None, yes: bool, pip: bool) ->
         if backed_up is not None:
             print(f"previous weights kept in {os.path.join(root, BACKUP)}  (moth update --rollback)" if backed_up
                   else "couldn't keep a backup of the previous weights this time (no --rollback)")
-        print("code comes from pip:  pip install -U moth-companion")
+        from moth.backends import compat
+        print(f"newer code, when there is some:  {compat.upgrade_hint(short=True)}")
         return 0
     print(f"updated: moth {old} -> {version(root)} (revision {info.sha[:12]})")
     print(f"changed: {describe(files, removed)}")

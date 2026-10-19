@@ -109,7 +109,7 @@ def releases(serve: bool) -> tuple[dict, dict]:
     else:
         rnd = random.Random(1)
         w_old, w_new = bytes(rnd.getrandbits(8) for _ in range(300_000)), bytes(rnd.getrandbits(8) for _ in range(300_000))
-        cfg, tok = b'{"fake": true}', b"{}"
+        cfg, tok = b'{"vocab_size": 64}', b"{}"   # (a config moth/backends/compat.py accepts)
     base = {"config.json": cfg, "tokenizer.json": tok, "LICENSE": b"Apache-2.0\n",
             "code/requirements.txt": b"torch>=2.5\ntokenizers\nsafetensors\nnumpy\nhuggingface_hub\n", **code}
     old = dict(base, **{"model.safetensors": w_old, "README.md": b"# moth\n", "code/moth/VERSION": OLD.encode() + b"\n",
@@ -119,6 +119,17 @@ def releases(serve: bool) -> tuple[dict, dict]:
                         "README.md": b"# moth\n\n## Changelog\n- 0.3.0: kinder replies\n\n## Files\nx\n",
                         "code/moth/docs/NEW_IN_030.md": b"new in 0.3.0\n", DEEP: code[DEEP] + b"\n"})
     return old, new
+
+
+def later_releases(old: dict) -> tuple[dict, dict]:
+    """(docs, future) on top of the old release: one that changes only the card and a doc (no new moth), and one
+    whose model this code can't run (a config setting it doesn't know, a moth.json asking for moth 9.0.0)."""
+    docs = dict(old, **{"README.md": b"# moth\n\nnow with a better card\n", "LICENSE": b"Apache-2.0 (reworded)\n",
+                        "code/moth/docs/MODEL_BACKENDS.md": old["code/moth/docs/MODEL_BACKENDS.md"] + b"\nmore\n"})
+    cfg = dict(json.loads(old["config.json"]), n_experts=8)
+    future = dict(old, **{"config.json": json.dumps(cfg).encode(), "moth.json": b'{"needs_moth": "9.0.0"}',
+                          "code/moth/VERSION": b"9.0.0\n"})
+    return docs, future
 
 
 def free_port() -> int:
@@ -153,6 +164,9 @@ class E2E(unittest.TestCase):
         cls.hub = FakeHub(REPO)
         cls.sha_old = cls.hub.add_commit("old", cls.old)
         cls.sha_new = cls.hub.add_commit("new", cls.new)
+        cls.docs, cls.future = later_releases(cls.old)
+        cls.sha_docs = cls.hub.add_commit("docs", cls.docs)
+        cls.sha_future = cls.hub.add_commit("future", cls.future)
         cls.hub.set_ref("v" + OLD, "old")
         cls.hub.set_ref("v" + NEW, "new")
         cls.hub.start()
@@ -512,6 +526,62 @@ class E2E(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertIn("offline mode is on", out)
         self.expect(cache, self.old, pip=True)
+
+    def test_docs_only_change_is_no_update(self):
+        """A card / docs edit: --check stays "up to date" (exit 0) and the pet stays quiet; update still fetches it."""
+        root = self.hf_install()
+        code = root / "code"
+        self.hub.set_ref("main", "docs")
+        rc, out = self.moth("update", "--check", cwd=code)
+        self.assertEqual(rc, 0, out)
+        self.assertIn(f"up to date: moth {OLD} (revision {self.sha_old[:12]})  (only the docs changed upstream", out)
+        self.assertIn("('none', '')", self.py("from moth import pet; print(pet.check_for_update())", cwd=code))
+        rc, out = self.moth("update", "--yes", cwd=code)
+        self.assertEqual(rc, 0, out)
+        self.expect(root, self.docs)
+
+    def test_pip_never_fetches_a_model_its_code_cant_run(self):
+        """pip: a Hub model that needs newer code is not fetched (check says how to upgrade; the pet says pip); the
+        first run falls back to the model tagged for this version, or says how to upgrade when one was pinned."""
+        site = self.tmp / "site"
+        for k, v in package_files().items():
+            (site / k).parent.mkdir(parents=True, exist_ok=True)
+            (site / k).write_bytes(v)
+        (site / "moth" / "VERSION").write_text(OLD + "\n")
+        cache = self.tmp / "cache" / Path(*REPO.split("/"))
+        cwd = self.tmp / "elsewhere"
+        cwd.mkdir()
+        run = lambda *a, **e: self.moth(*a, cwd=cwd, PYTHONPATH=str(site), **e)   # noqa: E731
+        self.assertEqual(run("update", "--yes")[0], 0)   # the old weights
+        self.expect(cache, self.old, pip=True)
+
+        self.hub.set_ref("main", "future")
+        rc, out = run("update", "--check")
+        self.assertEqual(rc, 10, out)
+        self.assertIn("needs newer moth code: it needs moth 9.0.0 or newer", out)
+        self.assertIn("newer code: pip install -U moth-companion", out)
+        out = self.py("from moth import pet; print(pet.check_for_update())", cwd=cwd, PYTHONPATH=str(site))
+        self.assertIn("('update', 'pip install -U moth-companion')", out)
+        rc, out = run("update", "--yes")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("needs newer moth code", out)
+        self.assertIn("Nothing was changed", out)
+        self.expect(cache, self.old, pip=True)
+
+        shutil.rmtree(cache)   # a first run now: falls back to the model tagged v<this version>
+        ensure = "from moth import weights; print(weights.ensure())"
+        p = subprocess.run([sys.executable, "-c", ensure], cwd=self.tmp, env=self.env(PYTHONPATH=str(site)),
+                           capture_output=True, text=True, timeout=180)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn(f"using the one made for moth {OLD} (v{OLD})", p.stderr)
+        self.expect(cache, self.old, pip=True)
+        shutil.rmtree(cache)   # pinned to the new one: no fallback, just how to upgrade
+        p = subprocess.run([sys.executable, "-c", ensure], cwd=self.tmp, env=self.env(
+            PYTHONPATH=str(site), MOTH_REVISION=self.sha_future), capture_output=True, text=True, timeout=180)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn(f"is newer than this moth ({OLD}): it needs moth 9.0.0 or newer", p.stderr)
+        self.assertIn("pip install -U moth-companion", p.stderr)
+        self.assertFalse((cache / "model.safetensors").exists())
 
     def test_pip_first_run_offline_and_interrupted(self):
         """The first run's download (weights.ensure): refused offline, resumable after a kill."""
