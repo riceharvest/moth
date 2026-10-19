@@ -315,8 +315,8 @@ def main(argv=None):
                  f"{x.get('reply_labels_per_s')} | {num((x.get('reply_labels_per_s') or 0) * 3600)} | {x.get('decisions_per_s')} | "
                  f"{x.get('concurrency')} |")
     if any(j.startswith("gev") for j in judges):
-        R += ["", "GEV-26B (Gemma terms treat models trained on Gemma outputs as derivatives): eval / agreement only, never "
-              "a filter or a reward."]
+        R += ["", "GEV-26B (Gemma-4 base; its card links the Gemma 4 license): eval / agreement only, never a filter or a "
+              "reward (project rule)."]
 
     # per language (own chats; replay is English only)
     R += ["", "## Per language (own chats, quality seeds; every 4th chat is zh/es/fr/hi)", "",
@@ -353,6 +353,7 @@ def main(argv=None):
     # reading samples + label audit
     audit = ["# Label audit", "", "## self=true where the friend asked about identity or files/home", ""]
     dis = ["", "## judges disagree (sample)", ""]
+    from moth.cards import STUDENT_TAIL, student_system
     from moth.gist import ASKED
     allf = open(os.path.join(out, "labelled_replies.jsonl"), "w")   # every labelled reply, for a hand-labelled eval set
     for t in tags:
@@ -362,37 +363,49 @@ def main(argv=None):
             k = (t, "gen", str(d["seed"]))
             ri = -1
             last_user = ""
+            ctx = []
             for m in d["messages"]:
                 if m["role"] == "user":
                     last_user = m["content"]
                 if m["role"] == "assistant" and m.get("content"):
                     ri += 1
-                    items.append((k, ri, last_user, m["content"], d.get("card") or {}, d["type"]))
+                    items.append((k, ri, last_user, m["content"], d.get("card") or {}, d["type"], list(ctx[-8:])))
+                if m.get("content"):
+                    c = m["content"]
+                    ctx.append(("[R] " if m["role"] == "assistant" else "[agent] " if c.startswith("[the agent said]")
+                                else "friend: ") + " ".join(c.replace("[the agent said]", "").split())[:400])
         for r in replay[t]:
             k = (t, "replay", f"{r['card_id']}:{r['name']}")
             ri = -1
+            ctx = []
             for tt in r["turns"]:
+                u = tt["user"]
+                ctx.append(("[agent] " if u.startswith("[the agent said]") else "friend: ")
+                           + " ".join(u.replace("[the agent said]", "").split())[:400])
                 for e in tt["events"]:
                     if "say" in e:
                         ri += 1
-                        items.append((k, ri, tt["user"], e["say"], r.get("card") or {}, r["cat"]))
+                        items.append((k, ri, tt["user"], e["say"], r.get("card") or {}, r["cat"], list(ctx[-8:])))
+                        ctx.append("[R] " + e["say"])
 
         def lab(k, ri, j):
             x = L[j].get(k)
             return x[ri] if x and ri < len(x) else None
-        for k, ri, u, say, card, typ in items:
+        for k, ri, u, say, card, typ, ctx in items:
             labs = {j: lab(k, ri, j) for j in judges}
             if any(labs.values()):
                 allf.write(json.dumps({"teacher": t, "src": k[1], "chat_id": k[2], "reply": ri + 1, "type": typ,
-                                       "card_id": card.get("id"), "lang": LANG.get(k, "en"), "card": card,
-                                       "friend": u, "text": say, "labels": labs}, ensure_ascii=False) + "\n")
+                                       "card_id": card.get("id"), "lang": LANG.get(k, "en"),
+                                       "card_text": student_system(card).replace(STUDENT_TAIL, "").strip(),
+                                       "card": card, "context": ctx, "friend": u, "text": say, "labels": labs},
+                                      ensure_ascii=False) + "\n")
         S = [f"# {t}: 30 sampled replies (gen + replay), with both judges' labels", ""]
-        for k, ri, u, say, card, typ in rng.sample(items, min(30, len(items))):
+        for k, ri, u, say, card, typ, _ in rng.sample(items, min(30, len(items))):
             ls = "; ".join(f"{j}: {'ON' if (lb := lab(k, ri, j)) and lb['on'] else 'OFF' if lb else '?'}"
                            f"{' SELF' if lb and lb['self'] else ''} ({lb['why'] if lb else ''})" for j in judges)
             S += [f"- [{k[1]} {typ} card={card.get('id')}] **friend:** {u[:300]!r}", f"  **reply:** {say!r}", f"  {ls}", ""]
         open(os.path.join(out, f"read_{t}.md"), "w").write("\n".join(S))
-        for k, ri, u, say, card, typ in items:
+        for k, ri, u, say, card, typ, _ in items:
             labs = {j: lab(k, ri, j) for j in judges}
             selfs = [j for j, lb in labs.items() if lb and lb["self"]]
             if selfs and (ASKED.search(u) or FILES_ASK.search(u)):

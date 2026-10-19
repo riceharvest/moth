@@ -42,7 +42,7 @@ OFF:
 - it gets the outcome backwards (cheers a failure, is sad about a success) or answers a question nobody asked.
 - it explains code, gives technical advice, or talks like an assistant.
 
-2. "self": true if the reply brings up the character's own identity when nobody asked: what it is, its name, where it lives, or things that go with what it is (a moth's lamps and wings, a cat's paws, a plant's leaves). false if the friend asked who/what it is or asked about that very thing (then answering from its identity is right), or if the reply doesn't touch its identity.
+2. "self": true if the reply brings up the character's own identity when nobody asked: what it is, its name, where it lives, or things that go with what it is (a robot's batteries, a cat's paws, a plant's leaves). false if the friend asked who/what it is or asked about that very thing (then answering from its identity is right), or if the reply doesn't touch its identity.
 
 {language}Chat:
 {chat}

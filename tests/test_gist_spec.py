@@ -110,7 +110,7 @@ def test_sample_card_shares():
     for _ in range(4000):
         c = cards.sample_card(rng)
         ids["moth" if c["id"] == "moth" else "blank" if c["id"] == "blank" else "pool"] += 1
-    assert ids["moth"] / 4000 <= 0.10 and 0.07 <= ids["blank"] / 4000 <= 0.13
+    assert ids["moth"] == 0 and 0.07 <= ids["blank"] / 4000 <= 0.13   # moth: never in training (2026-10-19)
 
 
 def test_load_card_file_and_specs():
@@ -387,3 +387,100 @@ def test_heldout_cards_never_train():
         why = collections.Counter()
         items, _ = build_sft.filter_chats([p], why)
     assert [it["seed"] for it in items] == [1] and why["heldout_card"] == 1
+
+
+# --- moth is held-out: never in training (2026-10-19) -----------------------------------------------------------------
+MOTH_LORE_RX = re.compile(r"\bmoths?\b|graphics card|1947|butterfl|first computer bug|grandma was", re.I)
+
+
+def test_moth_never_a_training_card():
+    rng = random.Random(1)
+    assert not any(cards.is_moth(cards.sample_card(rng)) for _ in range(20000))
+    assert not any(cards.is_moth(c) or cards.is_heldout(c) for c in cards.build_pool())
+    assert all(c["name"] != "moth" and "moth" not in str(c.get("kind")) for c in cards.build_pool())
+    for c in [cards.MOTH_CARD, cards.text_card("you are a moth"), cards.text_card("You are Moth."),
+              {"id": "c9", "name": "moth", "kind": None, "traits": [], "refs": []},
+              {"id": "c9", "name": "bo", "kind": "a moth", "traits": [], "refs": []},
+              {**cards.MOTH_CARD, "id": "x", "lines": ["your name is moth. you're a small moth."]}]:
+        assert cards.is_moth(c) and cards.is_heldout(c), c
+    assert not cards.is_moth(cards.BLANK_CARD) and not cards.is_moth(cards.text_card("you are a mother hen"))
+    # the shipped default stays moth
+    assert cards.load_card(None)["id"] == "moth" and persona.SYSTEM_STUDENT.startswith("you are moth")
+
+
+def test_no_moth_lore_in_teacher_or_sim_prompts():
+    assert not MOTH_LORE_RX.search(persona.TEACHER_CORE + persona.TEACHER_BIBLE + agent.AGENT_RULES)
+    assert not MOTH_LORE_RX.search(persona.teacher_system(None))
+    assert not any(MOTH_LORE_RX.search(x) for x in persona.SCENARIOS + persona.USER_PERSONAS + persona.TOPICS)
+    assert not MOTH_LORE_RX.search(persona.USER_SIM_PROMPT + agent.AGENT_REMIND + agent.AGENT_CHAT_REMIND)
+    assert not MOTH_LORE_RX.search(gist.LABEL_PROMPT)
+    from moth import gen_dialogs as G
+    assert not MOTH_LORE_RX.search(G.sim_prompt("p", "s", 6, 1, [], "rain") + G.SIM_SYSTEM + G.TALK_REMIND
+                                   + G.TALK_REMIND_ID + G.transcript([{"role": "user", "content": "[the agent said]\nok"}]))
+    for seed in range(300):
+        v = G.first_teacher_view(seed)
+        assert not cards.is_moth(v["card"]) and not MOTH_LORE_RX.search(v["system"] + v["user"] + v.get("sim", "")), seed
+
+
+def _fake_teacher(G, sent):
+    """G.chat replaced by a recorder: every prompt the generator sends is kept in `sent`."""
+    import asyncio
+    import itertools
+    import types
+    words = "apple river cloud pencil garden window candle ticket orange blanket button marble".split()
+    n = itertools.count()
+
+    async def chat(client, model, messages, budget=None, **kw):
+        sent.append("\n".join(m["content"] for m in messages))
+        await asyncio.sleep(0)
+        k = next(n)
+        last = messages[-1]["content"]
+        if "[DIRECTOR NOTE" in last:
+            text = "[END]" if k % 9 == 0 else f"my {words[k % 12]} and the {words[(k // 12) % 12]} today"
+        elif "FINAL message an AI agent" in last:
+            text = "Done. I updated the settings page and everything works now. Want me to also add a test?"
+        else:
+            text = f"oh, the {words[k % 12]}? was it {words[(k // 7) % 12]} {k}?"
+        msg = types.SimpleNamespace(content=text, tool_calls=None)
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg, finish_reason="stop")])
+    return chat
+
+
+def test_generation_sends_no_moth_lore_and_writes_no_moth_card(monkeypatch):
+    """Every prompt of ~200 generated chats (talk, recall, long, agent) and the bake-off's forced mix: no moth lore."""
+    import asyncio
+    from moth import gen_dialogs as G
+    sent = []
+    monkeypatch.setattr(G, "chat", _fake_teacher(G, sent))
+    monkeypatch.setitem(G.RECALL_SHARE, "p", 0.4)
+    monkeypatch.setitem(G.LONG_SHARE, "p", 0.2)
+    stats = collections.Counter()
+
+    async def run():
+        return await asyncio.gather(*(G.one_dialog(None, "fake", s, stats) for s in range(200)))
+    recs = [r for r in asyncio.run(run()) if r]
+    assert len(recs) > 100 and {r["type"] for r in recs} == {"talk", "agent"}
+    assert any(r.get("recall") for r in recs)
+    assert not any(cards.is_moth(r["card"]) for r in recs)
+    bad = [p for p in sent if MOTH_LORE_RX.search(p)]
+    assert len(sent) > 1000 and not bad, bad[:3]
+
+
+def test_build_sft_drops_moth_and_cardless_chats():
+    pytest.importorskip("torch")
+    from moth import build_sft
+    msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hi! what's up?", "tool_calls": []},
+            {"role": "user", "content": "nothing"}, {"role": "assistant", "content": "nothing is nice.", "tool_calls": []}]
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "x.jsonl")
+        with open(p, "w") as f:
+            for i, card in enumerate([None, cards.MOTH_CARD, cards.text_card("you are a moth named bo"),
+                                      cards.build_pool()[0]]):
+                rec = {"seed": i, "type": "talk", "messages": msgs}
+                if card is not None:
+                    rec["card"] = card
+                f.write(json.dumps(rec) + "\n")
+        why = collections.Counter()
+        items, _ = build_sft.filter_chats([p], why)
+    assert [it["seed"] for it in items] == [3]
+    assert why["no_card_moth"] == 1 and why["heldout_card"] == 2

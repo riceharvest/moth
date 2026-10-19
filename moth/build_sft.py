@@ -6,7 +6,8 @@
 Walks each chat to its first bad reply (assistant-speak, a crutch line, a repeated motif, unprompted identity talk
 past the first, file talk, an explained agent message, an OFF-gist label from moth.gist, ...) or made-up
 "what X" question, and keeps the part BEFORE that exchange if it still has >= 2 replies. Each chat is encoded with
-its own card's student system prompt (cards.student_system; chats without a card: the moth card). Lowercases replies. Writes data/sft/{train,val}.pt: lists of (ids, loss_mask) where the mask
+its own card's student system prompt (cards.student_system). Chats without a card (r1-r3: moth chats) and chats
+on a held-out card (moth included: it is only the app's default card, 2026-10-19) are dropped. Lowercases replies. Writes data/sft/{train,val}.pt: lists of (ids, loss_mask) where the mask
 covers moth's replies, not the system/user tokens. Prints the effective mix first.
 Pure chat (2026-10-19): the student has no tools and no home folder, so a chat with any tool call or tool row (old
 data) is dropped whole, and a reply that talks about files (a .txt name or a folder/ path the friend didn't say) too.
@@ -468,8 +469,11 @@ def filter_chats(paths: list[str], why: collections.Counter, cutoff: dict | None
             if d["seed"] in (held or ()):
                 why["heldout"] += 1
                 continue
+            if not d.get("card"):
+                why["no_card_moth"] += 1   # card-less chats (r1-r3) are moth chats: moth is never in training
+                continue
             if is_heldout(d.get("card")):
-                why["heldout_card"] += 1   # an eval-only identity card or phrasing: never in training
+                why["heldout_card"] += 1   # an eval-only identity card or phrasing (incl. moth): never in training
                 continue
             if eval_keys and uses_eval_agent_msg(d, eval_keys):
                 why["eval_agent_msg"] += 1   # reacts to one of the eval's held-out agent messages

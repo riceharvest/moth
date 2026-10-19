@@ -4,6 +4,9 @@ The character underneath is constant and identity-free (persona.TEACHER_CORE: wa
 short lowercase lines, never an assistant). A card adds a name, what it is and 0-3 traits (pure chat, 2026-10-19:
 no home folder and no tools; where it lives only survives inside a free-form line, as for moth). Every
 training chat gets a sampled card; the served bot gets one from --card (default: MOTH_CARD).
+MOTH IS NEVER TRAINED ON (2026-10-19): MOTH_CARD is only the default card the app ships. No training card uses the name or
+kind "moth" (is_heldout() is true for any card that mentions a moth), sample_card() never returns it, and no teacher,
+simulator or few-shot prompt carries moth lore; the eval treats moth as one more held-out identity.
 
 Card schema (a plain dict, JSON-serialisable; a card file is one such object):
   id       str            stable id ("moth", "blank", "c0042", "h003" for held-out eval cards)
@@ -282,20 +285,32 @@ def build_pool(n: int = 800, seed: int = 0) -> list[dict]:
     """n training cards (deterministic). Names of held-out cards never appear here."""
     rng = random.Random(seed)
     held_names = ({nm for _, names, _ in HELDOUT_KINDS for nm in names} | set(HELDOUT_HUMAN)
-                  | EVAL_FRIEND_NAMES)
+                  | EVAL_FRIEND_NAMES | {"moth", "moths"})   # moth: the app's default card, held-out
     humans = [x for x in HUMAN_NAMES if x not in held_names]
     kinds = [(k, [x for x in ns if x not in held_names] or ns, r) for k, ns, r in KINDS]
     return [_maybe_free(_card(i, rng, kinds, humans, TRAITS), rng) for i in range(n)]
 
 
 HELDOUT_ID = re.compile(r"^h\d{3}f?$")
+MOTH_WORD = re.compile(r"\bmoths?\b", re.I)
+
+
+def is_moth(card: dict | None) -> bool:
+    """The moth identity in any form (MOTH_CARD, "you are a moth", a card named moth): held-out, never trained on."""
+    if not card:
+        return False
+    if card.get("id") == "moth":
+        return True
+    fields = [card.get("name"), card.get("kind"), card.get("about")] + list(card.get("lines") or [])
+    return any(MOTH_WORD.search(str(x)) for x in fields if x)
 
 
 def is_heldout(card: dict | None) -> bool:
-    """An eval-only card: a held-out id, or a line in a held-out phrasing (never train on these)."""
+    """An eval-only card: a held-out id, the moth identity (is_moth), or a line in a held-out phrasing (never train on
+    these)."""
     if not card:
         return False
-    if HELDOUT_ID.match(str(card.get("id") or "")):
+    if HELDOUT_ID.match(str(card.get("id") or "")) or is_moth(card):
         return True
     kinds = {k for k, _, _ in HELDOUT_KINDS}
     names = {nm for _, ns, _ in HELDOUT_KINDS for nm in ns} | set(HELDOUT_HUMAN)
@@ -338,7 +353,7 @@ GENERIC_REFS = {"water", "sun", "sleep", "slow", "night", "hot", "rain", "sky", 
                 "leaves", "light"}
 
 _POOL: list[dict] = []
-SHARES = {"moth": 0.08, "blank": 0.10}   # the rest: a pool card
+SHARES = {"moth": 0.0, "blank": 0.10}   # the rest: a pool card. moth: 0, never in training (held-out, see is_heldout)
 # chat languages (user decision 2026-10-19): share of training chats, and how the teacher/judge name them
 LANGS = {"en": 0.60, "zh": 0.13, "es": 0.13, "fr": 0.08, "hi": 0.06}
 LANG_NAMES = {"en": "English", "zh": "Chinese (simplified, 简体中文)", "es": "Spanish", "fr": "French",
@@ -379,18 +394,13 @@ def sample_card(rng: random.Random, pool: list[dict] | None = None) -> dict:
 
 
 def _sample_card(rng: random.Random, pool: list[dict] | None = None) -> dict:
-    """moth ~8% (with 0-2 lore traits), blank ~10%, else a pool card."""
+    """blank ~10%, else a pool card. Never moth (held-out: the app's default card only)."""
     if pool is None:
         if not _POOL:
             _POOL.extend(build_pool())
         pool = _POOL
     x = rng.random()
-    if x < SHARES["moth"]:
-        if rng.random() < 0.3:   # moth phrased the way a user would write it
-            m = _free(rng, {**MOTH_CARD, "kind": "a moth"})
-            return {**m, "refs": MOTH_REFS}
-        return {**MOTH_CARD, "traits": rng.sample(MOTH_LORE, rng.choice([0, 0, 1, 2]))}
-    if x < SHARES["moth"] + SHARES["blank"]:
+    if x < SHARES["blank"]:
         return dict(BLANK_CARD)
     return dict(rng.choice(pool))
 

@@ -4,7 +4,7 @@ Run on the box by runbook/job_bakeoff.sh (one teacher at a time behind vLLM on :
 
   python -m moth.bakeoff smoke   --out DIR [--think]                    # parser/thinking checks before any chat
   python -m moth.bakeoff gen     --quality-start S --quality-n 150 [gen_dialogs args ...]
-  python -m moth.bakeoff replay  --out DIR [--cards moth,heldout_free:4] [--think]
+  python -m moth.bakeoff replay  --out DIR [--cards heldout_free:4,pool:3] [--think]
   python -m moth.bakeoff label   --judge TAG --out FILE TEACHER_DIR ...  # gist labels (moth.gist prompt), both sources
   python -m moth.bakeoff decide  --judge TAG --out FILE TEACHER_DIR ...  # JEV/GEV /v1/decide yes/no per reply
   python -m moth.bakeoff pairwise --judge TAG --out DIR --pairs a:b,... [--auto-top LABELS ...] TEACHER_DIR ...
@@ -152,11 +152,16 @@ def cmd_gen(argv):
 
 # --- replay -------------------------------------------------------------------------------------------------------------
 def replay_cards(spec: str) -> list[dict]:
-    from moth.cards import MOTH_CARD, heldout_cards
+    """moth | blank | pool:<i> (a training card) | heldout:<i> | heldout_free:<i>"""
+    from moth.cards import BLANK_CARD, MOTH_CARD, build_pool, heldout_cards
     out = []
     for s in spec.split(","):
         if s == "moth":
             out.append(dict(MOTH_CARD))
+        elif s == "blank":
+            out.append(dict(BLANK_CARD))
+        elif s.startswith("pool:"):
+            out.append(build_pool()[int(s.split(":")[1])])
         elif s.startswith("heldout_free:"):
             out.append(heldout_cards(free=True)[int(s.split(":")[1])])
         elif s.startswith("heldout:"):
@@ -225,7 +230,8 @@ def cmd_replay(argv):
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--cards", default="moth,heldout_free:4")
+    ap.add_argument("--cards", default="heldout_free:4,pool:3", help="moth is held-out and not a teacher's job: "
+                    "one held-out free-form card + one training-pool card")
     ap.add_argument("--think", action="store_true")
     ap.add_argument("--concurrency", type=int, default=64)
     ap.add_argument("--max-probes", type=int, default=0, help="0 = all of a card's probes")

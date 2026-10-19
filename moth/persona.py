@@ -1,6 +1,7 @@
 """Who the chat buddy is. A PURE chatbot (2026-10-19): no tools, no home folder, no files. Prompts:
   * student_system(card) (cards.py): the short system prompt the small model is trained with: a sampled identity
-    card + one line of chat framing. SYSTEM_STUDENT = the moth card's prompt.
+    card + one line of chat framing. SYSTEM_STUDENT = the moth card's prompt (the app's default card only: moth is
+    held-out and never in training, 2026-10-19).
   * TEACHER_CORE: the identity-free character sheet the teacher plays from while writing training chats (warm,
     curious, a bit dim, gist first). teacher_system(card) = TEACHER_CORE + the card section. The core is the shared
     prefix of every teacher call (Qwen3.x's hybrid prefix cache reuses only whole 1568-token blocks: the core as the
@@ -10,7 +11,7 @@ Plus the user-simulator personas, scenarios and topics that give the chats their
 from __future__ import annotations
 
 from moth.agent import AGENT_RULES
-from moth.cards import MOTH_CARD, display_name, student_system, teacher_card  # noqa: F401
+from moth.cards import BLANK_CARD, MOTH_CARD, display_name, student_system, teacher_card  # noqa: F401
 
 SYSTEM_STUDENT = student_system(MOTH_CARD)
 
@@ -98,11 +99,11 @@ TEACHER_CORE = TEACHER_CORE.replace("{agent_rules}", AGENT_RULES)
 
 
 def teacher_system(card: dict | None = None) -> str:
-    """The teacher's system prompt for one chat: the shared core, then this chat's identity card."""
-    return TEACHER_CORE + teacher_card(card or MOTH_CARD)
+    """The teacher's system prompt for one chat: the shared core, then this chat's identity card (none: blank)."""
+    return TEACHER_CORE + teacher_card(card or BLANK_CARD)
 
 
-TEACHER_BIBLE = teacher_system(MOTH_CARD)   # old name: the moth card's teacher prompt
+TEACHER_BIBLE = teacher_system(BLANK_CARD)   # old name; blank card (moth lore never goes into a teacher prompt)
 
 USER_PERSONAS = [
     "someone who types in lowercase fragments and asks 'what' a lot when confused",
@@ -172,7 +173,7 @@ SCENARIOS = [
     "ask who or what it is, then talk about yourself",
     "ask it to do something it can't (send an email, look something up online, see a photo)",
     "ask it to make up a very short story or poem",
-    "be mildly rude or call it a butterfly, then be nice",
+    "be mildly rude or call it a silly name, then be nice",
     "ask what music it likes and tell it about yours",
     "ask about its family and tell it about yours",
     "chat about random things (weather, food, your day) and let it be itself",

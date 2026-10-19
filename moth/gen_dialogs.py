@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from moth.agent import (AGENT_CHAT_REMIND, AGENT_LENGTHS, AGENT_PROMPT, AGENT_REMIND,  # noqa: E402
                         AGENT_RULES, AGENT_SCENARIOS, AGENT_TAG, AGENT_TASKS, AGENT_USER_PERSONAS, HARNESS_STYLES,
                         OUTCOMES, agent_turn)
-from moth.cards import LANG_NAMES, describe, display_name, lang_of, sample_card  # noqa: E402
+from moth.cards import BLANK_CARD, LANG_NAMES, describe, display_name, is_moth, lang_of, sample_card  # noqa: E402
 from moth.gist import ASKED, identity_ref  # noqa: E402
 from moth.persona import (SCENARIOS, TEACHER_BIBLE, TOPICS, USER_PERSONAS, USER_SIM_PROMPT,  # noqa: E402
                           teacher_system)
@@ -129,12 +129,12 @@ def sft_problem(meta: dict, msgs: list[dict], text: str) -> str | None:
         return None
 
 
-def transcript(msgs: list[dict], name: str = "moth") -> str:
+def transcript(msgs: list[dict], name: str = "the bot") -> str:
     out = []
     for m in msgs:
         if m["role"] == "user" and m["content"].startswith(AGENT_TAG):
             body = m["content"][len(AGENT_TAG):].strip()
-            out.append("[your AI agent's latest message to you, which moth can also see]\n" + body[:600])
+            out.append(f"[your AI agent's latest message to you, which {name} can also see]\n" + body[:600])
         elif m["role"] == "user":
             out.append(f"you: {m['content']}")
         elif m["role"] == "assistant" and m.get("content"):
@@ -253,8 +253,9 @@ def confused(last: str, mine: list[str]) -> str:
 
 
 def sim_prompt(persona, scenario, turns, i, msgs, topic="anything", card=None) -> str:
-    name = display_name(card) if card is not None else "moth"
-    return USER_SIM_PROMPT.format(name=name, who=describe(card) if card is not None else "a moth on a graphics card",
+    card = card if card is not None else BLANK_CARD   # never moth: moth is held-out (the app's default card only)
+    name = display_name(card)
+    return USER_SIM_PROMPT.format(name=name, who=describe(card),
                                   persona=persona, scenario=scenario, topic=topic, turns=turns, i=i,
                                   transcript=transcript(msgs, name), language=sim_language(card))
 
@@ -426,6 +427,8 @@ async def agent_dialog(client, model, seed, rng, stats, card=None) -> dict | Non
 async def one_dialog(client, model, seed, stats) -> dict | None:
     rng = random.Random(seed)
     card = sample_card(rng)
+    if is_moth(card):   # moth is held-out: no training chat may ever use it (cards.is_moth)
+        raise ValueError(f"seed {seed}: moth card sampled for a training chat")
     if not SCENARIO_IDS and rng.random() < AGENT_SHARE["p"]:
         return await agent_dialog(client, model, seed, rng, stats, card)
     scen = [SCENARIOS[i] for i in SCENARIO_IDS] if SCENARIO_IDS else SCENARIOS
@@ -445,10 +448,10 @@ async def one_dialog(client, model, seed, stats) -> dict | None:
     for i in range(1, turns + 1):
         directive, extra = "", QBACK if rng.random() < 0.2 else NO_QBACK
         if recall and i == recall["share_turn"]:
-            directive = f"\n\nIn THIS message, casually tell moth {fact}."
+            directive = f"\n\nIn THIS message, casually tell {display_name(card)} {fact}."
         elif recall and i == recall["ask_turn"]:
-            directive = (f"\n\nIn THIS message, ask moth if it remembers {short} (you told it earlier). Ask in your "
-                         "own words and don't give the answer.")
+            directive = (f"\n\nIn THIS message, ask {display_name(card)} if it remembers {short} (you told it "
+                         "earlier). Ask in your own words and don't give the answer.")
             extra = RECALL_REMIND
         if (recall and i < recall["ask_turn"]) or (turns >= 16 and i < turns - 3):
             directive += "\n\nThe chat is not finished: do not write [END] yet."
