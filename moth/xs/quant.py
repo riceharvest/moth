@@ -82,6 +82,15 @@ def act_dtype(mode: str):
     return torch.float32 if mode == "fp32" else torch.bfloat16
 
 
+# the int8 GEMV through its torch.* binding (~0.5 us less per call than torch.ops.aten.*: ~200 calls per token)
+_int8mm = getattr(torch, "_weight_int8pack_mm", None) or torch.ops.aten._weight_int8pack_mm
+
+
+def gemv_fn(mode: str):
+    """The fast path's kernel for a mode: fn(xb, *args) with args from QLinear.args() / Experts.args1()/args2()."""
+    return _int8mm if mode == "int8" else F.linear
+
+
 class QLinear:
     """y = x @ W^T for W (out, in) in one of MODES (no bias: tiny-moe has none)."""
 
@@ -119,6 +128,10 @@ class QLinear:
         if rows <= BF16_GEMV_ROWS or x.device.type != "cpu":
             return F.linear(x.to(torch.bfloat16), self.w).float()
         return F.linear(x, scratch(self.w.shape, torch.float32).copy_(self.w))
+
+    def args(self) -> tuple:
+        """gemv_fn(mode)(xb, *args) == self.mm(xb), without the per-call mode dispatch."""
+        return (self.q, self.s) if self.mode == "int8" else (self.w,)
 
     def nbytes(self) -> int:
         ts = (self.q, self.s) if self.mode == "int8" else (self.w,)
@@ -170,6 +183,13 @@ class Experts:
         if rows <= BF16_GEMV_ROWS or x.device.type != "cpu":
             return F.linear(x.to(torch.bfloat16), w).float()
         return F.linear(x, scratch(w.shape, torch.float32).copy_(w))
+
+    def args1(self) -> list:
+        """Per expert e: the gemv_fn args of mm1(., e), as views made once (q1[e] is an op, ~1 us, at every call)."""
+        return list(zip(self.q1, self.s1)) if self.mode == "int8" else [(w,) for w in self.w1]
+
+    def args2(self) -> list:
+        return list(zip(self.q2, self.s2)) if self.mode == "int8" else [(w,) for w in self.w2]
 
     def full1(self, e, x):
         return self._full(1, e, x)

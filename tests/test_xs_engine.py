@@ -170,6 +170,7 @@ class AgainstTinyMoE(unittest.TestCase):
     def test_gated_and_latent_variant(self):
         m = ref_model(seed=7, gated_norm=True, gated_attn=True, latent_alpha=2, n_kv_heads=1, pko_offset=0)
         xs = to_xs(m)
+        self.assertFalse(xs.fast)   # gated norm / latent experts: step() is step_ref
         ids = torch.randint(0, 300, (50,), generator=torch.Generator().manual_seed(6))
         ref = ref_logits(m, ids)
         self.check(ids, ref, [50], xs, 2e-4)
@@ -309,6 +310,118 @@ class GoldenFixture(unittest.TestCase):
             got = run_plan(xs, self.ids, [1] * 40, xs.new_cache(64))
             rel = torch.tensor([((g - self.ref[p]).abs().max() / self.ref[p].std()).item() for p, g in got.items()])
             self.assertLess(rel.median().item(), tol, mode)
+
+
+# ------------------------------------------------------------------------------------------ fast decode step
+def xs_state(cfg, seed=0) -> dict:
+    """Random fp32 weights for an XSConfig under tiny_moe's state-dict names (no tiny_moe needed): nonzero norms
+    gains, sinks, selection biases and bigram rows, so no part of the forward pass is trivially skipped."""
+    c = cfg
+    H, Hk, D, d, E, f, sf = c.n_heads, c.n_kv_heads, c.head_dim, c.d_model, c.n_routed, c.expert_dff, c.shared_ffn
+    shapes = {"embed": (c.vocab_size, d), "final_norm.norm.weight": (d,), "bigram": (c.bigram_rows, d)}
+    for i in range(c.n_layers):
+        p = f"layers.{i}."
+        shapes[p + "attn_norm.norm.weight"] = shapes[p + "mlp_norm.norm.weight"] = (d,)
+        shapes[p + "attn.w_qg.weight"] = (H * D * (2 if c.gated_attn else 1), d)
+        shapes[p + "attn.w_kv_local.weight"] = (2 * Hk * D, d)
+        if c.owns_global_kv(i):
+            shapes[p + "attn.w_kv_global.weight"] = (2 * Hk * D, d)
+            shapes[p + "attn.kg_norm.weight"] = (D,)
+        shapes[p + "attn.w_o.weight"] = (d, H * D)
+        shapes[p + "attn.q_norm.weight"] = shapes[p + "attn.kl_norm.weight"] = (D,)
+        shapes[p + "attn.sink"] = (H,)
+        if not c.is_hash_layer(i):
+            shapes[p + "moe.router"] = (E, d)
+        shapes[p + "moe.e_bias"] = (E,)
+        shapes[p + "moe.w1"] = (E, d, 2 * f)
+        shapes[p + "moe.w2"] = (E, f, d)
+        shapes[p + "moe.shared.0.w_in.weight"] = (2 * sf, d)
+        shapes[p + "moe.shared.0.w_out.weight"] = (d, sf)
+    g = torch.Generator().manual_seed(seed)
+    sd = {}
+    for k, shp in shapes.items():
+        w = torch.randn(shp, generator=g)
+        if k.endswith("norm.weight"):
+            w = 1 + 0.3 * w
+        elif k.endswith((".sink", ".e_bias")):
+            w = 0.5 * w
+        elif k == "bigram":
+            w = 0.3 * w
+        elif k != "embed":
+            w = w / math.sqrt(shp[-2] if k.endswith((".w1", ".w2")) else shp[-1])
+        sd[k] = w
+    return sd
+
+
+FAST_CFG = dict(vocab_size=300, d_model=128, n_layers=7, head_dim=32, n_kv_heads=2, kv_group=2, layer_pattern="FU",
+                swa_window=16, swa_only=2, max_seq_len=512, pko_every=2, pko_offset=1, n_experts=8, top_k=2,
+                expert_dff=48, shared_dff=96, hash_layers=3, bigram_rows=1009, base_width=128)
+
+
+@needs_torch
+class FastStep(unittest.TestCase):
+    """XSModel.step's fast path (_step_fast) against step_ref, the plain decode step: bitwise equal logits in every
+    weight format, so int8 / bf16 greedy decoding is unchanged by it."""
+
+    def setUp(self):
+        torch.set_num_threads(2)
+
+    def modes(self):
+        from moth.xs.quant import int8_kernel_ok
+        return ("fp32", "bf16", "int8") if int8_kernel_ok() else ("fp32", "bf16")
+
+    def run_both(self, xs, n_steps=60, seed=1):
+        """Same tokens through the fast path and step_ref on two caches: decode from position 0 (ring empty, PKO's
+        zero first key), past the ring (16 slots), a prefill chunk in between, then again after cache.reset()."""
+        g = torch.Generator().manual_seed(seed)
+        ca, cb = xs.new_cache(256), xs.new_cache(256)
+        for rnd in range(2):
+            toks = torch.randint(0, xs.cfg.vocab_size, (n_steps,), generator=g).tolist()
+            for i, t in enumerate(toks):
+                if i == n_steps // 2:   # a new message mid-decode (prefill path), then decode on
+                    chunk = torch.randint(0, xs.cfg.vocab_size, (7,), generator=g)
+                    self.assertTrue(torch.equal(xs.forward(chunk, ca), xs.forward(chunk, cb)))
+                a, b = xs._step_fast(t, ca), xs.step_ref(t, cb)
+                self.assertTrue(torch.equal(a, b), (xs.mode, rnd, i, (a - b).abs().max().item()))
+            self.assertEqual(ca.len, cb.len)
+            ca.reset()
+            cb.reset()
+
+    def test_bitwise_equal_xs_shape(self):
+        from moth.xs.config import XSConfig
+        from moth.xs.model import XSModel
+        cfg = XSConfig(**FAST_CFG)
+        sd = xs_state(cfg, seed=3)
+        for mode in self.modes():
+            xs = XSModel(cfg, sd, mode)
+            self.assertTrue(xs.fast, mode)
+            self.assertEqual(sorted({L.mode for L in xs.layers}), ["full", "reuse", "swa"])
+            self.assertTrue(xs.pko_groups and any(L.pko for L in xs.layers) and any(L.hashed for L in xs.layers))
+            self.run_both(xs)
+
+    def test_bitwise_equal_other_flags(self):
+        """Widths that aren't powers of two (RMSNorm's mean path), gated attention, sigmoid router, no sink / XSA /
+        QK-norm / clamp, an embedding multiplier."""
+        from moth.xs.config import XSConfig
+        from moth.xs.model import XSModel
+        cfg = XSConfig(**{**FAST_CFG, "d_model": 96, "head_dim": 24, "base_width": 96, "gated_attn": True,
+                          "router_act": "sigmoid", "attn_sink": False, "xsa": False, "qk_norm": False,
+                          "swiglu_clamp": 0.0, "emb_mult": 1.5, "expert_dff": 40, "shared_dff": 120})
+        sd = xs_state(cfg, seed=4)
+        for mode in self.modes():
+            xs = XSModel(cfg, sd, mode)
+            self.assertTrue(xs.fast, mode)
+            self.run_both(xs, n_steps=40)
+
+    def test_fallback_when_shared_expert_not_fusable(self):
+        from moth.xs.config import XSConfig
+        from moth.xs.model import XSModel
+        cfg = XSConfig(**{**FAST_CFG, "shared_dff": 64})
+        xs = XSModel(cfg, xs_state(cfg), "fp32")
+        self.assertFalse(xs.fast)
+        c1, c2 = xs.new_cache(64), xs.new_cache(64)
+        for t in (5, 9, 200):
+            self.assertTrue(torch.equal(xs.step(t, c1), xs.step_ref(t, c2)))
 
 
 # ------------------------------------------------------------------------------------------ format + template
