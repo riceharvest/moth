@@ -47,7 +47,7 @@ pattern = "(?P<version>\\S+)"
 
 # What ships: the runtime modules (the same set release/build.sh puts in the Hub repo's code/, plus any new module
 # by default), static/, assets/ (not the candidates/ art that wasn't picked), integrations/**, file_pool.json,
-# VERSION. Not: research/dev-only scripts and data (agent pool, judges, pairwise), caches.
+# VERSION. Not: research/dev-only scripts and data (agent pool, judges, pairwise, training, eval), caches.
 [tool.hatch.build]
 exclude = [
     "__pycache__",
@@ -60,6 +60,15 @@ exclude = [
     "moth/judge_mcp.py",
     "moth/pairwise.py",
     "moth/rejudge.py",
+    # the training / eval pipeline (the Hub download and the git repo have it; nothing at runtime imports it)
+    "moth/add_hermes_pool.py",
+    "moth/build_sft.py",
+    "moth/eval.py",
+    "moth/gen_dialogs.py",
+    "moth/metrics.py",
+    "moth/probes.py",
+    "moth/sft.py",
+    "tiny_agent/optim.py",
 ]
 
 [tool.hatch.build.targets.wheel]

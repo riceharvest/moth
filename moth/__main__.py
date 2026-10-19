@@ -32,6 +32,15 @@ def command(*parts: str) -> str:
     return subprocess.list2cmdline(parts) if os.name == "nt" else shlex.join(parts)
 
 
+def run_here(*args: str, module: str = "moth") -> str:
+    """How to run `python -m <module> <args>` on this install: anywhere for a pip install and the installers' app
+    (the `moth` command, or their Python / executable with -m), from code/ for a download or the checkout."""
+    from moth.backends import compat   # stdlib only
+    if compat.install_kind() in ("pip", "app"):
+        return command("moth", *args) if module == "moth" else command(sys.executable, "-m", module, *args)
+    return f"cd {command(CODE)} && {command(sys.executable, '-m', module, *args)}"
+
+
 def snippets() -> str:
     """Ready-to-paste setup for the six harnesses, with this install's real paths."""
     py = sys.executable
@@ -42,8 +51,8 @@ def snippets() -> str:
     p = lambda *x: os.path.join(INTEGRATIONS, *x)   # noqa: E731
     return f"""
 moth can watch your coding agent and react to its replies (one way: the agent never hears you or moth).
-Let moth set it up:  cd {command(CODE)} && {command(py, '-m', 'moth', 'hook', '--all')}   (asks first; backs up and
-merges configs; `{command(py, '-m', 'moth', 'hooks')}` shows what's installed). Or paste what fits your harness
+Let moth set it up:  {run_here('hook', '--all')}   (asks first; backs up and merges configs;
+`{run_here('hooks').split(' && ')[-1]}` shows what's installed). Or paste what fits your harness
 (details: {p('README.md')}):
 
   Claude Code   merge into {os.path.join(home, '.claude', 'settings.json')}
@@ -66,11 +75,11 @@ merges configs; `{command(py, '-m', 'moth', 'hooks')}` shows what's installed). 
                   - insert: [{{ id: moth, name: {json.dumps(p('dsh', 'moth.mjs'))} }}]
 
   any harness   watch and talk to moth in a side terminal:
-                  cd {command(CODE)} && {command(py, '-m', 'moth.tail')}
+                  {run_here(module='moth.tail')}
 
   The adapters only tell moth about each turn; the desktop pet shows its reaction. To also see moth's reply
   inside Pi (widget) and OpenCode (toast) too, from the next turn on:
-                  cd {command(CODE)} && {command(py, '-m', 'moth', 'config', 'show_in_harness', 'on')}
+                  {run_here('config', 'show_in_harness', 'on')}
 """
 
 
