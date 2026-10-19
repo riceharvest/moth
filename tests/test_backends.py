@@ -207,7 +207,7 @@ class Specs(Tmp):
         from moth import weights
         own = backends.resolve(weights.REPO_ID)   # moth's own XS (unreleased: the placeholder id, never contacted)
         self.assertEqual((own.backend, own.folder, own.repo, own.sampling["temperature"]),
-                         ("tiny-moe", weights.cache_dir(), weights.REPO_ID, 0.7))
+                         ("tiny-moe", weights.cache_dir(weights.REPO_ID), weights.REPO_ID, 0.7))
         old = backends.resolve(weights.LEGACY_REPO_ID)
         self.assertEqual((old.backend, old.repo), ("tiny-agent", weights.LEGACY_REPO_ID))
         xs = backends.resolve(self.folder("xs", config={"arch": "tiny-moe", "d_model": 512}))
@@ -286,7 +286,8 @@ class Settings(Tmp):
         self.assertIn("update it where it runs", out.getvalue())   # said, and then moth's own install as always
         self.assertEqual(seen, [("check", self.d, "someone/moth-xs"), ("update", self.d, "someone/moth-xs")])
         out = io.StringIO()
-        with contextlib.redirect_stderr(out):   # the unreleased placeholder: never contacted, said so
+        with contextlib.redirect_stderr(out), mock.patch.dict(os.environ, {"MOTH_REPO": ""}):   # the unreleased
+            # placeholder (no MOTH_REPO): never contacted, said so
             self.assertEqual(update.main(["--check"], root=self.d), 0)
             self.assertEqual(update.main(["--yes"], root=self.d), 1)
         self.assertIn("no published XS model release", out.getvalue())
