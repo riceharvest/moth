@@ -2247,7 +2247,7 @@ def _run(a, on_ready, boot, decided: str, quit_now: list) -> int:
             self.poll_loop()
 
         def poll_loop(self):
-            history = False
+            history, epoch = False, None
             while not self.stop.is_set():
                 lines, status = self.poller.poll()
                 if status:
@@ -2259,7 +2259,11 @@ def _run(a, on_ready, boot, decided: str, quit_now: list) -> int:
                     old = self.poller.history(MISSED_KEEP)
                     if old:
                         self.events.put(("history", old))
-                    try:   # the character the model plays (moth.json; older servers don't say: stays "moth")
+                if self.poller.start is not None and self.poller.epoch != epoch:
+                    # who it is: the card's name (/api/health "character"). A new card (`moth card set`, the page's
+                    # card button) starts a new chat, i.e. a new log epoch: ask again then. Older servers: "moth"
+                    epoch = self.poller.epoch
+                    try:
                         _, health = launch.probe(self.poller.url)
                         name = health.get("character") if isinstance(health, dict) else None
                         if isinstance(name, str) and 0 < len(name.strip()) <= 40:
@@ -2665,6 +2669,8 @@ def _run(a, on_ready, boot, decided: str, quit_now: list) -> int:
             for sub in getattr(m, "_moth_subs", ()):
                 sub.deleteLater()
             m.clear()
+            who = m.addAction(f"talking as: {getattr(self, 'character', 'moth')}")   # the card's name (moth card)
+            who.setEnabled(False)
             m.addAction("open chat page").triggered.connect(self.open_chat)
             m.addAction("what did i miss").triggered.connect(lambda *_: QTimer.singleShot(0, self.show_missed))
             m.addSeparator()

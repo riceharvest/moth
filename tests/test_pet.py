@@ -1703,9 +1703,10 @@ class PetSkinTrayUpdateTest(unittest.TestCase):
         if not QSystemTrayIcon.isSystemTrayAvailable():
             self.assertIsNone(seen["tray"])   # no tray offscreen: skipped silently
         self.assertEqual([t for t in seen["items"] if t],
-                         ["open chat page", "what did i miss", "mute bubbles", "mute harnesses", "quiet hours",
+                         ["talking as: moth", "open chat page", "what did i miss", "mute bubbles", "mute harnesses",
+                          "quiet hours",
                           "sleep", "show moth in harnesses", "skin", "stay on this screen", "check for updates",
-                          "quit"])
+                          "quit"])   # (the first: the card's name, disabled)
         self.assertEqual(seen["skins"], [("moth", False), ("Another One (other)", False), ("Testpet", True)])
         self.assertIs(seen["harness"], True)
         self.assertEqual(seen["muted"], (True, True))
