@@ -3,6 +3,7 @@ license: apache-2.0
 language:
 - en
 base_model: darioooooo0o/tiny-agent-112m
+base_model_relation: finetune
 datasets:
 - nvidia/Nemotron-SWE-v1
 - nebius/SWE-rebench-openhands-trajectories
@@ -16,6 +17,7 @@ tags:
 - tool-use
 - from-scratch
 - intel-arc
+- desktop-pet
 pipeline_tag: text-generation
 ---
 
@@ -213,6 +215,13 @@ so it's the mode to pick if you want replies as close to fp32 as possible at a b
 - If your PyTorch build has no int8 kernel for this, moth falls back to bf16 and says so.
 - `--threads N` sets the CPU threads (default: min(8, CPUs)). More threads help when the cores are free (16 on the
   5950X), but more threads than free cores (a busy machine, a CPU quota) make it slower.
+
+On a GPU (batch 1, bf16, CUDA/XPU graphs; `--compile` adds a one-time warmup):
+
+| GPU | reply speed | with `--compile` | reaction to an agent message (median) |
+|---|---|---|---|
+| RTX 5090 (`--device cuda`) | 640 tokens/s | 744 tokens/s | 46 ms (41 ms compiled) |
+| Intel Arc Pro B70 (`--device xpu`) | 418 tokens/s | 552 tokens/s | 84 ms (69 ms compiled) |
 
 ## Agent companion setup
 
@@ -458,11 +467,13 @@ see [Updating](#updating)).
 | `model.safetensors`, `config.json` | the model (custom architecture, see `code/tiny_agent/`) |
 | `tokenizer.json` | tokenizer (same as tiny-agent-112m) |
 | `code/moth/` | the app: `__main__.py` (start here), `serve.py` + `static/` (browser chat), `cli.py` (terminal chat), `tail.py` (side-terminal display), `pet.py` (desktop pet, needs PySide6; `launch.py` wakes the server for it), `shell.py` (moth's little shell) |
+| `code/moth/backends/`, `code/moth/docs/MODEL_BACKENDS.md` | the swappable model backends (tiny-agent, transformers, OpenAI-compatible) and the `moth.json` manifest |
+| `code/moth/setup.py` | `moth setup`, the guided first run |
 | `code/moth/integrations/` | hooks and plugins for the six harnesses, their README, and an offline test against a stub moth |
 | `code/moth/*.py` (rest) | character sheet, data generation, filtering, SFT and eval scripts |
 | `code/moth/file_pool.json` | the teacher-written files moth's home is sampled from |
 | `code/moth/docs/OWN_CHARACTER.md` | how to make your own character with this pipeline |
-| `code/moth/assets/` | the moth art (original SVG, CC BY 4.0) and its `CREDITS.md` |
+| `code/moth/assets/` | the moth art (original SVG, CC BY 4.0), the optional chirp sound (CC0) and their `CREDITS.md` |
 | `code/data/eval_agent_msgs.json` | 40 real agent messages used as eval prompts (unmodified, with sources) |
 | `code/tiny_agent/` | model, generation and tool code from tiny-agent |
 | `code/requirements.txt` | Python dependencies |
@@ -501,6 +512,7 @@ messages in `code/data/eval_agent_msgs.json`, which are included unmodified. `NO
 - [Liquid AI](https://huggingface.co/LiquidAI) for LFM2.5-24B-A2B, the round-3 teacher.
 - NVIDIA, Nebius and Lambda for publishing their agent traces.
 - DBCLS for the silkmoth icon that became moth's body (CC BY 4.0).
+- [Kenney](https://kenney.nl) for the chirp sound (CC0).
 - Inspired by "bugger" by [@gnostic_snakes](https://x.com/gnostic_snakes), another tiny bug that lives on a
   graphics card.
 
