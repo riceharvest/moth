@@ -1,13 +1,14 @@
 # moth
 
-> **A much better talker is on the way.** A new moth model, fully pretrained, then SFT'd and RL'd, is training right
-> now. To get it: `python -m moth update` in a Hugging Face download, `pip install -U moth-companion` for pip, or the
-> new installer from the [releases page](https://github.com/riceharvest/moth/releases/latest).
+> **This branch (moth 0.4, unreleased) runs the new XS model**: a small mixture-of-experts chat model (tiny-moe),
+> pretrained from scratch in five languages, SFT'd and RL'd. Pure chat: no tools, no files. Its weights aren't
+> published yet: point moth at a model folder with `--model DIR` (or `moth config model DIR`). `--legacy` runs the
+> old moth-112m (0.3) for comparison.
 
-**moth is a silly little companion, not an assistant.** It's a tiny 112M-parameter model that thinks it's a
-silkmoth living on your graphics card. It's a bit dim, gets things sweetly wrong, and will not fix your code. It
-keeps you company while your coding agent works: hook it up and it reacts to each agent turn's final message
-with a cute misreading.
+**moth is a silly little chat buddy, not an assistant.** It's warm, curious and a bit dim, gets things sweetly
+wrong, and will not fix your code. Who it is comes from a one-line card: by default a small moth living on your
+graphics card, but `moth card set "you are a cat named bo"` makes it a cat named bo. It keeps you company while
+your coding agent works: hook it up and it reacts to each agent turn's final message.
 
 ```
 [the agent said] Deployment to staging succeeded. The health check is green and response times are around
@@ -36,13 +37,15 @@ The model card with the full details (example chats, how it was trained, eval nu
 
 ## What it does
 
-- **Talks.** Short lowercase back-and-forth, and sometimes it remembers what you said a few turns ago.
+- **Talks.** Short lowercase back-and-forth in English, Chinese, Spanish, French or Hindi. Pure chat: no tools, no
+  files, no shell.
+- **Is whoever its card says.** `moth card` shows the card, `moth card set "<one line>"` or `--file card.json`
+  changes it (a running moth switches at once, the chat page and the pet show the new name), `moth card reset` goes
+  back to moth.
 - **Keeps your agent company.** One way only: the agent never sees moth or what you tell it.
-- **Has a home folder** (`~/.moth/home`: `lamps/ diary/ snacks/ friends/ sounds/ saved/`). It looks around with a
-  tiny pure-Python shell (`ls`, `cat`, `head`, `wc`, `echo`, plus `write`) that can't leave that folder.
-- **Runs locally.** CPU is fine (about half a second per reply, ~0.8 GB of RAM; int8 weights by default, `--quant none` for exact
-  fp32, see the model card's "Speed"). The server listens on 127.0.0.1 only and
-  needs a per-install token (`~/.moth/token`). It goes online only to download the weights or an update.
+- **Runs locally.** CPU is the target: XS with int8 weights by default (experts and linears int8, routers fp32,
+  ~1.1 GB of RAM), `--quant bf16` or `--quant none` (exact fp32). The server listens on 127.0.0.1 only and needs a
+  per-install token (`~/.moth/token`). It goes online only to download the weights or an update.
 
 ## Running it
 
@@ -55,7 +58,7 @@ cd moth-112m/code && python -m moth setup                            # then this
 ```
 
 `python -m moth setup` (`moth setup` for pip installs) is the first thing to run after installing. It checks the
-packages and the weights (a pip install downloads them here, about 860 MB, if you say yes), hooks moth into the
+packages and the weights (a pip install downloads them, about 1.2 GB, once the XS release is published), hooks moth into the
 coding agents it finds, offers autostart at login, and starts the pet. It asks before each step, `--yes` takes the
 defaults, `--dry-run` only shows the plan, and running it again only offers what's still missing. Later,
 `python -m moth.pet` starts the pet by itself (it wakes the server).
@@ -109,7 +112,8 @@ exactly as before. `moth doctor` shows what's active. Details and examples:
 
 ## Make your own character
 
-The personality is in the weights, not the prompt, so a new character means re-running the pipeline:
+With XS, a new identity is just a card (`moth card set ...`). The character underneath (warm, curious, dim) is in the
+weights; changing that means re-running the pipeline (this describes the 0.3 tools-era pipeline):
 [`moth/docs/OWN_CHARACTER.md`](moth/docs/OWN_CHARACTER.md). It needs an OpenAI-compatible teacher server and a
 CUDA or Intel XPU GPU for the fine-tune. Ship the result with a `moth.json` (its name, prompt and repo) and anyone
 can run it with `moth config model <your repo>`.

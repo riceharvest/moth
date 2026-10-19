@@ -46,7 +46,7 @@ path = "moth/VERSION"
 pattern = "(?P<version>\\S+)"
 
 # What ships: the runtime modules (the same set release/build.sh puts in the Hub repo's code/, plus any new module
-# by default), static/, assets/ (not the candidates/ art that wasn't picked), integrations/**, file_pool.json,
+# by default), static/, assets/ (not the candidates/ art that wasn't picked), integrations/**,
 # VERSION. Not: research/dev-only scripts and data (agent pool, judges, pairwise, training, eval), caches.
 [tool.hatch.build]
 exclude = [

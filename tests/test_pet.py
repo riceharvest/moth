@@ -279,8 +279,8 @@ class PollTest(unittest.TestCase):
         self.tok = os.path.join(self.tmp, "token")
         with open(self.tok, "w") as f:
             f.write(TOKEN + "\n")
-        m = types.SimpleNamespace(log=serve.Log(), lock=threading.RLock(), chats=[],
-                                  home=types.SimpleNamespace(tree=list, owned=True),
+        m = types.SimpleNamespace(log=serve.Log(), lock=threading.RLock(), chats=[], character="moth",
+                                  identity_view=lambda: {"name": "moth", "text": "you are moth.", "id": "moth"},
                                   agents=lambda: {"active": 0, "skipped": 0, "sessions": []})
         m.log.add({"say": "old line from before the pet"})
 
@@ -312,7 +312,7 @@ class PollTest(unittest.TestCase):
         p.poll()
         self.m.log.add({"agent": "a", "source": "codex", "label": "api", "skipped": True},
                        {"agent": "b", "source": "claude-code", "label": "moth-repo"}, {"say": "ooh"},
-                       {"you": "hi"}, {"say": "hello you"}, {"tool": "bash", "args": {}, "result": "x"})
+                       {"you": "hi"}, {"say": "hello you"})
         self.assertEqual(p.poll()[0], [("ooh", "claude · moth-repo"), ("hello you", None)])
 
     def test_lines_carry_source_label_reply_and_index(self):
@@ -537,7 +537,7 @@ class LaunchTest(LaunchBase):
         fake_weights(os.path.join(dev, "runs/v2/model"))
         d = L.server_paths(code=dev)
         self.assertEqual(d["model"], os.path.join(dev, "runs/final/ckpt_100"))
-        self.assertEqual(d["home"], os.path.join(dev, "live", "home"))
+        self.assertNotIn("home", d)   # pure chat: no home folder
         self.assertEqual(d["log"], os.environ["MOTH_SERVE_LOG"])
         del os.environ["MOTH_SERVE_LOG"]
         self.assertEqual(L.server_paths(code=dev)["log"], os.path.join(dev, "live", "serve.log"))
@@ -710,7 +710,7 @@ class LaunchTest(LaunchBase):
         d = L.server_paths(mode="pip")
         self.assertEqual((d["model"], d["download"]), (cache, cache))   # first run: download before starting
         self.assertEqual(d["tokenizer"], os.path.join(cache, "tokenizer.json"))
-        self.assertEqual(d["home"], os.path.join(os.path.expanduser("~"), ".moth", "home"))   # not site-packages
+        self.assertNotIn("home", d)
         del os.environ["MOTH_SERVE_LOG"]
         self.assertEqual(L.server_paths(mode="pip")["log"], os.path.join(os.path.expanduser("~"), ".moth", "serve.log"))
         fake_weights(cache)
@@ -747,7 +747,7 @@ class LaunchTest(LaunchBase):
         self.assertTrue(wait_until(lambda: not alive(child), 5))   # ... goes with the group
 
     def test_lifeline_flag_only_for_a_server_the_pet_starts(self):
-        paths = {"model": "m", "tokenizer": "t", "home": "h"}
+        paths = {"model": "m", "tokenizer": "t"}
         self.assertNotIn(L.EXIT_WITH_PARENT, L.server_command(1, paths, ["--x"]))   # python -m moth.launch, ...
         cmd = L.server_command(1, paths, ["--react-every", "0"], exit_with_parent=True)
         self.assertEqual(cmd[-3:], [L.EXIT_WITH_PARENT, "--react-every", "0"])     # the user's flags stay last

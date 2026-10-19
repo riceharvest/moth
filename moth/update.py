@@ -905,12 +905,16 @@ def main(argv=None, root: str = ROOT) -> int:
         # daily "new moth out" check keep working
         print(f"moth update: {target} (this updates moth's own install, as usual.)", file=sys.stderr, flush=True)
         target = None
-    if target:   # a tiny-agent model from another Hub repo, in the folder moth downloaded it to
+    if target:   # a moth model (XS / tiny-agent) from another Hub repo, in the folder moth downloaded it to
         root, a.repo, pip = target[0], target[1], True
     elif pip:   # pip install: the weights cache is what gets updated
         root = weights.cache_dir(a.repo)
     if a.rollback:
         return rollback(root, a.yes, pip)
+    if not weights.released(a.repo):   # the XS release isn't on the Hub yet: moth never contacts the placeholder id
+        print("moth update: there's no published XS model release to update from yet (set MOTH_REPO or --repo to "
+              "a Hub repo to use one).", file=sys.stderr, flush=True)
+        return 0 if a.check else 1
     if a.check:
         return check(root, a.repo, a.revision, pip)
     return update(root, a.repo, a.revision, a.yes, pip)

@@ -240,7 +240,7 @@ def main() -> int:
         run("weights", s.weights_step)
 
     def tick():
-        total = 860e6 if weights.repo() == weights.REPO_ID else 0
+        total = 1.19e9 if weights.repo() == weights.REPO_ID else 0   # XS bf16
         if total:
             bar.setValue(min(99, int(100 * folder_bytes(weights.cache_dir()) / total)))
         else:

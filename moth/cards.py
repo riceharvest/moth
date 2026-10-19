@@ -405,10 +405,46 @@ def _sample_card(rng: random.Random, pool: list[dict] | None = None) -> dict:
     return dict(rng.choice(pool))
 
 
+MAX_CARD_CHARS = 1000   # a card's identity text in the system prompt (the app's limit; training cards are far shorter)
+
+
+def validate(card: dict) -> dict:
+    """A card from outside (a file, `moth card set`, POST /api/card): the schema's types, some identity text, and at
+    most MAX_CARD_CHARS of it. Raises ValueError saying what's wrong."""
+    if not isinstance(card, dict):
+        raise ValueError("a card is a JSON object")
+    for k in ("name", "kind", "about"):
+        if card.get(k) is not None and not isinstance(card[k], str):
+            raise ValueError(f"{k} must be text")
+    for k in ("traits", "lines", "refs"):
+        v = card.get(k)
+        if v is not None and not (isinstance(v, list) and all(isinstance(x, str) for x in v)):
+            raise ValueError(f"{k} must be a list of text lines")
+    if card.get("id") not in ("moth", "blank") and not _lines(card):
+        raise ValueError('no identity in it: give "name" / "kind" / "traits", or "lines"')
+    if len(" ".join(_lines(card))) > MAX_CARD_CHARS:
+        raise ValueError(f"too long (over {MAX_CARD_CHARS} characters)")
+    return card
+
+
+def card_from_file(path: str) -> dict:
+    """A JSON card file -> a validated card (missing id / traits / refs filled in)."""
+    with open(path, encoding="utf-8") as f:
+        card = json.load(f)
+    if not isinstance(card, dict):
+        raise ValueError(f"{path}: a card file holds one JSON object")
+    card.setdefault("id", os.path.splitext(os.path.basename(path))[0])
+    card.setdefault("traits", [])
+    card.setdefault("refs", [w for w in re.findall(r"[a-z]{3,}", (card.get("kind") or "").lower())
+                             if w not in ("small", "little", "tiny")])
+    return validate(card)
+
+
 def load_card(spec: str | dict | None) -> dict:
-    """--card value -> card: None/"moth" = MOTH_CARD, "blank", "heldout:<i>", a path to a JSON card file, or a dict."""
+    """--card value -> card: None/"moth" = MOTH_CARD, "blank", "heldout:<i>", "text:<one line>", a path to a JSON
+    card file, or a dict."""
     if isinstance(spec, dict):
-        return spec
+        return {"id": "custom", "traits": [], "refs": [], **spec}
     if spec in (None, "", "moth"):
         return dict(MOTH_CARD)
     if spec == "blank":
@@ -420,13 +456,11 @@ def load_card(spec: str | dict | None) -> dict:
     if spec.startswith("text:"):
         return text_card(spec[5:])
     if os.path.exists(spec):
-        card = json.load(open(spec, encoding="utf-8"))
-        card.setdefault("id", os.path.splitext(os.path.basename(spec))[0])
-        card.setdefault("traits", [])
-        card.setdefault("refs", [w for w in re.findall(r"[a-z]{3,}", (card.get("kind") or "").lower())
-                                 if w not in ("small", "little", "tiny")])
-        return card
-    raise SystemExit(f"--card {spec!r}: not moth, blank, heldout:<i> or a JSON file")
+        try:
+            return card_from_file(spec)
+        except (OSError, ValueError) as e:
+            raise SystemExit(f"--card {spec}: {e}")
+    raise SystemExit(f"--card {spec!r}: not moth, blank, heldout:<i>, text:<one line> or a JSON file")
 
 
 def text_card(text: str) -> dict:

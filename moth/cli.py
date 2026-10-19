@@ -1,53 +1,27 @@
-"""Chat with moth in the terminal:  python -m moth.cli --model runs/sft1/model
+"""Chat with moth in the terminal:  python -m moth.cli  [serve's model options]
 
-Same engine as moth.serve (persistent home, the same little home-only shell). Commands: /reset, /home, /quit.
-Tool output is printed with terminal escape codes stripped (a file in moth's home can't move your cursor).
+Same engine as moth.serve (the default model, its card, the phrase memory); pure chat. Commands: /reset (new chat),
+/card (who moth is), /quit. Replies are printed with terminal escape codes stripped.
 """
 from __future__ import annotations
 
-import argparse
-
-from moth.serve import CPU_QUANT, default_paths, default_threads, make_engine, strip_ansi
+from moth.serve import default_threads, make_engine, parse_args, strip_ansi
 
 DIM, LAMP, OFF = "\033[2m", "\033[33m", "\033[0m"
 
 
-def main():
-    d = default_paths()
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default=d["model"], help="a weights folder, an HF repo id or openai:<url>#<model>")
-    ap.add_argument("--tokenizer", default=d["tokenizer"])
-    ap.add_argument("--home", default=d["home"], help="moth's home folder (kept between runs)")
-    ap.add_argument("--pool-file", default=d["pool"])
-    ap.add_argument("--seed", type=int, default=3, help="which home moth starts with")
-    ap.add_argument("--device", default="cpu")
-    ap.add_argument("--temperature", type=float, default=0.8)
-    ap.add_argument("--top-p", type=float, default=0.95)
-    ap.add_argument("--rep-penalty", type=float, default=1.3)
-    ap.add_argument("--ctx-budget", type=int, default=None, help="max tokens of chat moth keeps in mind")
-    ap.add_argument("--max-turn-tokens", type=int, default=200)
-    ap.add_argument("--max-tool-rounds", type=int, default=3)
-    ap.add_argument("--quant", default="auto", choices=["auto", "none", "int8", "bf16"],
-                    help=f"as moth.serve: auto = {CPU_QUANT} on the CPU; none = exact fp32")
-    ap.add_argument("--threads", type=int, default=None, help="CPU threads (default: min(8, CPUs))")
-    a = ap.parse_args()
+def main(argv=None):
+    a = parse_args(argv)
     from moth import backends, weights
-    from moth.backends import compat
-    kind, val = backends.parse_spec(a.model or "")
-    if kind == "folder":   # a model newer than this code: say how to upgrade (moth/backends/compat.py)
-        compat.require(val)
-    a.manifest = backends.resolve(a.model)
-    if a.manifest.backend == "tiny-agent":
-        if a.manifest.folder:
-            a.model = a.manifest.folder
-        weights.ensure_default(a.model)   # pip install, first run: download the model files
+    if a.manifest.backend in ("tiny-moe", "tiny-agent"):
+        weights.ensure_default(a.model, legacy=a.legacy)   # pip install, first run: download the model files
         backends.prepare(a.manifest)
-        compat.require(a.model)
     import torch
     torch.set_num_threads(a.threads or default_threads())
     moth = make_engine(a)
-    name = moth.character
-    print(f"{DIM}{name} is awake. home: {moth.home.root}  (/reset, /home, /quit){OFF}")
+    who = moth.identity_view()
+    name = who["name"]
+    print(f"{DIM}{name} is awake ({who['text'] or 'no card'}).  (/reset, /card, /quit){OFF}")
     while True:
         try:
             text = input("\nyou> ").strip()
@@ -59,22 +33,15 @@ def main():
         if text == "/quit":
             break
         if text == "/reset":
-            moth.reset()
+            moth.forget()
             print(f"{DIM}(new chat){OFF}")
             continue
-        if text == "/home":
-            for d in moth.home.tree():
-                print(f"{LAMP}{d['dir']}/{OFF} " + "  ".join(d["files"]))
+        if text == "/card":
+            print(f"{DIM}{moth.identity_view()['text'] or 'no card'}{OFF}")
             continue
         for ev in moth.chat(text):
             if "say" in ev:
                 print(f"{LAMP}{name}>{OFF} {strip_ansi(ev['say'])}")
-            else:
-                a, t = ev["args"], ev["tool"]
-                cmd = {"bash": f"$ {a.get('command', '')}", "read": f"$ cat {a.get('path', '')}",
-                       "write": f"✎ {a.get('path', '')}"}.get(t, t)
-                body = str(a.get("content", "") if t == "write" else ev["result"])
-                print(f"{DIM}  {strip_ansi(str(cmd))}\n  " + strip_ansi(body).replace("\n", "\n  ")[:800] + OFF)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ The JS adapters run under `node` with fake `pi` / `ctx` / plugin inputs; a stray
 (moth/config.py): off by default (still posted, nothing polled or drawn), env beats file, and a live toggle of the
 file applies from the next turn without a restart. `Serve` checks serve.py's real
 HTTP handler (torch faked out): Host allow-list, CORS, the per-install token, POST hygiene, /api/says, X-Frame-Options,
-and that "new home" only deletes a folder moth made. `AdapterToLog` runs every adapter against the real handler and
+and that POST /api/card swaps the identity card (token only). `AdapterToLog` runs every adapter against the real handler and
 the real Moth.hear_agent: the session ids and labels from each harness's payload end up on the log's cards.
 Every adapter must send the token (from MOTH_TOKEN_FILE, set to a
 throwaway file here) and its harness name as `source`, and post past an HTTP proxy set in the environment.
@@ -503,7 +503,7 @@ class LogStub:
                     want = {k: q[k][0] for k in ("source", "session") if k in q}
                     evs = [{"say": e["say"]} for e in evs if "say" in e and
                            all((e.get("re") or {}).get(k) == v for k, v in want.items())]
-                self._json({"events": evs, "next": len(stub.log), "epoch": stub.epoch, "tree": []})
+                self._json({"events": evs, "next": len(stub.log), "epoch": stub.epoch})
 
             def do_POST(self):
                 stub.paths.append(("POST", self.path))
@@ -518,7 +518,7 @@ class LogStub:
                     return self._json({"ok": True, "status": stub.status})
                 stub.log.append({"you": text})
                 time.sleep(delay)
-                evs = [{"tool": "bash", "args": {"command": "ls"}, "result": "notes"}, {"say": f"hi back: {text}"}]
+                evs = [{"say": f"hi back: {text}"}]
                 stub.log.extend(evs)
                 self._json({"events": evs})
 
@@ -583,7 +583,7 @@ class Display(unittest.TestCase):
         t.sent.append("hello moth")
         t.chat("hello moth")                       # the reply comes through the poll, our own line is not echoed
         t.poll_once()
-        self.assertEqual([s for s in shown if "awake" not in s], ["  $ ls", "moth> hi back: hello moth"])
+        self.assertEqual([s for s in shown if "awake" not in s], ["moth> hi back: hello moth"])
         self.moth.log[:] = [{"say": "fresh start"}]    # moth restarted: a new epoch, its log starts over
         self.moth.epoch = "e2"
         t.poll_once()
@@ -1090,11 +1090,16 @@ class Serve(unittest.TestCase):
     def setUp(self):
         import types
         serve, self.tmp = self.serve, tempfile.mkdtemp()
-        moth = types.SimpleNamespace(log=serve.Log(), lock=threading.RLock(), heard=[], chats=[],
-                                     home=serve.Home(os.path.join(self.tmp, "home"), 1, None),
-                                     a=types.SimpleNamespace(home=os.path.join(self.tmp, "home"), pool_file=None))
-        moth.log.add({"you": "my boss is awful"}, {"agent": "Fixed the bug."}, {"say": "hi"},
-                     {"tool": "bash", "args": {"command": "ls"}, "result": "diary"})
+        moth = types.SimpleNamespace(log=serve.Log(), lock=threading.RLock(), heard=[], chats=[], cards=[],
+                                     character="moth", a=types.SimpleNamespace())
+        moth.log.add({"you": "my boss is awful"}, {"agent": "Fixed the bug."}, {"say": "hi"}, {"you": "ok"})
+        moth.identity_view = lambda: {"name": moth.character, "text": "you are moth.", "id": "moth"}
+
+        def set_identity(card):
+            moth.cards.append(card)
+            moth.character = card.get("name") or "buddy"
+            moth.log.clear()
+        moth.set_identity = set_identity
         moth.hear_agent = lambda text, source, session=None, label=None: (
             moth.heard.append((text, source, session, label)) or "queued")
         moth.agents = lambda: {"active": 1, "skipped": 0,
@@ -1159,13 +1164,15 @@ class Serve(unittest.TestCase):
         for tok in (None, "", "wrong", TOKEN + "x"):
             with self.subTest(token=tok):
                 self.assertEqual(self.req("GET", "/api/log?since=0", {"X-Moth-Token": tok})[0], 401)
-                self.assertEqual(self.req("GET", "/api/home", {"X-Moth-Token": tok})[0], 401)
+                self.assertEqual(self.req("GET", "/api/card", {"X-Moth-Token": tok})[0], 401)
         code, h, body = self.req("GET", "/api/log?since=0", {"X-Moth-Token": TOKEN})
         d = json.loads(body)
         self.assertEqual((code, len(d["events"]), d["next"], d["epoch"]), (200, 4, 4, self.moth.log.epoch))
         self.assertEqual(h["x-frame-options"], "DENY")
-        self.assertEqual(json.loads(self.req("GET", "/api/log?since=3", {"X-Moth-Token": TOKEN})[2])["events"][0]["tool"],
-                         "bash")
+        self.assertEqual(json.loads(self.req("GET", "/api/log?since=3", {"X-Moth-Token": TOKEN})[2])["events"][0],
+                         {"you": "ok"})
+        self.assertEqual(d["card"], {"name": "moth", "text": "you are moth.", "id": "moth"})   # behind the token
+        self.assertEqual(self.req("GET", "/api/home", {"X-Moth-Token": TOKEN})[0], 404)   # pure chat: no home
 
     def test_says_view(self):
         code, h, body = self.req("GET", "/api/says?since=0", {"Origin": "null"})
@@ -1269,24 +1276,23 @@ class Serve(unittest.TestCase):
         self.assertNotIn(b"secret-proj", says)                  # folder names only behind the token
         self.assertNotIn(b"agents", says)
 
-    def test_reset_only_deletes_moths_own_home(self):
-        home = self.moth.home.root
+    def test_card_swaps_identity_with_token_only(self):
         e0 = self.moth.log.epoch
-        code, _, body = self.post("/api/reset", {})
-        self.assertEqual((code, json.loads(body)["epoch"] != e0, len(self.moth.log)), (200, True, 0))
-        with open(os.path.join(home, "diary", "mine.txt"), "w") as f:
-            f.write("keep me")
-        self.assertEqual(self.post("/api/reset", {"new_home": True})[0], 200)   # moth made it: replaced
-        self.assertFalse(os.path.exists(os.path.join(home, "diary", "mine.txt")))
-        self.assertTrue(self.moth.home.owned)
-        os.remove(os.path.join(home, self.serve.MARKER))   # e.g. an older home, or --home pointed at your own folder
-        with open(os.path.join(home, "precious.txt"), "w") as f:
-            f.write("mine")
-        code, _, body = self.post("/api/reset", {"new_home": True})
-        self.assertEqual(code, 409)
-        self.assertIn("won't delete", json.loads(body)["error"])
-        self.assertTrue(os.path.exists(os.path.join(home, "precious.txt")))
-        self.assertEqual(self.post("/api/reset", {"new_home": True}, **{"X-Moth-Token": None})[0], 401)
+        code, _, body = self.post("/api/card", {"card": "you are a cat named bo."})
+        d = json.loads(body)
+        self.assertEqual((code, d["card"]["name"], d["epoch"] != e0), (200, "bo", True))
+        self.assertEqual(self.moth.cards[-1]["lines"], ["you are a cat named bo."])   # a one-liner: a text card
+        code, _, body = self.post("/api/card", {"card": {"name": "pip", "kind": "a houseplant", "traits": []}})
+        self.assertEqual((code, self.moth.cards[-1]["name"]), (200, "pip"))
+        self.assertEqual(self.post("/api/card", {"card": "moth"})[0], 200)
+        self.assertEqual(self.moth.cards[-1]["id"], "moth")
+        for bad in ({"card": 5}, {"card": {"name": 5}}, {"card": {"traits": "x"}}, {"card": {"lines": ["x" * 2000]}}):
+            self.assertEqual(self.post("/api/card", bad)[0], 400, bad)
+        self.assertEqual(self.post("/api/card", {"card": "x"}, **{"X-Moth-Token": None})[0], 401)
+        self.assertEqual(len(self.moth.cards), 3)
+        health = json.loads(self.req("GET", "/api/health")[2])
+        self.assertEqual(health["character"], "moth")              # the name only; the card text stays behind the token
+        self.assertNotIn("you are", json.dumps(health))
 
     def test_reset_everything_is_moth_forget(self):
         """"new chat" keeps moth's phrase memory; {"everything": true} (what `moth forget` sends) wipes it too."""
@@ -1312,7 +1318,6 @@ class AdapterToLog(unittest.TestCase):
         m.log, m.lock, m.wake, m.clock = serve.Log(), threading.RLock(), threading.Condition(threading.RLock()), time.monotonic
         m.sessions, m.pending, m.batch, m.batch_until = {}, None, None, 0.0
         m.react_every, m.batch_window, m.last_react = 0, 0, float("-inf")
-        m.home = serve.Home(os.path.join(self.tmp, "home"), 1, None)
         self.m = m
         self.srv = ThreadingHTTPServer(("127.0.0.1", 0), serve.make_handler(m, TOKEN))
         self.srv.daemon_threads = True

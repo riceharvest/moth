@@ -55,7 +55,6 @@ def main():
     with open(a.token_file, "w") as f:
         f.write(token + "\n")
     lock = threading.Lock()
-    tmp = os.path.join(os.path.dirname(os.path.abspath(a.record)), "fake-moth-home")
 
     def hear_agent(text, source, session=None, label=None):
         with lock, open(a.record, "a", encoding="utf-8") as f:
@@ -67,8 +66,9 @@ def main():
         moth.log.add(card, {"say": f"heard {label or session}: {words}", "re": tag})
         return "queued"
 
-    moth = types.SimpleNamespace(log=serve.Log(), lock=threading.RLock(), hear_agent=hear_agent,
-                                 home=serve.Home(tmp, 1, None), a=types.SimpleNamespace(home=tmp, pool_file=None))
+    moth = types.SimpleNamespace(log=serve.Log(), lock=threading.RLock(), hear_agent=hear_agent, character="moth",
+                                 identity_view=lambda: {"name": "moth", "text": "you are moth.", "id": "moth"},
+                                 a=types.SimpleNamespace())
     moth.agents = lambda: {"active": 0, "skipped": 0, "sessions": []}
     moth.say_to = lambda text: [{"say": f"you said: {text}"}]
     moth.forget = lambda: moth.log.clear()

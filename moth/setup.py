@@ -4,7 +4,8 @@
 
   1 packages   python, torch, tokenizers / safetensors / numpy, and PySide6 for the desktop pet. Anything missing:
                the exact pip command, run only when you say yes at the prompt (never by --yes, never with sudo).
-  2 weights    pip install: offers to download them (about 860 MB, into ~/.cache/moth/<repo>). Hugging Face download:
+  2 weights    pip install: offers to download them (XS, about 1.2 GB, into ~/.cache/moth/<repo>; none until the XS
+               release is published: then it says how to point moth at a model folder). Hugging Face download:
                checks they're complete (`moth update` or `hf download` finish a partial one).
   3 memory     moth needs about 1 GB; the pet won't wake it with less than ~3 GB free.
   4 hooks      the coding agents found here and whether moth is hooked in; one question per harness, installed
@@ -306,6 +307,12 @@ class Setup:
             self.left.append(f"weights ({prog()} update)")
             return
         self.weights_ok = False
+        if not weights.released(weights.repo()):   # the XS release isn't on the Hub yet: nothing to download
+            self.line("✗", "no model to download yet: the XS release isn't published")
+            self.say(f"      point moth at a model folder: {prog()} setup --model DIR  (or {prog()} config model DIR,"
+                     " or MOTH_REPO=<owner/name>)")
+            self.left.append("weights (no XS release yet: --model DIR)")
+            return
         size = weights.SIZE_HINT if weights.repo() == weights.REPO_ID else "size unknown"
         self.line("·", f"not downloaded yet: {size}, from huggingface.co/{weights.repo()}")
         self.say(f"      into {folder}")
@@ -318,8 +325,8 @@ class Setup:
             self.left.append("weights (needs huggingface_hub)")
             return
         free = self._free_gb(folder)
-        if free is not None and free < 1.0:
-            self.line("✗", f"only {free:.1f} GB free there; the weights need about 0.9 GB")
+        if free is not None and free < 1.4:
+            self.line("✗", f"only {free:.1f} GB free there; the weights need about 1.3 GB")
             self.left.append("weights (disk space)")
             return
         if not self.ask("download them now?", True):

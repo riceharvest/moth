@@ -4,8 +4,9 @@
                                       chat, and the token ids of its own last 16 reactions, which its phrase memory
                                       keeps so it doesn't repeat a joke) lives only in RAM: stopping moth wipes it.
                                       The chat page's "new chat" button wipes the chat but keeps those reactions.
-  moth forget --all [--yes]           also its home folder (its files and diary, and whatever it wrote down there),
-                                      reset on its next start; only a folder moth made itself (.moth-home marker).
+  moth forget --all [--yes]           also the home folder an older moth (0.3, which had files and a diary) left
+                                      behind; only a folder moth made itself (.moth-home marker). moth 0.4 is pure
+                                      chat and keeps no files.
   moth forget --all --token [--yes]   also the install token and moth's settings (~/.moth/token, config.json).
 
 The token and settings are never removed otherwise; hook backups in ~/.moth/backups are kept. Deletes no files while a
@@ -22,7 +23,7 @@ import os
 import shutil
 import sys
 
-MARKER = ".moth-home"   # moth/shell.py MARKER (shell.py imports nothing heavy, but keep this module stdlib-only)
+MARKER = ".moth-home"   # what moth <= 0.3 wrote into the home folder it made (its home was dropped in 0.4)
 
 
 def prog() -> str:
@@ -34,7 +35,7 @@ def moth_dir() -> str:
 
 
 def default_home() -> str:
-    """serve's default home: ~/.moth/home, or live/home in this project's dev checkout."""
+    """Where moth <= 0.3 kept its home: ~/.moth/home, or live/home in this project's dev checkout."""
     from moth import weights
     if weights.mode() == "dev":
         return os.path.join(weights.ROOT, "live", "home")
@@ -129,9 +130,9 @@ def _confirm(question: str) -> bool:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog=f"{prog()} forget", description="wipe moth's memory of you: its logs; with "
-                                 "--all also its home folder (files, diary); the token and settings only with "
+                                 "--all also an old home folder (moth <= 0.3); the token and settings only with "
                                  "--all --token")
-    ap.add_argument("--all", action="store_true", help="also reset moth's home folder (its files and diary)")
+    ap.add_argument("--all", action="store_true", help="also delete the home folder an older moth (<= 0.3) made")
     ap.add_argument("--token", action="store_true", help="with --all: also delete the token and config.json")
     ap.add_argument("--home", default=None, help="moth's home folder, if you start moth with --home (default: "
                                                  "serve's default)")
@@ -159,10 +160,10 @@ def main(argv=None) -> int:
             danger = {os.path.realpath(os.path.expanduser("~")), os.path.realpath(os.sep), os.path.realpath(moth_dir())}
             if os.path.islink(home) or os.path.realpath(home) in danger or not home_owned(home):
                 print(f"moth didn't make {home} itself (no {MARKER} marker), so it won't delete it. Move it away by "
-                      f"hand (say, mv {home} {home}.old); moth makes a fresh home on its next start. Nothing was "
+                      f"hand (say, mv {home} {home}.old); moth 0.4 doesn't use it. Nothing was "
                       "deleted.")
                 return 1
-            targets.append((home, "home folder (moth's files and diary)"))
+            targets.append((home, "old home folder (moth <= 0.3's files and diary)"))
         if a.token:
             from moth import config
             targets += [(p, w) for p, w in ((token_path(), "token (hooks pick up the new one on moth's next start)"),
@@ -170,7 +171,7 @@ def main(argv=None) -> int:
     print("conversation and reaction memory: nothing on disk (they live only in RAM while moth runs; moth isn't "
           "running now)")
     if not targets:
-        print("nothing else to forget" + ("" if a.all else f" (`{prog()} forget --all` also resets moth's home folder)"))
+        print("nothing else to forget" + ("" if a.all else f" (`{prog()} forget --all` also deletes an old home folder)"))
         return 0
     print("moth forget will delete:")
     for p, what in targets:
@@ -190,7 +191,7 @@ def main(argv=None) -> int:
             print(f"  couldn't delete {p}: {e}")
             rc = 1
     if a.all:
-        print("moth gets a fresh home folder on its next start.")
+        print("the old home folder is gone (moth 0.4 keeps no files).")
     return rc
 
 

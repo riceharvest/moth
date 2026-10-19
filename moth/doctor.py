@@ -123,7 +123,7 @@ def weights_paths() -> tuple[str, str, str]:
         folder = os.path.dirname(weights.ROOT)
         return mode, folder, os.path.join(folder, "tokenizer.json")
     if mode == "dev":
-        return mode, weights.DEV_MODEL, weights.DEV_TOKENIZER
+        return mode, weights.DEV_MODEL, os.path.join(weights.DEV_MODEL, "tokenizer.json")
     folder = weights.cache_dir()
     return mode, folder, os.path.join(folder, "tokenizer.json")
 
@@ -143,6 +143,7 @@ def safetensors_complete(path: str) -> bool:
 
 
 def check_weights(r: Report) -> str | None:
+    from moth import weights
     try:
         mode, folder, _ = weights_paths()
     except Exception as e:
@@ -158,8 +159,11 @@ def check_weights(r: Report) -> str | None:
             r.add("✗", "weights", f"{folder} has no config.json", f"{prog()} update")
         else:
             r.add("✓", "weights", f"{size:.0f} MB in {folder}  ({mode} install)")
+    elif mode == "pip" and not weights.released(weights.repo()):
+        r.add("✗", "weights", f"no model yet: the XS release isn't published, so there is nothing to download into "
+                              f"{folder}", f"{prog()} config model <a model folder> (or set MOTH_REPO)")
     elif mode == "pip":
-        r.add("!", "weights", f"not downloaded yet: moth fetches them (about 860 MB) into {folder} on first run",
+        r.add("!", "weights", f"not downloaded yet: moth fetches them ({weights.SIZE_HINT}) into {folder} on first run",
               f"start moth once with a network connection ({prog()})")
     elif mode == "dev" and dev_alternative():
         alt = dev_alternative()
@@ -170,7 +174,7 @@ def check_weights(r: Report) -> str | None:
     else:
         r.add("✗", "weights", f"no model.safetensors in {folder}",
               "pass --model DIR to moth" if mode == "dev" else
-              "download again: hf download darioooooo0o/moth-112m --local-dir moth-112m")
+              f"download again: hf download {weights.repo()} --local-dir <this folder>")
     return folder
 
 
@@ -185,7 +189,8 @@ def check_model(r: Report, spec: str | None = None, timeout: float = 2.0):
         r.add("!", "model", f"couldn't read the model setting: {e}")
         return None
     if not spec:
-        r.add("✓", "model", f"moth's own (tiny-agent, character 'moth')  ({prog()} config model ... swaps it)")
+        r.add("✓", "model", f"moth's own (XS on tiny-moe; the card says who it is)  ({prog()} config model ... swaps "
+                            "it)")
         return None
     try:
         m = backends.resolve(spec, network=False)
@@ -195,7 +200,7 @@ def check_model(r: Report, spec: str | None = None, timeout: float = 2.0):
     for n in m.notes:
         r.add("!", "model", f"moth.json: {n}")
     what = m.describe()
-    if m.backend == "tiny-agent":
+    if m.backend in ("tiny-agent", "tiny-moe"):
         st = os.path.join(m.folder or "", "model.safetensors")
         if m.folder and os.path.isfile(st) and safetensors_complete(st):
             r.add("✓", "model", what)

@@ -2,8 +2,8 @@
 
 moth's pet, hooks, chat page and `moth tail` all talk to one local server (`moth.serve`). The model behind that
 server can be changed with one setting: a later moth, another creator's small persona model, or any small local
-chat model. Everything else stays the same: the hooks, the reaction batching across agent sessions, the home folder,
-the chat page and the pet.
+chat model. Everything else stays the same: the hooks, the reaction batching across agent sessions, the identity card,
+the chat page and the pet. moth is pure chat since 0.4: no backend runs tools.
 
 ```bash
 moth config model ~/models/moth-2                          # a weights folder (its moth.json says how to run it)
@@ -18,16 +18,18 @@ as part of setup. `moth doctor` shows which backend, model and character are act
 
 ## Backends
 
-| backend | runs | needs | tools | phrase ban | context kept across turns |
-|---|---|---|---|---|---|
-| `tiny-agent` (default) | moth-112m and anything trained with this repo's pipeline (`tiny_agent/`) | nothing extra | yes | yes | KV cache: each turn feeds only the new text; int8 on the CPU, device graphs on CUDA/XPU |
-| `transformers` | any causal LM `transformers` loads (a folder or an HF repo id) with a chat template, CPU or GPU | `pip install "moth-companion[transformers]"` | if the manifest says so | yes | no: each turn re-reads the chat |
-| `openai` | any OpenAI-compatible `/v1/chat/completions` server: llama.cpp `llama-server`, Ollama, vLLM, LM Studio | a running server | if the manifest says so | no | no (the server may cache prefixes) |
+| backend | runs | needs | phrase ban | context kept across turns |
+|---|---|---|---|---|
+| `tiny-moe` (default) | XS (tiny-moe: LatentMoE experts + CSA2 attention) on moth's own inference code (`moth/xs`) | nothing extra | yes | KV cache: each turn feeds only the new text; int8 experts on the CPU (routers fp32), `--quant bf16` / `none` |
+| `tiny-agent` | the old moth-112m (0.3) and anything trained with `tiny_agent/`; `--legacy` runs it | nothing extra | yes | KV cache; int8 on the CPU, device graphs on CUDA/XPU; its tool tokens are banned |
+| `transformers` | any causal LM `transformers` loads (a folder or an HF repo id) with a chat template, CPU or GPU | `pip install "moth-companion[transformers]"` | yes | no: each turn re-reads the chat |
+| `openai` | any OpenAI-compatible `/v1/chat/completions` server: llama.cpp `llama-server`, Ollama, vLLM, LM Studio | a running server | no | no (the server may cache prefixes) |
 
 How moth picks the backend for a model spec:
 
-- **A folder.** If it has a `moth.json`, that file decides. Without one, it's a tiny-agent folder, which is how every
-  existing moth folder keeps working unchanged. The exception is a plain transformers save, a `config.json` with a
+- **A folder.** If it has a `moth.json`, that file decides. Without one, a `config.json` with `"arch": "tiny-moe"`
+  is XS (tiny-moe) and anything else of moth's is a tiny-agent folder, which is how every existing moth folder keeps
+  working unchanged. The exception is a plain transformers save, a `config.json` with a
   `model_type`, which runs on transformers with the general-model defaults below.
 - **An HF repo id (`owner/name`).** moth fetches only the repo's `moth.json`, a few hundred bytes, and uses it.
   - tiny-agent repos download their weights into `~/.cache/moth/<owner>/<name>/` on first start, the same way
@@ -45,21 +47,21 @@ newer manifest still loads on an older moth). A key with the wrong type stops mo
 
 | key | default | what it does |
 |---|---|---|
-| `backend` | `"tiny-agent"` | `tiny-agent`, `transformers` or `openai` |
+| `backend` | `"tiny-agent"` (an XS folder: `"tiny-moe"`) | `tiny-moe`, `tiny-agent`, `transformers` or `openai` |
 | `character` | `"moth"` | the name shown where it is display text (the pet's tray tooltip and notification title, `moth.cli`'s prompt, doctor). Commands and the package stay `moth` |
-| `chat_format` | `"chatml"` (tiny-agent), `"template"` (others) | `chatml`: moth's own `<\|im_start\|>` format. `template`: the tokenizer's chat template (transformers) or the server's own (openai) |
-| `system` | moth-112m's trained prompt (tiny-agent), a short moth character sheet (others) | the system prompt |
+| `chat_format` | `"xs"` (tiny-moe), `"chatml"` (tiny-agent), `"template"` (others) | `chatml`: moth's own `<\|im_start\|>` format. `template`: the tokenizer's chat template (transformers) or the server's own (openai) |
+| `system` | the identity card + one line of chat framing (tiny-moe), moth-112m's trained prompt (tiny-agent), a short character sheet around the card (others) | the system prompt; set here, it wins over any card |
 | `agent_card` | `"[the agent said]\n{message}"` | how a coding agent's final message is shown to the model. `{message}` is the cleaned text (markdown stripped, long messages cut to head + tail). Must contain `{message}` |
 | `reaction` | none (tiny-agent), a "react in one short silly line…" nudge (others) | added after the agent card for that one reaction only. History keeps the plain card |
-| `sampling` | `{"temperature": 0.8, "top_p": 0.95, "rep_penalty": 1.3, "max_tokens": 200}` | defaults for `--temperature`, `--top-p`, `--rep-penalty` and `--max-turn-tokens`. Flags still win |
-| `tools` | `true` (tiny-agent), `false` (others) | moth's home tools: `bash` / `read` / `write` in its own little folder, as `<tool_call>` JSON. Off means every turn only talks |
+| `sampling` | tiny-moe: `{"temperature": 0.7, "top_p": 1.0, "rep_penalty": 1.0, "max_tokens": 200}` (plain softmax, what its RL trains with); others: `{"temperature": 0.8, "top_p": 0.95, "rep_penalty": 1.3, "max_tokens": 200}` | defaults for `--temperature`, `--top-p`, `--rep-penalty` and `--max-turn-tokens`. Flags still win |
+| `tools` | `false` | ignored since 0.4 (moth has no tools; `true` only adds a note) |
 | `lowercase` | `true` | moth only speaks lowercase |
 | `context` | 3000 | tokens of chat kept in mind. Older turns drop out first. `--ctx-budget` wins |
 | `stop` | `[]` | extra stop strings |
 | `model` | the folder itself | transformers: a folder or an HF repo id. openai: the server's model name |
 | `base_url` | none | openai: the server, e.g. `http://127.0.0.1:8080/v1` |
 | `api_key_env` | `MOTH_OPENAI_API_KEY` | openai: the environment variable holding a key, if the server wants one. It must start with `MOTH_`, so a manifest can't send another key (`GITHUB_TOKEN`...) anywhere. Keys never go in moth.json or moth's config |
-| `tokenizer` | `tokenizer.json` in the folder | tiny-agent: the tokenizer file, relative to the folder |
+| `tokenizer` | `tokenizer.json` in the folder | tiny-moe / tiny-agent: the tokenizer file, relative to the folder |
 | `repo` | none (moth-112m: its own repo) | the HF repo `moth update` refreshes this model from |
 | `version` | none | the model's own version, shown by doctor and the serve log |
 | `needs_moth` | none | the oldest moth that can run this model, e.g. `"0.4.0"`: an older moth says how to upgrade instead of loading it, and a pip install's `moth update` won't fetch it |

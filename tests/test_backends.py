@@ -75,7 +75,7 @@ class Manifests(Tmp):
     def test_missing_manifest_is_moth_112m(self):
         m = M.load(self.folder("plain"))
         self.assertTrue(m.is_default)
-        self.assertEqual((m.backend, m.character, m.chat_format, m.tools, m.lowercase), ("tiny-agent", "moth", "chatml", True, True))
+        self.assertEqual((m.backend, m.character, m.chat_format, m.tools, m.lowercase), ("tiny-agent", "moth", "chatml", False, True))
         self.assertEqual(m.sampling, {"temperature": 0.8, "top_p": 0.95, "rep_penalty": 1.3, "max_tokens": 200})
         from moth.agent import agent_turn, clean_agent_message
         msg = "## Done\n- fixed `x.py`"
@@ -122,10 +122,11 @@ class Manifests(Tmp):
 
     def test_apply_args(self):
         import argparse
-        a = argparse.Namespace(max_tool_rounds=3, ctx_budget=None)
+        a = argparse.Namespace(ctx_budget=None)
         self.assertIs(M.apply_args(a, M.Manifest()), a)       # nothing to change: the very same namespace
-        b = M.apply_args(a, M.parse({"tools": False, "context": 1024}))
-        self.assertEqual((b.max_tool_rounds, b.ctx_budget, a.max_tool_rounds), (0, 1024, 3))
+        self.assertIs(M.apply_args(a, M.parse({"tools": False})), a)   # tools: ignored since 0.4 (pure chat)
+        b = M.apply_args(a, M.parse({"context": 1024}))
+        self.assertEqual((b.ctx_budget, a.ctx_budget), (1024, None))
         a.ctx_budget = 500
         self.assertEqual(M.apply_args(a, M.parse({"context": 1024})).ctx_budget, 500)   # --ctx-budget wins
 
@@ -204,8 +205,14 @@ class Specs(Tmp):
         hub = backends.resolve("someone/chat-0.5b", network=True)   # offline: never asks the Hub
         self.assertEqual((hub.backend, hub.model, hub.repo), ("transformers", "someone/chat-0.5b", "someone/chat-0.5b"))
         from moth import weights
-        own = backends.resolve(weights.REPO_ID)
-        self.assertEqual((own.backend, own.folder, own.repo), ("tiny-agent", weights.cache_dir(), weights.REPO_ID))
+        own = backends.resolve(weights.REPO_ID)   # moth's own XS (unreleased: the placeholder id, never contacted)
+        self.assertEqual((own.backend, own.folder, own.repo, own.sampling["temperature"]),
+                         ("tiny-moe", weights.cache_dir(), weights.REPO_ID, 0.7))
+        old = backends.resolve(weights.LEGACY_REPO_ID)
+        self.assertEqual((old.backend, old.repo), ("tiny-agent", weights.LEGACY_REPO_ID))
+        xs = backends.resolve(self.folder("xs", config={"arch": "tiny-moe", "d_model": 512}))
+        self.assertEqual((xs.backend, xs.chat_format, xs.is_default, xs.sampling["rep_penalty"]),
+                         ("tiny-moe", "xs", True, 1.0))
         self.folder(os.path.join("c", "evil", "persona"), {"backend": "openai", "base_url": "https://x.example/v1",
                                                             "model": "m"})
         with self.assertRaises(M.ManifestError):   # a Hub moth.json can't send moth's text to an endpoint
@@ -271,12 +278,18 @@ class Settings(Tmp):
         out = io.StringIO()
         seen = []
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out), \
+                mock.patch.dict(os.environ, {"MOTH_REPO": "someone/moth-xs"}), \
                 mock.patch.object(update, "check", lambda root, repo, rev, pip=False: seen.append(("check", root, repo)) or 0), \
                 mock.patch.object(update, "update", lambda root, repo, rev, yes, pip=False: seen.append(("update", root, repo)) or 0):
             self.assertEqual(update.main(["--check"], root=self.d), 0)
             self.assertEqual(update.main(["--yes"], root=self.d), 0)
         self.assertIn("update it where it runs", out.getvalue())   # said, and then moth's own install as always
-        self.assertEqual(seen, [("check", self.d, update.weights.repo()), ("update", self.d, update.weights.repo())])
+        self.assertEqual(seen, [("check", self.d, "someone/moth-xs"), ("update", self.d, "someone/moth-xs")])
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):   # the unreleased placeholder: never contacted, said so
+            self.assertEqual(update.main(["--check"], root=self.d), 0)
+            self.assertEqual(update.main(["--yes"], root=self.d), 1)
+        self.assertIn("no published XS model release", out.getvalue())
         config.write("model", "someone/chat-0.5b")
         self.assertIn("hf download someone/chat-0.5b", update.model_target())
         m2 = self.folder(os.path.join("c", "someone", "moth-2"), {"backend": "tiny-agent", "repo": "someone/moth-2"})
@@ -377,18 +390,12 @@ class TinyAgentUnchanged(Tmp):
                 self.assertIs(type(m), serve.Moth)
                 self.assertEqual(m.messages[0]["content"], SYSTEM_STUDENT)
                 results[name, temp] = run_moth(m)
-        # the old way (what tests/bench_speed.py does): no manifest anywhere, tok/model/_kv set by hand
-        from tiny_agent.checkpoint import load_model
-        from tokenizers import Tokenizer
+        # straight construction: a plain parser, the backend handed over (what tests/bench_speed.py does)
         for temp in ("0", "0.8"):
-            args = serve.build_parser().parse_args(["--model", w, "--tokenizer", TOKENIZER, "--home",
-                                                    os.path.join(self.d, f"h-old-{temp}"), "--temperature", temp])
-            m = serve.Moth.__new__(serve.Moth)
-            m.tok = Tokenizer.from_file(TOKENIZER)
-            m.model = load_model(w, device="cpu", dtype=torch.float32, low_mem=True).eval()
-            m.kv_dtype = torch.float32
-            m._kv = G.KVCache(m.model, 1, serve.MAX_LEN, "cpu", dtype=torch.float32)
-            m.setup(args)
+            args = serve.build_parser().parse_args(["--model", w, "--tokenizer", TOKENIZER, "--temperature", temp,
+                                                    "--quant", "none"])
+            m = serve.Moth(args, manifest=M.Manifest(folder=w))
+            self.assertIsInstance(m._kv, G.KVCache)
             results["old", temp] = run_moth(m)
         for temp in ("0", "0.8"):
             self.assertEqual(results["none", temp], results["old", temp], temp)
@@ -412,11 +419,93 @@ class TinyAgentUnchanged(Tmp):
         a2 = serve.parse_args(["--model", w, "--tokenizer", TOKENIZER, "--temperature", "0.9"])
         self.assertEqual(a2.temperature, 0.9)                                # ... and flags still win
         m = serve.make_engine(a)
-        self.assertEqual((m.character, m.messages[0]["content"], m.a.max_tool_rounds), ("moth 2", "you are moth 2.", 0))
+        self.assertEqual((m.character, m.messages[0]["content"]), ("moth 2", "you are moth 2."))
         m.agent_said("Done. " + "word " * 60, "codex")
         card = [x for x in m.messages if x["role"] == "user"][-1]["content"]
         self.assertTrue(card.startswith("<<agent>> Done. word"))
         self.assertEqual(len(card[len("<<agent>> "):].split()), serve.COMPACT_WORDS + 1)   # compacted with the new card
+
+
+def save_tiny_xs(folder: str, card_manifest: dict | None = None) -> str:
+    """A small random XS model folder (moth.xs release format) with the test XS tokenizer."""
+    sys.path.insert(0, os.path.join(ROOT, "tests"))
+    from bench_xs import RandomXS
+    from xs_tok import xs_tokenizer
+    from moth.xs import config as xc, weights as W
+    tok = xs_tokenizer()
+    cfg = xc.XSConfig(vocab_size=tok.get_vocab_size(), d_model=64, n_layers=4, head_dim=16, n_kv_heads=2, swa_only=1,
+                      kv_group=2, layer_pattern="FU", swa_window=8, n_experts=4, top_k=2, expert_dff=16,
+                      shared_dff=32, hash_layers=1, bigram_rows=101, max_seq_len=8192, pko_every=2, pko_offset=1)
+    rnd = RandomXS(cfg, seed=3)
+    os.makedirs(folder, exist_ok=True)
+    tok_path = os.path.join(folder, "_tok.json")
+    tok.save(tok_path)
+    W.save(folder, {k: rnd[k] for k in rnd}, xc.to_dict(cfg), tok_path, card_manifest or W.MANIFEST)
+    os.remove(tok_path)
+    return folder
+
+
+@needs_torch
+class TinyMoeBehindMoth(Tmp):
+    """The default model's path end to end: an XS folder -> backend tiny-moe -> moth.serve's stateful engine."""
+
+    def test_xs_folder_runs_through_serve(self):
+        import torch
+        from moth import cards, serve
+        torch.set_num_threads(2)
+        w = save_tiny_xs(os.path.join(self.d, "xs"))
+        for sub in ([], ["--quant", "none"], ["--quant", "bf16"]):
+            a = serve.parse_args(["--model", w] + sub)
+            self.assertEqual((a.manifest.backend, a.tokenizer), ("tiny-moe", os.path.join(w, "tokenizer.json")))
+            self.assertEqual((a.temperature, a.top_p, a.rep_penalty), (0.7, 1.0, 1.0))   # the RL's plain sampler
+            m = serve.make_engine(a)
+            self.assertIs(type(m), serve.Moth)
+            self.assertEqual(m.backend.name, "tiny-moe")
+            self.assertEqual(m.system, cards.student_system(cards.MOTH_CARD))
+            torch.manual_seed(0)
+            for u in ("hi there", "how are you?"):
+                evs = m.chat(u)
+                self.assertEqual(len(evs), 1)
+                self.assertNotEqual(evs[0]["say"], serve.FALLBACK)
+            evs = m.agent_said("Fixed the login bug. All tests pass.", "claude-code", session="s1")
+            self.assertNotEqual(evs[0]["say"], serve.FALLBACK)
+            text = m.backend.render(m.messages)
+            self.assertIn("<|agent|>Fixed the login bug.", text)
+            # the cache starts with exactly the rendered chat (system + first turn + the generation prompt); later
+            # it holds the model's own reply tokens (moth's history keeps them lowercased / stripped as text)
+            ids = m.enc(m.backend.render(m.messages[:2], True))
+            self.assertEqual(m.cache.tokens[:len(ids)].tolist(), ids)
+            m.set_identity("text:you are a cat named bo.")
+            self.assertTrue(m.system.startswith("you are a cat named bo."))
+            self.assertEqual((len(m.messages), m.character), (1, "bo"))
+            self.assertNotEqual(m.chat("meow?")[0]["say"], serve.FALLBACK)
+        self.assertEqual(m.quant, "bf16")
+
+    def test_card_from_config_and_flag(self):
+        from moth import config, serve
+        w = save_tiny_xs(os.path.join(self.d, "xs"))
+        config.write("card", "you are a fox named rue")
+        self.assertEqual(serve.parse_args(["--model", w]).identity, "text:you are a fox named rue")
+        self.assertEqual(serve.parse_args(["--model", w, "--card", "blank"]).identity, "blank")
+        config.write("card", {"name": "pip", "kind": "a houseplant", "traits": []})
+        self.assertEqual(serve.parse_args(["--model", w]).identity["name"], "pip")
+        config.write("card", "moth")
+        self.assertIsNone(serve.parse_args(["--model", w]).identity)
+
+    def test_compat(self):
+        from moth.backends import compat
+        w = save_tiny_xs(os.path.join(self.d, "xs"))
+        self.assertIsNone(compat.problem(w))
+        with open(os.path.join(w, "config.json")) as f:
+            cfg = json.load(f)
+        with open(os.path.join(w, "config.json"), "w") as f:
+            json.dump({**cfg, "brand_new_feature": 1}, f)
+        self.assertIn("newer model architecture", compat.problem(w))
+        # what moth 0.3.x's compat says about an XS release: its moth.json names a backend it doesn't have
+        man = json.load(open(os.path.join(w, "moth.json")))
+        self.assertEqual((man["backend"], man["needs_moth"]), ("tiny-moe", "0.4.0"))
+        old_backends = ("tiny-agent", "transformers", "openai")
+        self.assertNotIn(man["backend"], old_backends)   # -> "it runs on a 'tiny-moe' backend this moth doesn't have"
 
 
 class FakeOAI:
@@ -537,7 +626,7 @@ class TransformersBackend(Tmp):
         a = serve.parse_args(["--model", folder, "--home", os.path.join(self.d, "h")])
         m = serve.make_engine(a)
         self.assertIsInstance(m, GenericMoth)
-        self.assertEqual((m.character, m.a.max_tool_rounds, m.backend.name), ("gpt-moth", 0, "transformers"))
+        self.assertEqual((m.character, m.backend.name), ("gpt-moth", "transformers"))
         evs = m.say_to("hello there")
         self.assertEqual(len(evs), 1)
         self.assertIn("say", evs[0])
@@ -564,7 +653,6 @@ class TransformersBackend(Tmp):
         self.make_model(folder, {"backend": "transformers", "chat_format": "chatml", "tools": True,
                                  "sampling": {"temperature": 0, "max_tokens": 4}})
         m = serve.make_engine(serve.parse_args(["--model", folder, "--home", os.path.join(self.d, "h")]))
-        self.assertEqual(m.a.max_tool_rounds, 3)                              # tools on: moth's normal rounds
         from tiny_agent.chat import render
         self.assertEqual(m.backend.prompt(m.messages), render(m.messages, add_generation_prompt=True))
         self.assertEqual(len(m.say_to("hi")), 1)

@@ -1,6 +1,10 @@
 #!/bin/bash
-# Assemble the Hugging Face repo folder for moth:  bash release/build.sh runs/<final>/model
-#   -> release/hf/ : model.safetensors, config.json, tokenizer.json, README.md, LICENSE, code/
+# Assemble the Hugging Face repo folder for moth:  bash release/build.sh runs/xs/model
+#   (an XS model folder made by `python -m moth.xs.weights export`: model.safetensors, config.json, tokenizer.json,
+#   moth.json)
+#   -> release/hf/ : model.safetensors, config.json, tokenizer.json, moth.json, README.md, LICENSE, code/
+# README.md comes from release/README.md, the XS card TEMPLATE: fill its {{placeholders}} before an upload (the build
+# refuses to finish while any are left, unless ALLOW_PLACEHOLDERS=1 for a test build).
 # Dry run (prints the file list and checks it, touches nothing):  DRY_RUN=1 bash release/build.sh [model dir]
 # MOTH_RELEASE_OUT=/some/dir builds there instead (e.g. to test the copy without touching release/hf/).
 # Both modes first check that every moth.* / tiny_agent.* import in the shipped code is shipped too.
@@ -9,18 +13,20 @@ cd "$(dirname "$0")/.."
 DRY=${DRY_RUN:-0}
 MODEL=${1:-}
 if [ "$DRY" != 1 ] && [ -z "$MODEL" ]; then
-  echo "usage: bash release/build.sh <final model dir (model.safetensors + config.json)>" >&2; exit 2
+  echo "usage: bash release/build.sh <XS model dir (model.safetensors + config.json + tokenizer.json + moth.json)>" >&2
+  exit 2
 fi
 OUT=${MOTH_RELEASE_OUT:-release/hf}   # override to try a build elsewhere
 TA_FILES="model generate chat checkpoint tools optim"
-MOTH_FILES="__init__ __main__ persona agent home serve shell cli tail eval probes metrics gen_dialogs build_sft sft add_hermes_pool _tools pet config weights launch hooks doctor autostart forget setup pairwise norepeat"
+MOTH_FILES="__init__ __main__ persona agent cards card serve cli tail eval probes metrics gist gen_dialogs build_sft sft add_hermes_pool pet config weights launch hooks doctor autostart forget setup pairwise norepeat"
 
 # what goes where: "<source>\t<path in the repo>"
 files() {
   if [ -n "$MODEL" ]; then
     printf '%s\t%s\n' "$MODEL/model.safetensors" model.safetensors "$MODEL/config.json" config.json
+    printf '%s\t%s\n' "$MODEL/tokenizer.json" tokenizer.json "$MODEL/moth.json" moth.json
   fi
-  printf '%s\t%s\n' data/tiny-agent-112m/tokenizer.json tokenizer.json LICENSE LICENSE release/README.md README.md
+  printf '%s\t%s\n' LICENSE LICENSE release/README.md README.md
   # third-party notices: the LFM Open License (round-3 teacher) and the source/attribution list
   printf '%s\t%s\n' release/LICENSE-LFM LICENSE-LFM release/NOTICE NOTICE
   # tiny_agent ships from this project's copy (moth-specific changes, e.g. the low-mem CPU loader)
@@ -29,8 +35,10 @@ files() {
   # the model backends (tiny-agent, transformers, openai) and moth.json's parser (moth/docs/MODEL_BACKENDS.md)
   find moth/backends -type f -name '*.py' -not -path '*/__pycache__/*' | LC_ALL=C sort |
     while IFS= read -r f; do printf '%s\t%s\n' "$f" "code/$f"; done
+  # XS inference (tiny-moe backend): model, weight formats, cache, the vendored chat template
+  find moth/xs -type f -name '*.py' -not -path '*/__pycache__/*' | LC_ALL=C sort |
+    while IFS= read -r f; do printf '%s\t%s\n' "$f" "code/$f"; done
   printf '%s\t%s\n' moth/update.py code/moth/update.py moth/VERSION code/moth/VERSION   # python -m moth update / --version
-  printf '%s\t%s\n' moth/file_pool.json code/moth/file_pool.json
   # the chat page and everything next to it (e.g. bundled fonts), so the page needs no network
   find moth/static -type f -not -path '*/__pycache__/*' -not -name '.DS_Store' | LC_ALL=C sort |
     while IFS= read -r f; do printf '%s\t%s\n' "$f" "code/$f"; done
@@ -100,6 +108,13 @@ if [ "$DRY" = 1 ]; then
   echo "  code/requirements.txt                            (generated)"
   [ -n "$MODEL" ] || echo "  (+ model.safetensors and config.json from the model dir)"
   exit 0
+fi
+
+if [ "${ALLOW_PLACEHOLDERS:-0}" != 1 ] && grep -q '{{' release/README.md; then
+  echo "release/README.md still has {{placeholders}}:" >&2
+  grep -o '{{[A-Z0-9_]*}}' release/README.md | sort -u | sed 's/^/  /' >&2
+  echo "fill them (or ALLOW_PLACEHOLDERS=1 for a test build)" >&2
+  exit 1
 fi
 
 rm -rf "$OUT"

@@ -31,20 +31,20 @@ python -m pytest -q -rs tests/test_engine.py        # chat engine, scripted fake
 python -m pytest -q -rs tests/test_update.py        # `python -m moth update` against a fake Hub
 python -m pytest -q -rs tests/test_config.py        # `python -m moth config`, browser opt-in
 python -m pytest -q -rs tests/test_pet.py           # desktop pet: flight, bubbles, poller, launcher, Qt offscreen
-python -m pytest -q -rs tests/test_shell.py         # moth's pure-Python shell
+python -m pytest -q -rs tests/test_xs_engine.py     # XS inference vs tiny_moe (golden fixture; live tiny_moe if present)
 python -m pytest -q -rs tests/test_eval_probes.py   # eval probes, metrics, pairwise (fake moth)
 python -m pytest -q -rs tests/test_rl_env.py        # RL environment (moth.rl) in mock mode
 python -m pytest -q -rs tests/test_cli_tools.py     # moth hooks / doctor / autostart / forget in a temp HOME
 python -m pytest -q -rs moth/integrations/test_integrations.py   # harness adapters + serve's HTTP handler
 ```
 
-Every file also runs on its own without pytest (`python tests/test_shell.py`).
+Every file also runs on its own without pytest (`python tests/test_engine.py`).
 
 Some parts skip where their inputs are missing, and `-rs` says why:
 
-- `test_shell.py`: the replay against the recorded training bash (needs the local `results/r3/b.jsonl`), and the
-  differential test against real bash (needs a working `bwrap`, Linux only; on Ubuntu 24.04 also
-  `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`, as CI does).
+- `test_xs_engine.py`: the live comparison against tiny_moe (needs the tiny-agent repo with `tiny_moe/` and triton:
+  `TINY_MOE_REPO`), and the vendored chat template check (needs the moe-sft worktree: `TINY_MOE_SFT_REPO`). The
+  golden fixture tests always run.
 - `test_pet.py`: the Qt tests without PySide6 (or its native libraries), the signal tests on Windows (no POSIX
   signals), and the hard-kill test on macOS (no parent-death signal or Job Object there: a known gap).
 

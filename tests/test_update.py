@@ -295,7 +295,7 @@ class UpdateTest(unittest.TestCase):
             body = json.loads(r.read())
             if code == 200:
                 self.assertEqual(body, {"ok": True, "pid": os.getpid(), "install_root": str(self.root),
-                                        "version": serve.version()})
+                                        "version": serve.version(), "character": "moth"})
         c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
         c.request("GET", "/api/log")   # everything else still needs the token
         self.assertEqual(c.getresponse().status, 401)
@@ -613,13 +613,16 @@ class PipModeTest(unittest.TestCase):
         os.environ.update(dict.fromkeys(HOME_VARS, str(self.home)), MOTH_CACHE=str(self.tmp / "cache"))
         os.environ.pop("MOTH_REPO", None)
         os.environ.pop("MOTH_REVISION", None)
-        self.cache = Path(W.cache_dir())
         self.saved = sys.modules.get("huggingface_hub")
         sys.modules["huggingface_hub"] = self.hub.module
+        # the XS repo is unreleased (W.UNRELEASED, never contacted): a stand-in id plays the published release here
         self.patches = [unittest.mock.patch.object(W, "mode", return_value="pip"),
+                        unittest.mock.patch.object(W, "REPO_ID", "test-owner/moth-xs"),
+                        unittest.mock.patch.object(U, "REPO_ID", "test-owner/moth-xs"),
                         unittest.mock.patch.object(U, "version", lambda root=None: "0.3.0")]
         for p in self.patches:
             p.start()
+        self.cache = Path(W.cache_dir())
 
     def tearDown(self):
         for p in self.patches:
@@ -647,9 +650,16 @@ class PipModeTest(unittest.TestCase):
                 if p.is_file() and not p.relative_to(self.cache).as_posix().startswith((".moth", ".cache"))}
 
     def test_cache_dir(self):
-        self.assertEqual(self.cache, self.tmp / "cache" / "darioooooo0o" / "moth-112m")
+        self.assertEqual(self.cache, self.tmp / "cache" / "test-owner" / "moth-xs")
         os.environ["MOTH_REPO"] = "someone/other-moth"
         self.assertEqual(Path(W.cache_dir()), self.tmp / "cache" / "someone" / "other-moth")
+
+    def test_unreleased_repo_is_never_contacted(self):
+        with unittest.mock.patch.object(W, "REPO_ID", W.UNRELEASED), self.assertRaises(SystemExit) as cm:
+            W.ensure()
+        self.assertIn("no XS model release", str(cm.exception))
+        self.assertEqual(self.hub.calls if hasattr(self.hub, "calls") else [], [])
+        self.assertFalse(self.cache.exists() and any(self.cache.iterdir()))
 
     def test_first_run_downloads_only_weights(self):
         folder, err = self.ensure()
@@ -676,7 +686,7 @@ class PipModeTest(unittest.TestCase):
         self.hub.offline = True
         with self.assertRaises(SystemExit) as cm:
             self.ensure()
-        self.assertIn("can't get darioooooo0o/moth-112m", str(cm.exception))
+        self.assertIn("can't get test-owner/moth-xs", str(cm.exception))
         sys.modules["huggingface_hub"] = None   # import fails
         with self.assertRaises(SystemExit) as cm:
             self.ensure()
@@ -719,8 +729,7 @@ class PipModeTest(unittest.TestCase):
         d = serve.default_paths()
         self.assertEqual(Path(d["model"]), self.cache)
         self.assertEqual(Path(d["tokenizer"]), self.cache / "tokenizer.json")
-        self.assertEqual(Path(d["home"]), self.home / ".moth" / "home")
-        self.assertTrue(d["pool"].endswith("file_pool.json"))
+        self.assertEqual(set(d), {"model", "tokenizer"})   # pure chat: no home folder, no file pool
         self.assertFalse(self.cache.exists())   # building the parser (moth --help) fetches nothing
 
     def test_check(self):

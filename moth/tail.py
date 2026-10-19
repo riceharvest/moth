@@ -120,11 +120,6 @@ class Tail:
                 self.sent.remove(ev["you"])
                 return None
             return self.one_line("you> ", ev["you"])
-        if "tool" in ev:
-            a = ev.get("args") or {}
-            cmd = {"bash": f"$ {a.get('command', '')}", "read": f"$ cat {a.get('path', '')}",
-                   "write": f"✎ {a.get('path', '')}"}.get(ev["tool"], ev["tool"])
-            return self.one_line("  ", cmd)
         return None
 
     # --- talking to moth ------------------------------------------------------------------------------------

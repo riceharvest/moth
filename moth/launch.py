@@ -6,12 +6,13 @@ python -m moth.pet first asks GET /api/health on its URL (moth.serve answers it 
                              stop it again when the pet quits
   something else answers  -> start nothing; the pet says so
 
-Weights, tokenizer, home and log:
-  Hugging Face download (model.safetensors next to code/): that model, ~/.moth/home, log ~/.moth/serve.log
+Weights, tokenizer and log (moth is pure chat: no home folder):
+  Hugging Face download (model.safetensors next to code/): that model, log ~/.moth/serve.log
   pip install (moth/weights.py): the model files in weights.cache_dir() (~/.cache/moth/<repo>), downloaded on the
-  first run (weights.ensure; the pet says "downloading moth…" meanwhile), ~/.moth/home, log ~/.moth/serve.log
-  this dev checkout: the first complete one of runs/final2/ckpt_100, runs/final/ckpt_100, runs/v2/model (as
-  try_moth.sh), data/tiny-agent-112m/tokenizer.json, live/home, log live/serve.log
+  first run (weights.ensure; the pet says "downloading moth…" meanwhile), log ~/.moth/serve.log
+  this dev checkout: the first complete one of runs/xs/model (XS, its own tokenizer.json), then the old model's
+  runs/final2/ckpt_100, runs/final/ckpt_100, runs/v2/model (with data/tiny-agent-112m/tokenizer.json), log
+  live/serve.log
   --model DIR (pet flag) picks the weights; MOTH_SERVE_LOG moves the log.
 
 The child runs in its own process group (POSIX: its own session) so it can be stopped as a whole, and on Linux it
@@ -46,7 +47,7 @@ from urllib.parse import urlsplit
 from moth import weights
 
 CODE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # moth-112m/code, or this checkout
-DEV_WEIGHTS = ("runs/final2/ckpt_100", "runs/final/ckpt_100", "runs/v2/model")
+DEV_WEIGHTS = ("runs/xs/model", "runs/final2/ckpt_100", "runs/final/ckpt_100", "runs/v2/model")
 MIN_FREE_GB = 3.0        # moth peaks ~3.5 GB while loading; below ~3 GB free the OOM killers start
 LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
 READY_TIMEOUT = 300.0    # s for the model to load (on CPU usually well under a minute)
@@ -79,7 +80,7 @@ def install_mode(code: str = CODE) -> str:
 
 
 def server_paths(model: str | None = None, code: str = CODE, mode: str | None = None) -> dict:
-    """{"model", "tokenizer", "home", "log", "download"} for this install; "download": the folder weights.ensure()
+    """{"model", "tokenizer", "log", "download"} for this install; "download": the folder weights.ensure()
     has to fill before the server can start (pip install, first run), else None. Raises LaunchError without usable
     weights.
     model: a weights folder, or any model spec moth.serve takes (an HF repo id, openai:<url>#<model>, a folder whose
@@ -95,23 +96,25 @@ def server_paths(model: str | None = None, code: str = CODE, mode: str | None = 
     if mode == "pip":   # only the code is installed: never put home or the log under site-packages
         cache = weights.cache_dir()
         d.update(model=cache, tokenizer=os.path.join(cache, "tokenizer.json"),
-                 home=os.path.join(home, ".moth", "home"), log=os.path.join(home, ".moth", "serve.log"))
+                 log=os.path.join(home, ".moth", "serve.log"))
         if model and os.path.isfile(os.path.join(model, "tokenizer.json")):
             d["tokenizer"] = os.path.join(os.path.abspath(os.path.expanduser(model)), "tokenizer.json")
         elif not weights.present(cache) and not (model and os.path.isfile(d["tokenizer"])):
             d["download"] = cache   # (with --model too when the tokenizer only comes with the download)
     elif repo:
         d.update(model=repo, tokenizer=os.path.join(repo, "tokenizer.json"),
-                 home=os.path.join(home, ".moth", "home"), log=os.path.join(home, ".moth", "serve.log"))
+                 log=os.path.join(home, ".moth", "serve.log"))
         if not model and not complete(repo):   # an interrupted `hf download`: never fetch a second copy elsewhere
             raise LaunchError(weights.incomplete_message(repo))
     else:
         d.update(model=None, tokenizer=os.path.join(code, "data", "tiny-agent-112m", "tokenizer.json"),
-                 home=os.path.join(code, "live", "home"), log=os.path.join(code, "live", "serve.log"))
+                 log=os.path.join(code, "live", "serve.log"))
         if not model:
             d["model"] = next((os.path.join(code, c) for c in DEV_WEIGHTS if complete(os.path.join(code, c))), None)
             if not d["model"]:
                 raise LaunchError("no complete weights in " + ", ".join(c.rsplit("/", 1)[0] for c in DEV_WEIGHTS))
+            if os.path.isfile(os.path.join(d["model"], "tokenizer.json")):   # XS: the folder brings its tokenizer
+                d["tokenizer"] = os.path.join(d["model"], "tokenizer.json")
     if other:   # serve resolves it (and brings its own tokenizer)
         d.update(model=model.strip(), tokenizer=None, download=None)
     elif model:
@@ -119,8 +122,9 @@ def server_paths(model: str | None = None, code: str = CODE, mode: str | None = 
         if not complete(model):
             raise LaunchError(f"{model} has no complete config.json + model.safetensors")
         d["model"] = model
-        if os.path.isfile(os.path.join(model, "moth.json")) and os.path.isfile(os.path.join(model, "tokenizer.json")):
-            d["tokenizer"] = os.path.join(model, "tokenizer.json")   # a moth with its own manifest + tokenizer
+        own = os.path.join(model, "tokenizer.json")
+        if os.path.isfile(own) and (os.path.isfile(os.path.join(model, "moth.json")) or _xs(model)):
+            d["tokenizer"] = own   # a moth with its own manifest + tokenizer, or an XS folder
     d["log"] = os.environ.get("MOTH_SERVE_LOG") or d["log"]
     return d
 
@@ -133,13 +137,19 @@ def _configured_model() -> str | None:
         return None
 
 
+def _xs(folder: str) -> bool:
+    from moth.xs.weights import is_xs_folder   # stdlib only
+    return is_xs_folder(folder)
+
+
 def _tiny_folder(model: str) -> bool:
-    """model is a folder of tiny-agent weights (moth-112m's kind: launch checks them); False for every other spec."""
+    """model is a folder of moth's own weights (XS or the old moth-112m: launch checks them); False for every other
+    spec."""
     from moth import backends   # stdlib only
     kind = None
     try:
         kind, _ = backends.parse_spec(model)
-        return kind == "folder" and backends.resolve(model, network=False).backend == "tiny-agent"
+        return kind == "folder" and backends.resolve(model, network=False).backend in ("tiny-agent", "tiny-moe")
     except backends.ManifestError:
         return kind == "folder"   # a broken moth.json: let the weights check / serve say what's wrong
 
@@ -151,7 +161,7 @@ def server_command(port: int, paths: dict, extra=(), token_file: str | None = No
     base = shlex.split(os.environ.get("MOTH_SERVE_CMD", "")) or [sys.executable, "-m", "moth.serve"]
     cmd = base + ["--device", "cpu", "--model", paths["model"]] \
         + (["--tokenizer", paths["tokenizer"]] if paths.get("tokenizer") else []) \
-        + ["--home", paths["home"], "--port", str(port)]
+        + ["--port", str(port)]
     if token_file:
         cmd += ["--token-file", token_file]
     if exit_with_parent:
@@ -461,7 +471,7 @@ class Boot:
     nothing started), "wait" (just poll: --no-server, or a URL on another machine)."""
 
     def fetch(self) -> str | None:
-        """weights.ensure() (no time limit: ~860 MB): None when done, else why not. Any thread."""
+        """weights.ensure() (no time limit: ~1.2 GB): None when done, else why not. Any thread."""
         try:
             weights.ensure(self.download)
             return None

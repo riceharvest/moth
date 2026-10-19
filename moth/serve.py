@@ -1,11 +1,10 @@
 """Chat with moth in the browser:  python -m moth.serve   ->  http://127.0.0.1:4747   (or just: python -m moth)
 
-One conversation at a time. moth's home (~/.moth/home in the release layout, live/home/ here) survives restarts,
-so what it writes stays. Its bash tool is moth/shell.py: a tiny pure-Python shell that knows only the commands
-moth was trained on (ls, cat, head, wc, echo), stays inside the home and answers exactly like the bash it trained with.
-No subprocess, no sandbox needed, so it runs the same on Linux, macOS and Windows.
-The KV cache is kept across turns; when it fills up, the oldest turns are dropped and the rest is re-read.
-Runs on CPU by default (112M params: fast enough).
+One conversation at a time, pure chat: no tools, no files, no shell. Who moth is comes only from the identity card in
+its system prompt (--card, else `moth card`, else the moth card; moth/cards.py), and POST /api/card swaps it live.
+The model is XS (the tiny-moe backend, moth/xs: int8 experts on the CPU by default) unless a moth.json / --model / --legacy
+picks another backend (moth/backends). The KV cache is kept across turns; when it fills up, the oldest turns are
+dropped and the rest is re-read. Runs on the CPU by default.
 
 Local server hardening: only Host 127.0.0.1/localhost:<port> (DNS rebinding), only local pages over CORS, and a
 per-install token (~/.moth/token, made on first run) for everything that reads or drives the chat. The page moth
@@ -23,10 +22,8 @@ import argparse
 import hmac
 import json
 import os
-import random
 import re
 import secrets
-import shutil
 import socketserver
 import sys
 import threading
@@ -40,26 +37,23 @@ import torch
 TA = os.environ.get("TA_REPO") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, TA)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from tiny_agent.chat import parse_assistant, render  # noqa: E402
-from tiny_agent.generate import KVCache, append  # noqa: E402
-from tiny_agent.tools import BASH_TIMEOUT_S, Workspace, truncate  # noqa: E402
 from moth.agent import AGENT_TAG, agent_turn, clean_agent_message  # noqa: E402
-from moth.home import load_pool, sample_home  # noqa: E402
 from moth.norepeat import PhraseMemory, vocab_classes  # noqa: E402
-from moth.cards import load_card, student_system_v1  # noqa: E402
-from moth.shell import MARKER, Shell, _windows_unsafe  # noqa: E402
+from moth import cards  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MAX_LEN = 4096        # KV cache size (hard limit)
 CTX_BUDGET = 3000     # trained on chats + stitched sessions up to 4k tokens (quality flat to ~4k, tests/ctx_probe.py)
 CTX_KEEP = 1800       # when over budget, keep the system prompt + the newest turns that fit in this
 REPLY_ROOM = 200      # tokens kept free for moth's next reply
-CALL_ROOM = 60        # ... and for each later tool call in the same turn
 COMMON = ("i i'm im the a an and or to of it it's its is in on at my me you your we be was are not no yes "
           "just so that this but like with for do don't can can't oh . , ! ? ' \" - : ... s t m")
 FALLBACK = "oh. my head went all fuzzy for a second. what were we saying?"
+# literal special-token strings neutralised in outside text: both chat templates' (XS: <|user|> ... <|end|>; the old
+# model's chatml) + whatever the tokenizer adds
 SPECIALS = ("<|im_start|>", "<|im_end|>", "<tool_call>", "</tool_call>", "<think>", "</think>",
-            "<tool_response>", "</tool_response>", "<|endoftext|>", "<|pad|>")   # + whatever the tokenizer adds
+            "<tool_response>", "</tool_response>", "<|endoftext|>", "<|pad|>", "<|system|>", "<|user|>",
+            "<|assistant|>", "<|agent|>", "<|end|>")
 
 # Pages allowed to read moth over CORS. Full log, chat, agent, reset: local dev pages only (http(s)://localhost or
 # 127.0.0.1, any port). /api/says (moth's own lines, nothing else) also: packaged desktop shells (Hermes Desktop
@@ -119,24 +113,21 @@ def interest(text: str) -> int:
     return 1 if len(words) > LONG_AGENT_WORDS else 0
 
 
-def default_paths() -> dict:
-    """Weights next to code/ (the Hugging Face repo layout) or this project's runs/ and data/."""
+def default_paths(legacy: bool = False) -> dict:
+    """{"model", "tokenizer"}: weights next to code/ (the Hugging Face repo layout), the pip cache, or this project's
+    runs/ (dev). The model folder holds its own tokenizer.json. legacy: the old dense model (moth-112m / final2) for
+    A/B runs (--legacy)."""
     root = os.path.dirname(HERE)
     repo = os.path.dirname(root)
     from moth import weights   # stdlib only
-    if weights.mode() == "hf":   # also a download still missing its weights: main() says how to finish it
-        return {"model": repo, "tokenizer": os.path.join(repo, "tokenizer.json"),
-                "home": os.path.join(os.path.expanduser("~"), ".moth", "home"),
-                "pool": os.path.join(HERE, "file_pool.json")}
-    if weights.mode() == "pip":   # pip install: weights in ~/.cache/moth/<repo>/, fetched in main() (not on --help)
-        cache = weights.cache_dir()
-        return {"model": cache, "tokenizer": os.path.join(cache, "tokenizer.json"),
-                "home": os.path.join(os.path.expanduser("~"), ".moth", "home"),
-                "pool": os.path.join(HERE, "file_pool.json")}
-    return {"model": os.path.join(root, "runs/sft1/model"),
-            "tokenizer": os.path.join(root, "data/tiny-agent-112m/tokenizer.json"),
-            "home": os.path.join(root, "live/home"),
-            "pool": os.path.join(HERE, "file_pool.json")}
+    if weights.mode() == "hf" and not legacy:   # also a download still missing its weights: main() says how to finish
+        return {"model": repo, "tokenizer": os.path.join(repo, "tokenizer.json")}
+    if weights.mode() == "pip" or (legacy and weights.mode() == "hf"):   # fetched in main() (not on --help)
+        cache = weights.cache_dir(weights.LEGACY_REPO_ID if legacy else None)
+        return {"model": cache, "tokenizer": os.path.join(cache, "tokenizer.json")}
+    if legacy:
+        return {"model": weights.DEV_LEGACY_MODEL, "tokenizer": weights.DEV_TOKENIZER}
+    return {"model": weights.DEV_MODEL, "tokenizer": os.path.join(weights.DEV_MODEL, "tokenizer.json")}
 
 
 INSTALL_ROOT = os.path.dirname(os.path.dirname(HERE))   # the download folder (moth-112m/), for moth update
@@ -204,60 +195,6 @@ def _opt(a, name: str, default):
     return default if v is None else v
 
 
-def _is_marker_path(path: str) -> bool:
-    """Some part of path is moth's home marker as a case-insensitive file system or Windows would see it."""
-    return any(p.lower().rstrip(". ") == MARKER for p in path.replace("\\", "/").split("/"))
-
-
-class Home(Workspace):
-    """A Workspace rooted at a fixed, persistent directory. bash goes to moth.shell, read/write as in training."""
-
-    def __init__(self, root: str, seed: int, pool_file: str | None, card: dict | None = None):
-        self.files, self.read_paths, self.submitted = {}, set(), None
-        self.root = os.path.realpath(root)
-        if not os.path.isdir(self.root):
-            os.makedirs(self.root)
-            # "new home" only ever deletes folders with this
-            with open(os.path.join(self.root, MARKER), "w", encoding="utf-8", newline="\n") as f:
-                f.write("moth made this folder. its \"new home\" button may delete it.\n")
-            for rel, content in sample_home(random.Random(seed), load_pool(pool_file), card).items():
-                p = os.path.join(self.root, rel)
-                os.makedirs(os.path.dirname(p), exist_ok=True)
-                with open(p, "w", encoding="utf-8", newline="\n") as f:
-                    f.write(content)
-        self.shell = Shell(self.root)
-
-    @property
-    def owned(self) -> bool:
-        """moth created this folder itself (so it may delete it)."""
-        return os.path.isfile(os.path.join(self.root, MARKER)) and not os.path.islink(os.path.join(self.root, MARKER))
-
-    def close(self):
-        pass
-
-    def _resolve(self, path: str) -> str | None:
-        """As Workspace's, but moth's marker is off limits: a write must never make a folder look like moth's. On
-        case-insensitive file systems ".MOTH-HOME" is the marker, and on Windows ".moth-home." / ".moth-home " too,
-        so any path part that folds to it is refused, on every OS (and Windows-only path tricks, as in moth.shell)."""
-        if isinstance(path, str) and (_is_marker_path(path) or (os.name == "nt" and _windows_unsafe(path))):
-            return None
-        full = super()._resolve(path)
-        if full is None or _is_marker_path(os.path.relpath(full, self.root).replace(os.sep, "/")):
-            return None
-        return full
-
-    def tool_bash(self, command: str, timeout: int = BASH_TIMEOUT_S) -> str:
-        return self.shell.run(str(command))
-
-    def tree(self) -> list[dict]:
-        out = []
-        for d in sorted(os.listdir(self.root)):
-            full = os.path.join(self.root, d)
-            if os.path.isdir(full):
-                out.append({"dir": d, "files": sorted(f for f in os.listdir(full) if not f.startswith("."))})
-        return out
-
-
 class Log:
     """Everything shown in the chat window, polled by displays: the last `size` events, with absolute indexes.
     The epoch changes on every restart and reset, so a display knows to start over instead of guessing."""
@@ -295,18 +232,22 @@ class Log:
         return self.start + len(self.events)
 
 
+STATEFUL = ("tiny-moe", "tiny-agent")   # backends whose KV cache Moth keeps across turns (the rest: GenericMoth)
+
+
 class Moth:
-    """moth's engine on the tiny-agent backend (moth/backends/tiny_agent.py loads the model): the KV cache is kept
-    across turns and only new text is fed (_feed / _prefill_all / _turn). Other backends: moth.backends.engine's
-    GenericMoth, the same engine re-rendering the chat each turn (make_engine picks)."""
-    backend = None    # the moth.backends object (None: tests and benchmarks that set tok/model themselves)
-    manifest = None   # its moth.json (moth/backends/manifest.py); None: moth-112m's defaults
+    """moth's engine on a stateful backend: tiny-moe (XS, the default; moth/backends/tiny_moe.py) or tiny-agent (the
+    old dense model, --legacy; moth/backends/tiny_agent.py). The KV cache is kept across turns and only new text is fed
+    (_feed / _prefill_all / _turn); the backend owns the chat template, the stop token and the cache. Other backends:
+    moth.backends.engine's GenericMoth, the same engine re-rendering the chat each turn (make_engine picks)."""
+    backend = None    # the moth.backends object (tests set a fake one)
+    manifest = None   # its moth.json (moth/backends/manifest.py); None: the backend's defaults
 
     def __init__(self, a, manifest=None):
         from moth.backends import load_backend, resolve
         from moth.backends.manifest import apply_args
         m = manifest or getattr(a, "manifest", None) or resolve(a.model, network=False)
-        if m.backend != "tiny-agent":
+        if m.backend not in STATEFUL:
             raise SystemExit(f"moth: {m.backend} models run on moth.serve.make_engine(a), not Moth(a)")
         if not m.is_default:
             self.manifest = m
@@ -316,27 +257,22 @@ class Moth:
         self.setup(a)
         if a.device != "cpu":   # capture the GPU graphs (decode + short-chunk feeds) now, not on the first turns
             self.cache = self._kv
-            self._decoder().warmup(a.max_turn_tokens, self.im_end, a.temperature, a.top_p,
+            self._decoder().warmup(a.max_turn_tokens, self.stop, a.temperature, a.top_p,
                                    getattr(a, "rep_penalty", 1.0))
             self.cache = None
 
     def setup(self, a):
-        """Everything but the weights (tests build a Moth with a fake model and call this)."""
+        """Everything but the weights (tests build a Moth with a fake backend and call this)."""
         self.a = a
-        # who it is comes only from the system prompt: --card (default: the moth card = the old fixed prompt).
-        # The released weights are the round-3 tools model: the legacy tools/home prompt (cards.student_system_v1)
-        # until a pure-chat model ships with its own serve path. A manifest's own system prompt still wins.
-        self.identity = load_card(getattr(a, "card", None))
         man = self.manifest
-        default = student_system_v1(self.identity)
-        self.system = man.system_prompt(default) if man else default
         self.character = man.character if man else "moth"
         self.card_pre, self.card_post = man.card_parts() if man else (AGENT_TAG + "\n", "")
         self.lowercase = man.lowercase if man else True
-        self.im_end = self.tok.token_to_id("<|im_end|>")
-        self.ban = [self.tok.token_to_id(t) for t in ("<tool_call>", "<think>")]   # for turns where moth must talk
+        b = self.backend
+        self.stop = b.stop_id
+        self.ban = list(b.talk_ban)   # ids a reply never samples (tool / think / turn-opening specials)
         self.lock = threading.RLock()
-        self.home = Home(a.home, a.seed, a.pool_file, self.identity)
+        self.set_identity(getattr(a, "identity", None) or getattr(a, "card", None), reset=False)
         self.log = Log()
         self.budget = getattr(a, "ctx_budget", None) or CTX_BUDGET
         self.keep = self.budget * CTX_KEEP // CTX_BUDGET
@@ -352,7 +288,7 @@ class Moth:
             added = [t.content for t in self.tok.get_added_tokens_decoder().values()]
         except AttributeError:   # older tokenizers
             added = []
-        specials = sorted(set(SPECIALS) | set(added), key=len, reverse=True)
+        specials = sorted(set(SPECIALS) | set(added) | set(getattr(b, "specials", lambda: ())()), key=len, reverse=True)
         self.specials = re.compile("|".join(re.escape(s) for s in specials))
         self.react_every = _opt(a, "react_every", REACT_EVERY)
         self.quiet_after = _opt(a, "quiet_after", QUIET_AFTER_CHAT)
@@ -365,19 +301,49 @@ class Moth:
         self.wake = threading.Condition(threading.RLock())
         self.reset()
 
+    # --- who moth is ----------------------------------------------------------------------------------------
+    def set_identity(self, spec, reset: bool = True) -> dict:
+        """The identity card (moth.cards.load_card: None / "moth", "blank", a one-liner "text:...", a JSON card file
+        or a card dict) -> self.identity and the system prompt. The system prompt sits at position 0 of the KV cache,
+        so a new card starts a new chat (reset=True: what POST /api/card does)."""
+        card = cards.load_card(spec)
+        man, b = self.manifest, self.backend
+        if man is not None and man.system:              # a moth.json's own system prompt wins over any card
+            system = man.system
+        elif getattr(b, "stateful", False):             # XS: the card + one line of chat framing (what it trained on)
+            system = b.system_prompt(card)
+        else:                                           # a general model: the generic sheet around the card
+            from moth.backends.manifest import generic_system
+            system = generic_system(card, man.character if man else "moth")
+        with self.lock:
+            self.identity, self.system = card, system
+            if card.get("id") == "moth":   # the default card: the manifest's character name, if any
+                self.character = man.character if man else "moth"
+            else:
+                self.character = card.get("name") or "buddy"
+            if reset:
+                self.forget()
+        return card
+
+    def identity_view(self) -> dict:
+        """What the chat page and the pet show about the card: a display name and the identity lines (no tail)."""
+        lines = cards._ident(self.identity)
+        return {"name": self.identity.get("name") or self.character, "text": " ".join(lines),
+                "id": self.identity.get("id")}
+
     def enc(self, text: str) -> list[int]:
         return self.tok.encode(text, add_special_tokens=False).ids
 
     def defuse(self, text: str) -> str:
-        """Literal special-token strings in outside text ("<|im_end|>" in a file or a message) would be read as the
-        real tokens and could end a turn or fake a tool call: "<|im_end|>" -> "< |im_end|>"."""
+        """Literal special-token strings in outside text ("<|end|>" in a message) would be read as the real tokens
+        and could end a turn or fake one: "<|end|>" -> "< |end|>"."""
         return self.specials.sub(lambda m: "< " + m.group(0)[1:], text)
 
     def reset(self):
         self.messages = [{"role": "system", "content": self.system}]
         self.cache = None
         self.said = deque(maxlen=3)    # token ids of moth's last replies (repetition penalty)
-        self.protect: set[int] = set()  # ids from this turn's user message and tool results: free to copy
+        self.protect: set[int] = set()  # ids from this turn's user message: free to copy
 
     def forget(self, everything: bool = False):
         """New chat (the page's button / POST /api/reset): history, log (new epoch), any pending reaction or open
@@ -402,10 +368,13 @@ class Moth:
                 self.sessions.clear()
 
     # --- the model ------------------------------------------------------------------------------------------
+    def _render(self, messages, add_generation_prompt=False) -> str:
+        return self.backend.render(messages, add_generation_prompt)
+
     def _prefill_all(self):
         """(Re)build the cache from self.messages, dropping the oldest turns if they don't fit."""
         while True:
-            ids = self.enc(render(self.messages, add_generation_prompt=True))
+            ids = self.enc(self._render(self.messages, add_generation_prompt=True))
             if len(ids) < self.keep or len(self.messages) <= 2:
                 break
             # drop the oldest user turn and everything up to the next user turn
@@ -415,89 +384,48 @@ class Moth:
             self.messages = self.messages[:1] + self.messages[i:]
         self.cache = self._new_cache()
         logits = self._feed(ids)
-        if logits is None:   # the current turn alone is over budget (tool results are cut to prevent this)
+        if logits is None:   # the current turn alone is over budget (messages are capped at 500 / 20000 chars)
             raise RuntimeError(f"turn too long for moth's context ({len(ids)} tokens)")
         return logits
 
     def _new_cache(self):
-        kv = getattr(self, "_kv", None)
-        if kv is None:        # tests build a Moth without weights
-            return KVCache(self.model, 1, MAX_LEN, self.a.device, dtype=next(self.model.parameters()).dtype)
-        kv.reset([0])         # same as a fresh cache: everything past the length is masked
-        return kv
+        return self.backend.new_cache()   # the session's one cache, reset: everything past the length is masked
 
     def _feed(self, ids):
-        """Append ids to the cache in one pass (tiny_agent.generate.append: the whole prompt in one forward)."""
+        """Append ids to the cache in one pass (the whole prompt in one forward)."""
         if int(self.cache.lens_cpu[0]) + len(ids) + REPLY_ROOM > self.budget:
             return None   # over budget: the caller re-reads a trimmed conversation
-        x = torch.tensor([ids], device=self.a.device)
-        return append(self.model, self.cache, x, [len(ids)])
+        return self.backend.feed(self.cache, ids)
 
     def _pen_ids(self) -> set[int]:
         """Token ids of moth's last replies that the repetition penalty hits this turn (not common words, not ids from
-        this turn's user message or tool results): fixed for a whole turn."""
+        this turn's user message): fixed for a whole turn."""
         if getattr(self.a, "rep_penalty", 1.0) == 1.0 or not (self.said or self._carry):
             return set()
         return ({i for r in self.said for i in r} | self._carry) - self.common - self.protect
 
-    def _sample(self, logits, talk_only=False):
-        """One token from logits (1, V): ban (talk_only), repetition penalty, temperature, top-p. On the logits'
-        device, vectorised (masks, no per-id indexing); the same values and draws as the old per-token code."""
-        from tiny_agent.generate import sample_top_p
-        V = logits.size(-1)
-        pm = torch.zeros(V, dtype=torch.bool)
-        ids = self._pen_ids()
-        if ids:
-            pm[list(ids)] = True
-        bm = torch.zeros(V, dtype=torch.bool)
-        if talk_only:
-            bm[self.ban] = True
-        return int(sample_top_p(logits, self.a.temperature, self.a.top_p, getattr(self.a, "rep_penalty", 1.0),
-                                pm.to(logits.device) if ids else None, bm.to(logits.device) if talk_only else None))
-
     def _decoder(self):
-        from tiny_agent.generate import Decoder
         dec = getattr(self, "_dec", None)
         if dec is None or dec.cache is not self.cache:
             graph = False if getattr(self.a, "no_graph", False) else None   # None: device graphs on CUDA/XPU
-            dec = self._dec = Decoder(self.model, self.cache, graph=graph, compile=getattr(self.a, "compile", False))
+            dec = self._dec = self.backend.decoder(self.cache, graph=graph, compile=getattr(self.a, "compile", False))
         return dec
 
-    def _turn(self, logits, talk_only=False) -> str:
-        """Sample moth's turn until <|im_end|> (appended to the cache too) or max_turn_tokens (then <|im_end|> is
-        appended). CPU: an eager per-token loop, token-for-token the same as the old one for a given seed; CUDA/XPU:
-        one captured graph per token, sampling on the device, tokens read back every few steps (generate.Decoder)."""
+    def _turn(self, logits) -> str:
+        """Sample moth's turn until the stop token (appended to the cache too) or max_turn_tokens (then the stop is
+        appended). Never a tool call or a new turn: those tokens are banned (self.ban)."""
         out = self._decoder().generate(
-            logits, self.a.max_turn_tokens, self.im_end, temperature=self.a.temperature, top_p=self.a.top_p,
-            pen=getattr(self.a, "rep_penalty", 1.0), pen_ids=self._pen_ids(), ban_ids=self.ban if talk_only else (),
+            logits, self.a.max_turn_tokens, self.stop, temperature=self.a.temperature, top_p=self.a.top_p,
+            pen=getattr(self.a, "rep_penalty", 1.0), pen_ids=self._pen_ids(), ban_ids=self.ban,
             logits_hook=self._hook)
         return self.tok.decode(out, skip_special_tokens=False)
-
-    def _cut(self, text: str, max_tokens: int) -> str:
-        """Shorten one tool result to max_tokens, with the truncation marker moth saw in training."""
-        ids = self.enc(text)
-        if len(ids) <= max_tokens:
-            return text
-        keep = int(len(text) * max_tokens / len(ids)) - 80   # room for the marker line
-        text = truncate(text, keep) if keep >= 30 else "[... truncated, too long ...]"
-        ids = self.enc(text)
-        return text if len(ids) <= max_tokens else self.tok.decode(ids[:max(1, max_tokens)])
-
-    def _fit_results(self, results: list[str], turn_msg: dict, rounds_left: int) -> list[str]:
-        """Cut tool results so the current turn fits the context budget even after every older turn is dropped:
-        a turn that can't be trimmed must never overflow (that used to leave the cache empty and crash).
-        Each round's results get at most half of what is left, after room for the later rounds' calls."""
-        start = next((i for i, m in enumerate(self.messages) if m is turn_msg), 1)
-        fixed = len(self.enc(render(self.messages[:1] + self.messages[start:], add_generation_prompt=True)))
-        room = self.budget - REPLY_ROOM - fixed - 16 * len(results) - 8 - CALL_ROOM * rounds_left
-        per = max(8, room // (2 * max(1, len(results))) if rounds_left else room // max(1, len(results)))
-        return [self._cut(r, per) for r in results]
 
     # --- one turn -------------------------------------------------------------------------------------------
     @torch.no_grad()
     def chat(self, user: str, talk_only: bool = False) -> list[dict]:
-        """Returns the events of moth's turn: {"tool": name, "args":…, "result":…} and {"say": text}.
-        talk_only: no tools in any round (reactions to the coding agent). Any failure rolls the turn back."""
+        """moth's reply to one message, as events [{"say": text}]. talk_only marks a reaction to the coding agent
+        (the phrase ban always applies to those; moth never has tools, so every turn just talks). Any failure rolls
+        the turn back."""
         with self.lock:
             snap = (list(self.messages), list(self.said), set(self.protect))
             try:
@@ -519,49 +447,16 @@ class Moth:
         self._carry = self.phrases.recent() if talk_only else set()   # reactions: the soft penalty spans "new chat"
         logits = None
         if self.cache is not None:
-            logits = self._feed(self.enc("\n" + render([msg], add_generation_prompt=True)))
+            logits = self._feed(self.enc(self.backend.next_turn([msg])))
         self.messages.append(msg)
         if logits is None:
             logits = self._prefill_all()
-        events, seen_calls = [], set()
-        for rnd in range(self.a.max_tool_rounds + 1):
-            last = talk_only or rnd == self.a.max_tool_rounds      # this turn must talk
-            m = parse_assistant(self._turn(logits, talk_only=last))
-            if last:
-                m["tool_calls"] = []   # banned tokens can still be spelled out in plain text
-            keys = {json.dumps(c, sort_keys=True) for c in m["tool_calls"]}
-            cut = "<tool_call>" in (m["content"] or "")   # a call cut off by the token limit
-            if (m["tool_calls"] and keys <= seen_calls) or cut:
-                # the same call again (a loop) or a broken call: rewind this turn and make it talk instead
-                self.cache = None
-                logits = self._prefill_all()
-                m = parse_assistant(self._turn(logits, talk_only=True))
-                m["tool_calls"], keys = [], set()
-            m["content"] = m["content"] or ""
-            if self.lowercase:   # moth only speaks lowercase (the odd "I" slips through)
-                m["content"] = m["content"].lower()
-            self.messages.append(m)
-            if not m["tool_calls"]:
-                events.append({"say": m["content"] or "..."})
-                self.said.append(self.enc(" " + (m["content"] or "")))
-                break
-            if m["content"]:
-                events.append({"say": m["content"]})
-            seen_calls |= keys
-            results = []
-            for c in m["tool_calls"]:
-                r = c["error"] if "error" in c else self.home.call(c["name"], c["arguments"])
-                results.append(r)
-                events.append({"tool": c.get("name", "?"), "args": c.get("arguments", {}), "result": r})
-            results = self._fit_results([self.defuse(r) for r in results], msg, self.a.max_tool_rounds - rnd - 1)
-            for r in results:
-                self.protect |= set(self.enc(" " + r))
-            tool_msg = {"role": "tool", "results": results}
-            self.messages.append(tool_msg)
-            logits = self._feed(self.enc("\n" + render([tool_msg], add_generation_prompt=True)))
-            if logits is None:
-                logits = self._prefill_all()
-        return events
+        text = self.backend.reply(self._turn(logits)).strip()
+        if self.lowercase:   # moth only speaks lowercase (the odd "I" slips through; a no-op for zh / hi)
+            text = text.lower()
+        self.messages.append({"role": "assistant", "content": text})
+        self.said.append(self.enc(" " + text))
+        return [{"say": text or "..."}]
 
     # --- the human ------------------------------------------------------------------------------------------
     def say_to(self, text: str) -> list[dict]:
@@ -852,20 +747,21 @@ def make_handler(moth: Moth, token: str, hosts: tuple[str, ...] = ("127.0.0.1", 
             url = urlsplit(self.path)
             q = parse_qs(url.query)
             if url.path == "/api/health":   # no token (Host still checked): which install runs here, for moth update
-                health = {"ok": True, "pid": os.getpid(), "install_root": INSTALL_ROOT, "version": version()}
-                if getattr(moth, "manifest", None) is not None:   # another model (moth.json): who the pet shows
-                    health.update(character=moth.character, backend=moth.manifest.backend)
+                health = {"ok": True, "pid": os.getpid(), "install_root": INSTALL_ROOT, "version": version(),
+                          "character": getattr(moth, "character", "moth")}   # the card's name (never its text)
+                if getattr(moth, "manifest", None) is not None:
+                    health["backend"] = moth.manifest.backend
                 return self._send(200, json.dumps(health).encode(), "application/json", cors=False)
             if url.path == "/":
                 with open(page, encoding="utf-8") as f:
                     html = f.read().replace("__MOTH_TOKEN__", token)
                 return self._send(200, html.encode(), "text/html; charset=utf-8", cors=False)   # holds the token
-            if url.path not in ("/api/says", "/api/log", "/api/home"):
+            if url.path not in ("/api/says", "/api/log", "/api/card"):
                 return self._json({"error": "not found"}, 404)
             if url.path != "/api/says" and not self._authed():
                 return self._json({"error": "missing or wrong token (see ~/.moth/token)"}, 401)
-            if url.path == "/api/home":
-                return self._json({"tree": moth.home.tree()})
+            if url.path == "/api/card":
+                return self._json({"card": moth.identity_view()})
             since = (q.get("since") or ["0"])[0]
             if not re.fullmatch(r"\d{1,18}", since):
                 return self._json({"error": "since must be a number"}, 400)
@@ -884,7 +780,7 @@ def make_handler(moth: Moth, token: str, hosts: tuple[str, ...] = ("127.0.0.1", 
                 d["events"] = [{"say": e["say"]} for e in d["events"] if "say" in e
                                and all((e.get("re") or {}).get(k) == v for k, v in want.items())]
             if url.path == "/api/log":
-                d["tree"] = moth.home.tree()
+                d["card"] = moth.identity_view()
                 d["agents"] = moth.agents()   # session labels are folder names: never in the token-free /api/says
             self._json(d)
 
@@ -912,7 +808,7 @@ def make_handler(moth: Moth, token: str, hosts: tuple[str, ...] = ("127.0.0.1", 
             if origin is not None and not LOCAL_ORIGIN.fullmatch(origin):
                 return self._json({"error": "foreign origin"}, 403)
             path = urlsplit(self.path).path
-            if path not in ("/api/chat", "/api/agent", "/api/reset"):
+            if path not in ("/api/chat", "/api/agent", "/api/reset", "/api/card"):
                 return self._json({"error": "not found"}, 404)
             if not self._authed():
                 return self._json({"error": "missing or wrong token (see ~/.moth/token)"}, 401)
@@ -924,7 +820,7 @@ def make_handler(moth: Moth, token: str, hosts: tuple[str, ...] = ("127.0.0.1", 
                 text = text.strip()[:500] if isinstance(text, str) else ""
                 if not text:
                     return self._json({"error": "empty"}, 400)
-                self._json({"events": moth.say_to(text), "tree": moth.home.tree()})
+                self._json({"events": moth.say_to(text)})
             elif path == "/api/agent":   # from moth/integrations/* : one-way, never replies to the agent
                 text = body.get("text")
                 text = text.strip()[:20000] if isinstance(text, str) else ""
@@ -935,20 +831,27 @@ def make_handler(moth: Moth, token: str, hosts: tuple[str, ...] = ("127.0.0.1", 
                 status = moth.hear_agent(text, source, session=clean_session(body.get("session")),
                                          label=clean_label(body.get("label")))
                 self._json({"ok": True, "status": status})
+            elif path == "/api/card":   # moth card set: a new identity, live (a new chat: the system prompt changed)
+                spec = body.get("card")
+                if isinstance(spec, str):
+                    spec = spec.strip()[:1000]
+                    spec = spec if spec in ("moth", "blank", "") else "text:" + spec
+                elif not isinstance(spec, dict):
+                    return self._json({"error": "card: a one-line identity, \"moth\", or a card object"}, 400)
+                try:
+                    card = cards.load_card(spec or None)
+                    cards.validate(card)
+                except (ValueError, SystemExit) as e:
+                    return self._json({"error": f"bad card: {e}"}, 400)
+                moth.set_identity(card)
+                self._json({"ok": True, "card": moth.identity_view(), "epoch": moth.log.epoch})
             else:   # /api/reset
                 with moth.lock:
-                    if body.get("new_home") is True and not moth.home.owned:
-                        return self._json({"error": f"moth didn't make {moth.home.root} itself, so it won't delete "
-                                                    f"it. move it away by hand for a fresh home.",
-                                           "tree": moth.home.tree()}, 409)
                     if body.get("everything") is True:   # moth forget: also the phrase memory
                         moth.forget(everything=True)
                     else:
                         moth.forget()
-                    if body.get("new_home") is True:
-                        shutil.rmtree(moth.home.root, ignore_errors=True)
-                        moth.home = Home(moth.a.home, random.randrange(10**6), moth.a.pool_file, moth.identity)
-                self._json({"ok": True, "tree": moth.home.tree(), "epoch": moth.log.epoch})
+                self._json({"ok": True, "epoch": moth.log.epoch})
 
     return H
 
@@ -971,26 +874,29 @@ def default_threads() -> int:
     return max(1, min(8, os.cpu_count() or 1))
 
 
-def build_parser(manifest=None) -> argparse.ArgumentParser:
+def build_parser(manifest=None, legacy: bool = False) -> argparse.ArgumentParser:
     """manifest (a moth.json, moth/backends/manifest.py): its sampling defaults and tokenizer become the defaults;
-    flags given on the command line still win. None: moth-112m's defaults."""
-    d = default_paths()
+    flags given on the command line still win. None: the default model's defaults."""
+    d = default_paths(legacy)
     s = manifest.sampling if manifest is not None else {}
     tok = d["tokenizer"]
-    if manifest is not None and manifest.backend == "tiny-agent" and manifest.folder:
+    if manifest is not None and manifest.backend in STATEFUL and manifest.folder:
         own = os.path.join(manifest.folder, manifest.tokenizer or "tokenizer.json")
-        tok = own if (manifest.tokenizer or manifest.repo or os.path.isfile(own)) else tok   # repo: comes with it
+        if manifest.backend == "tiny-moe" or manifest.tokenizer or manifest.repo or os.path.isfile(own):
+            tok = own   # the model folder's own tokenizer (an HF repo id: it comes with the download)
     ap = argparse.ArgumentParser(description="moth's local chat server")
     ap.add_argument("--model", default=d["model"],
                     help="a weights folder, an HF repo id or openai:<base_url>#<model> (default: `moth config model`, "
                          "else this install's moth; see moth/docs/MODEL_BACKENDS.md)")
     ap.add_argument("--tokenizer", default=tok)
-    ap.add_argument("--home", default=d["home"], help="moth's home folder (kept between runs)")
-    ap.add_argument("--pool-file", default=d["pool"])
-    ap.add_argument("--seed", type=int, default=3, help="which home moth starts with")
+    ap.add_argument("--legacy", action="store_true",
+                    help="run the old dense model (moth-112m / final2, tiny-agent backend) instead of XS, for A/B: "
+                         "talk only (its tool tokens are banned), the prompt it was trained on")
     ap.add_argument("--card", default=None,
-                    help="identity card: moth (default), blank, heldout:<i>, or a JSON file "
-                         '{"name": "pip", "kind": "a houseplant", "home": "on a windowsill", "traits": ["you love puns"]}')
+                    help='who moth is (beats `moth card`): moth (default), blank, "text:you are a cat named bo", or a '
+                         'JSON card file {"name": "pip", "kind": "a houseplant", "traits": ["you love puns"]}')
+    for gone in ("--home", "--pool-file", "--seed", "--max-tool-rounds"):   # moth has no home or tools any more:
+        ap.add_argument(gone, default=None, help=argparse.SUPPRESS)        # accepted (old launch scripts) and ignored
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--temperature", type=float, default=s.get("temperature", 0.8))
     ap.add_argument("--top-p", type=float, default=s.get("top_p", 0.95))
@@ -1004,7 +910,6 @@ def build_parser(manifest=None) -> argparse.ArgumentParser:
                     help="use the phrase ban in chat replies too (off: chat recall is never affected)")
     ap.add_argument("--ctx-budget", type=int, default=None, help="max tokens of chat moth keeps in mind")
     ap.add_argument("--max-turn-tokens", type=int, default=s.get("max_tokens", 200))
-    ap.add_argument("--max-tool-rounds", type=int, default=3)
     ap.add_argument("--quant", default="auto", choices=["auto", "none", "int8", "bf16"],
                     help=f"Linear weights on the CPU: auto (default) = {CPU_QUANT} on the CPU, none on a GPU; "
                          "int8 (weight-only, per-channel) and bf16 are the fast modes; none = exact fp32 (slowest)")
@@ -1050,9 +955,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     with a moth.json brings its own sampling defaults (flags still win). a.manifest: the resolved manifest; a.model:
     the weights folder for tiny-agent models (the spec as given for the others)."""
     argv = list(sys.argv[1:] if argv is None else argv)
-    a = build_parser().parse_args(argv)
+    a = build_parser(legacy="--legacy" in argv).parse_args(argv)
     from moth import backends
-    spec = a.model if _given(argv, "--model") else (backends.configured() or a.model)
+    if a.legacy or _given(argv, "--model"):
+        spec = a.model   # --legacy: the old model's default folder (unless --model says otherwise)
+    else:
+        spec = backends.configured() or a.model
     kind, val = backends.parse_spec(spec or "")
     if kind == "folder":   # a model newer than this code: say how to upgrade, not a traceback from the model code
         from moth.backends import compat
@@ -1061,18 +969,34 @@ def parse_args(argv=None) -> argparse.Namespace:
         m = backends.resolve(spec)
     except backends.ManifestError as e:
         raise SystemExit(f"moth: {e}")
-    if not m.is_default:
-        a = build_parser(m).parse_args(argv)
-    if m.backend == "tiny-agent" and m.folder:   # (an HF repo id: the folder it downloads to)
+    if a.legacy and m.backend != "tiny-agent":
+        raise SystemExit(f"moth: --legacy runs the old tiny-agent model, but {spec} is a {m.backend} model")
+    a = build_parser(m, legacy=a.legacy).parse_args(argv)   # the model's sampling defaults (XS: plain T 0.7)
+    if m.backend in STATEFUL and m.folder:   # (an HF repo id: the folder it downloads to)
         a.model = m.folder
+    a.identity = resolve_card(a)
     a.manifest = m
     return a
+
+
+def resolve_card(a):
+    """--card, else `moth card` (~/.moth/config.json "card"), else None (the moth card). A one-liner from the config
+    becomes a text card; a card object from the config (moth card set --file) is used as it is."""
+    if getattr(a, "card", None):
+        return a.card
+    from moth import config
+    v = config.card()
+    if v is None:
+        return None
+    if isinstance(v, dict):
+        return v
+    return v if v in ("moth", "blank") else "text:" + v
 
 
 def make_engine(a) -> Moth:
     """Moth for tiny-agent models (the KV-cache path), moth.backends.engine.GenericMoth for the others."""
     m = getattr(a, "manifest", None)
-    if m is None or m.backend == "tiny-agent":
+    if m is None or m.backend in STATEFUL:
         return Moth(a)
     from moth.backends.engine import GenericMoth
     return GenericMoth(a)
@@ -1086,9 +1010,9 @@ def main(argv=None, on_ready=None):
         import _thread
         from moth.launch import exit_with_parent
         exit_with_parent(lambda: live["srv"].shutdown() if "srv" in live else _thread.interrupt_main())
-    if a.manifest.backend == "tiny-agent":
-        weights.ensure_default(a.model)   # pip install, first run: download the model files
-        backends.prepare(a.manifest)      # a tiny-agent model from another Hub repo: the same first-run download
+    if a.manifest.backend in STATEFUL:
+        weights.ensure_default(a.model, legacy=a.legacy)   # pip install, first run: download the model files
+        backends.prepare(a.manifest)      # a model from another Hub repo: the same first-run download
         from moth.backends import compat
         compat.require(a.model)
     if not a.manifest.is_default:
@@ -1107,7 +1031,8 @@ def main(argv=None, on_ready=None):
     srv = Server((a.host, a.port), make_handler(moth, token, hosts))
     moth.start_reactor()
     url = f"http://127.0.0.1:{a.port}" if a.host in ("0.0.0.0", "::", "") else f"http://{a.host}:{a.port}"
-    print(f"moth is awake at {url}  (home: {moth.home.root})", flush=True)
+    print(f"moth is awake at {url}  ({moth.identity_view()['name']}, {a.manifest.backend}"
+          f"{', ' + moth.quant if moth.quant not in (None, 'none') else ''})", flush=True)
     if on_ready:
         on_ready(url)
     live["srv"] = srv   # from here the lifeline stops serve_forever (and the finally below removes the pidfile)

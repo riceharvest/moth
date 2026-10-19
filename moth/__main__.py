@@ -11,7 +11,8 @@ opened in the browser with --open (or --browser); --no-browser is accepted and d
   python -m moth hooks | hook | unhook           see / install / remove the coding-agent hooks (moth/hooks.py)
   python -m moth doctor                          one-screen health check (moth/doctor.py)
   python -m moth autostart on|off|status         start the desktop pet at login (moth/autostart.py)
-  python -m moth forget [--all [--token]]        wipe moth's logs (and home folder) (moth/forget.py)
+  python -m moth forget [--all [--token]]        wipe moth's logs (moth/forget.py)
+  python -m moth card [set "<identity>" | set --file card.json | reset]   who moth is (moth/card.py)
 """
 from __future__ import annotations
 
@@ -103,6 +104,9 @@ USAGE = """usage: python -m moth [serve options] [--open]
        python -m moth config model <folder | HF repo id | openai:URL#model | default>
                                         the model behind moth (default: its own); see
                                         moth/docs/MODEL_BACKENDS.md. --model beats it for one run
+       python -m moth card [set "you are a cat named bo" | set --file card.json | reset]
+                                        who moth is: any one-line identity or a card file (default: the moth
+                                        card); switches a running moth at once (a new chat)
        python -m moth update [--check | --rollback] [--yes] [--repo ID] [--revision REV]
                                         update this Hugging Face download in place (python -m moth update --help)
        python -m moth hooks             which coding agents are on this machine and whether moth is hooked in
@@ -115,7 +119,7 @@ USAGE = """usage: python -m moth [serve options] [--open]
        python -m moth autostart on|off|status
                                         start the desktop pet (which wakes the server) when you log in
        python -m moth forget [--all [--token]] [--yes]
-                                        wipe moth's logs; --all also resets its home folder (files, diary);
+                                        wipe moth's logs; --all also deletes an old home folder (moth <= 0.3);
                                         --all --token also the token and settings. Stop moth first
        python -m moth --version         print moth's version and the Hub revision this folder is on
        python -m moth --help            this help, then the serve options below
@@ -137,7 +141,7 @@ def main(argv=None):
     if argv[:1] in (["hooks"], ["hook"], ["unhook"]):   # before --help / --version: `moth hook --help` is hook's
         from moth import hooks
         sys.exit(hooks.main(argv[0], argv[1:]))
-    if argv[:1] in (["setup"], ["doctor"], ["autostart"], ["forget"]):
+    if argv[:1] in (["setup"], ["doctor"], ["autostart"], ["forget"], ["card"]):
         import importlib
         sys.exit(importlib.import_module(f"moth.{argv[0]}").main(argv[1:]))
     if "--version" in argv:

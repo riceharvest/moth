@@ -13,3 +13,6 @@ if "MOTH_TEST_REAL_HOME" not in os.environ:   # once (a nested pytest keeps the 
     os.environ.setdefault("PYTHONUSERBASE", site.getuserbase())
     _home = tempfile.mkdtemp(prefix="moth-test-home-")
     os.environ["HOME"] = os.environ["USERPROFILE"] = _home
+    # moth's XS repo isn't published (moth/weights.py UNRELEASED: never contacted); the download / update tests run
+    # against a fake Hub under this stand-in id, as a real release would
+    os.environ.setdefault("MOTH_REPO", "test-owner/moth-xs")

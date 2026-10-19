@@ -27,6 +27,9 @@ Settings:
   model            (default default = this install's moth)  the model behind moth: a weights folder (its moth.json
                    says how to run it), an HF repo id, or openai:<base_url>#<model> for a local llama.cpp / Ollama /
                    vLLM server. Used from moth's next start; `--model` beats it. moth/docs/MODEL_BACKENDS.md.
+  card             (default moth)  who moth is: any one-line identity ("you are a cat named bo"), moth, blank, or a
+                   card object (`moth card set --file card.json` stores it here). `moth card` shows and sets it and
+                   switches a running moth live (a new chat); serve --card beats it. moth/cards.py has the schema.
 
 Values: on/off, 1/0, true/false, yes/no (any case), or a JSON true/false in the file. The Pi, OpenCode and Codex adapters
 use the same rule (their `enabled()`). pet_skin takes any text ("default" resets it to moth).
@@ -39,7 +42,8 @@ import sys
 import tempfile
 
 DEFAULTS = {"show_in_harness": False, "pet_skin": "moth", "update_check": True, "hide_in_fullscreen": True,
-            "chirp": False, "muted_sources": [], "pet_screen": "any", "quiet_hours": "off", "model": "default"}
+            "chirp": False, "muted_sources": [], "pet_screen": "any", "quiet_hours": "off", "model": "default",
+            "card": "moth"}
 TEXT = {"pet_skin", "pet_screen", "model"}   # text settings; muted_sources is a list, quiet_hours a time span, the rest on/off
 ENV = {"show_in_harness": "MOTH_SHOW_IN_HARNESS"}
 TRUE = {"1", "on", "true", "yes"}
@@ -57,6 +61,7 @@ USAGE = """usage: python -m moth config                          print the curre
        python -m moth config pet_screen <name>|any    keep the pet on one screen (default any)
        python -m moth config quiet_hours 23:00-08:00|off  no bubbles or chirp then; the moth dozes (default off)
        python -m moth config model <folder|repo id|openai:URL#model|default>  the model behind moth (default: its own)
+       python -m moth config card "<one-line identity>"|moth|blank   who moth is (or: python -m moth card)
 """
 
 
@@ -135,7 +140,22 @@ def parse_quiet(value) -> str | None:
     return "-".join(f"{m // 60:02d}:{m % 60:02d}" for m in span)
 
 
-PARSE = {"muted_sources": parse_sources, "quiet_hours": parse_quiet}
+def parse_card(value) -> str | dict | None:
+    """card: a one-line identity (text), "moth" / "blank" (also "default" -> moth), or a card object (validated by
+    moth.cards.validate); None if bad."""
+    if isinstance(value, dict):
+        try:
+            from moth import cards   # stdlib only
+            return cards.validate(dict(value))
+        except ValueError:
+            return None
+    v = parse_text(value)
+    if v is None or len(v) > 1000:
+        return None
+    return "moth" if v.lower() in ("moth", "default") else ("blank" if v.lower() == "blank" else v)
+
+
+PARSE = {"muted_sources": parse_sources, "quiet_hours": parse_quiet, "card": parse_card}
 
 
 def parser(key: str):
@@ -148,6 +168,9 @@ def show(key: str, value) -> str:
         return "on" if value else "off"
     if isinstance(value, list):
         return ",".join(value) or "none"
+    if isinstance(value, dict):   # a card object
+        from moth import cards
+        return "card file: " + (" ".join(cards._ident(value)) or "(no identity lines)")
     return str(value)
 
 
@@ -198,6 +221,12 @@ def model() -> str | None:
     return None if v.lower() in ("default", "moth") else v
 
 
+def card():
+    """The identity card setting: None (the moth card), "blank", a one-line identity, or a card object."""
+    v = lookup("card")[0]
+    return None if v == "moth" else v
+
+
 def quiet_hours() -> str:
     return lookup("quiet_hours")[0]
 
@@ -246,6 +275,7 @@ def describe() -> str:
 
 PET_LIVE = ("hide_in_fullscreen", "chirp", "muted_sources", "pet_screen", "quiet_hours")   # the pet rereads these
 HINTS = {"muted_sources": f"a comma list of {', '.join(SOURCES)}, or none",
+         "card": 'a one-line identity like "you are a cat named bo", moth, or blank (files: moth card set --file)',
          "quiet_hours": "a time span like 23:00-08:00, or off"}
 
 
@@ -300,6 +330,9 @@ def main(argv=None) -> int:
         note = _model_note(value)
         if note:
             print(note)
+        return 0
+    if key == "card":
+        print(f"card = {show(key, value)}   (saved in {path()}; `moth card` also switches a running moth)")
         return 0
     if key == "update_check":
         print(f"update_check = {'on' if value else 'off'}   (saved in {path()})")

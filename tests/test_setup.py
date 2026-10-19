@@ -60,6 +60,11 @@ class Base(T.TempHome):
         super().setUp()
         self.cache = self.tmp / "cache"
         os.environ["MOTH_CACHE"] = str(self.cache)
+        # the XS repo is unreleased (never contacted): a stand-in id plays the published release
+        os.environ["MOTH_REPO"] = "test-owner/moth-xs"
+        p = unittest.mock.patch.object(S.weights, "REPO_ID", "test-owner/moth-xs")
+        p.start()
+        self.addCleanup(p.stop)
         os.environ.pop("MOTH_URL", None)
         self.url_state = ["none"]   # what /api/health says: "none" | "moth" | "other"
         self.launched: list = []
@@ -159,7 +164,7 @@ class DryRun(Base):
     def test_missing_weights_dry_run_doesnt_download(self):
         rc, out = self.setup_run("--dry-run")
         self.assertEqual(rc, 0, out)
-        self.assertIn("not downloaded yet: about 860 MB", out)
+        self.assertIn("not downloaded yet: about 1.2 GB", out)
         self.assertIn(str(self.cache), out)
         self.assertIn("download them now? yes", out)
         self.assertEqual(self.fetched, [])
@@ -172,7 +177,7 @@ class Yes(Base):
         rc, out = self.setup_run("--yes")
         self.assertEqual(rc, 0, out)
         # weights: downloaded into the pip cache, once
-        self.assertEqual(self.fetched, [str(self.cache / "darioooooo0o" / "moth-112m")])
+        self.assertEqual(self.fetched, [str(self.cache / "test-owner" / "moth-xs")])
         # hooks: installed, with the backup shown and Codex's approval note
         settings = json.loads((self.home / ".claude" / "settings.json").read_text())
         self.assertEqual(settings["model"], "opus")
@@ -323,7 +328,7 @@ class Problems(Base):
         self.assertEqual(rc, 1, out)   # moth can't run yet
         self.assertIn("missing model files: model.safetensors", out)
         self.assertIn(f"cd {repo / 'code'} && python -m moth update", out)
-        self.assertIn("hf download darioooooo0o/moth-112m --local-dir", out)
+        self.assertIn("hf download test-owner/moth-xs --local-dir", out)
         self.assertIn("no weights yet (step 2)", out)
         self.assertEqual((self.launched, self.fetched), ([], []))
 

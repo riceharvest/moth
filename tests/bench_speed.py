@@ -8,8 +8,9 @@
   decode b1:  tok/s for --decode greedy tokens after a --ctx-token prompt (new: Decoder.generate with a stop id that
               never comes, so exactly --decode tokens + the closing stop append; old: the old bench loop)
   decode sampled (new only): the same with moth's sampler (T 0.8, top-p 0.95, rep penalty 1.3 on 300 ids)
-  serve turn: Moth.chat() end to end (render, tokenize, prefill / feed, sampled reply, tool calls) over a fixed
-              conversation with a temp home; old = moth.serve with its pre-2026-10-18 _feed/_turn/_sample patched in
+  serve turn: Moth.chat() end to end (render, tokenize, prefill / feed, sampled reply) over a fixed conversation;
+              old = moth.serve with its pre-2026-10-18 _feed/_turn/_sample patched in (LEGACY: the old dense model
+              only; XS has its own bench, tests/bench_xs.py)
 Each measurement: 1 warm-up + --repeats timed runs, median. Prompts are fixed seeded random token ids.
 
   python tests/bench_speed.py --device cpu --dtype fp32 --low-mem --quant int8 --threads 8,16   # CPU serving default
@@ -97,10 +98,10 @@ def legacy_turn(self, logits, talk_only=False):
         t = legacy_sample(self, logits, talk_only)
         out.append(t)
         logits = G.append_chunked(self.model, self.cache, torch.tensor([[t]], device=self.a.device), [1])
-        if t == self.im_end:
+        if t == self.stop:
             break
-    if out[-1] != self.im_end:
-        G.append_chunked(self.model, self.cache, torch.tensor([[self.im_end]], device=self.a.device), [1])
+    if out[-1] != self.stop:
+        G.append_chunked(self.model, self.cache, torch.tensor([[self.stop]], device=self.a.device), [1])
     return self.tok.decode(out, skip_special_tokens=False)
 
 
@@ -117,20 +118,25 @@ def legacy_new_cache(self):
 def make_moth(a, model, home, temperature):
     """A real moth.serve.Moth around an already loaded model (no second copy of the weights)."""
     from moth import serve
-    args = serve.build_parser().parse_args(["--model", a.model, "--tokenizer", TOKENIZER, "--home", home,
+    args = serve.build_parser(legacy=True).parse_args(["--model", a.model, "--tokenizer", TOKENIZER,
                                             "--device", a.device, "--temperature", str(temperature)]
                                            + (["--no-graph"] if a.no_graph else [])
                                            + (["--compile"] if getattr(a, "compile", False) else []))
-    m = serve.Moth.__new__(serve.Moth)
+    from moth.backends.tiny_agent import TinyAgentBackend
     from tokenizers import Tokenizer
-    m.tok = Tokenizer.from_file(TOKENIZER)
-    m.model = model
-    m.kv_dtype = next(model.parameters()).dtype if a.quant == "none" else torch.float32
-    m._kv = G.KVCache(model, 1, MAX_LEN, a.device, dtype=m.kv_dtype)
+    b = TinyAgentBackend.__new__(TinyAgentBackend)   # the loaded model, no second copy (as TinyAgentBackend.__init__)
+    b.a, b.tok, b.model, b.quant = args, Tokenizer.from_file(TOKENIZER), model, a.quant
+    b.kv_dtype = next(model.parameters()).dtype if a.quant == "none" else torch.float32
+    b.kv = G.KVCache(model, 1, MAX_LEN, a.device, dtype=b.kv_dtype)
+    b.stop_id = b.tok.token_to_id("<|im_end|>")
+    b.talk_ban = [b.tok.token_to_id(t) for t in ("<tool_call>", "<think>")]
+    m = serve.Moth.__new__(serve.Moth)
+    m.backend = b
+    m.tok, m.model, m.kv_dtype, m._kv, m.quant = b.tok, model, b.kv_dtype, b.kv, a.quant
     m.setup(args)
     if a.device != "cpu":           # as Moth.__init__: capture the GPU graphs up front
         m.cache = m._kv
-        m._decoder().warmup(args.max_turn_tokens, m.im_end, args.temperature, args.top_p, args.rep_penalty)
+        m._decoder().warmup(args.max_turn_tokens, m.stop, args.temperature, args.top_p, args.rep_penalty)
         m.cache = None
     return m
 
@@ -346,9 +352,6 @@ def equivalence(a, model, prompt, lens, kv_dtype, home_root, dev):
                 rr = run_chat(mr, chat, False, ci)
                 for impl in ("new", "old"):
                     rb = run_chat(mb, chat, impl == "old", ci)
-                    for mm in (mr, mb):
-                        shutil.rmtree(mm.home.root, ignore_errors=True)
-                        mm.home = type(mm.home)(mm.home.root, mm.a.seed, mm.a.pool_file)
                     agree[impl][0] += sum(x == y for x, y in zip(rb, rr))
                     agree[impl][1] += len(rr)
             out["bf16_vs_fp32_greedy_turns"] = {k: f"{v[0]}/{v[1]}" for k, v in agree.items()}
@@ -362,9 +365,6 @@ def equivalence(a, model, prompt, lens, kv_dtype, home_root, dev):
             mr = make_moth(aref, ref, os.path.join(home_root, "q-ref"), 0.0)
             for ci, chat in enumerate(CHATS[:a.equiv]):
                 rq, rr = run_chat(mq, chat, False, ci), run_chat(mr, chat, False, ci)
-                for mm in (mq, mr):
-                    shutil.rmtree(mm.home.root, ignore_errors=True)
-                    mm.home = type(mm.home)(mm.home.root, mm.a.seed, mm.a.pool_file)
                 sm = [x == y for x, y in zip(rq, rr)]
                 same_turns, turns, same_chats = same_turns + sum(sm), turns + len(sm), same_chats + all(sm)
             out["quant_vs_fp32_greedy"] = {"chats": a.equiv, "identical_chats": same_chats,
@@ -381,11 +381,7 @@ def equivalence(a, model, prompt, lens, kv_dtype, home_root, dev):
         diffs = []
         for ci, chat in enumerate(CHATS[:a.equiv]):
             new = run_chat(m, chat, False, 1000 + ci)
-            shutil.rmtree(m.home.root, ignore_errors=True)     # same fresh home for the old run
-            m.home = type(m.home)(m.home.root, m.a.seed, m.a.pool_file)
             old = run_chat(m, chat, True, 1000 + ci)
-            shutil.rmtree(m.home.root, ignore_errors=True)
-            m.home = type(m.home)(m.home.root, m.a.seed, m.a.pool_file)
             s = [x == y for x, y in zip(new, old)]
             same_turns += sum(s)
             turns += len(s)

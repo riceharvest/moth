@@ -1,11 +1,11 @@
 # moth
 
-**moth is a silly little companion, not an assistant.** It's a tiny model (112M parameters, trained from scratch)
-that thinks it's a moth living on a graphics card. It chats in short lowercase sentences, has a home folder it can
-look around in and write to, and can watch your coding agent and react to its replies. It will not fix your code.
-It runs locally, on CPU.
+**moth is a silly little chat buddy, not an assistant.** A tiny mixture-of-experts model (XS, trained from scratch)
+that chats in short lowercase lines, in English, Chinese, Spanish, French or Hindi, and can watch your coding agent and
+react to its replies. Who it is comes from a one-line card (`moth card set "you are a cat named bo"`; default: a small
+moth on a graphics card). Pure chat: no tools, no files. It will not fix your code. It runs locally, on CPU.
 
-Model card, samples, how it was made and licenses: https://huggingface.co/darioooooo0o/moth-112m
+Model card, samples, how it was made and licenses: {{HF_REPO_URL}}
 Source, issues and the Windows / macOS / Linux installers: https://github.com/riceharvest/moth
 
 ## Install
@@ -36,9 +36,9 @@ moth-pet        # the desktop pet (needs the [pet] extra), talks to the running 
 moth --help     # all commands and options
 ```
 
-On first run moth downloads its weights (about 860 MB: `model.safetensors`, `config.json`, `tokenizer.json`)
-from the Hugging Face Hub into `~/.cache/moth/<repo>/`. After that it works offline. Your moth's state (its home
-folder, the local token, settings) lives in `~/.moth/`.
+On first run moth downloads its weights (about 1.2 GB: `model.safetensors`, `config.json`, `tokenizer.json`,
+`moth.json`) from the Hugging Face Hub into `~/.cache/moth/<repo>/`. After that it works offline. Your moth's state
+(the local token, settings, its card) lives in `~/.moth/`.
 
 - `MOTH_REPO` picks another Hub repo, `MOTH_REVISION` pins the download to a branch, tag or commit, and
   `MOTH_CACHE` moves the weights folder. `--model DIR --tokenizer FILE` uses local files instead.

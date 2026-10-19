@@ -8,7 +8,7 @@ Two ways to get moth:
   [model card](../release/README.md)).
 
 Both are the same moth. The installers bundle Python, CPU-only torch, tokenizers and Qt for the desktop pet. The
-model weights (about 860 MB) aren't in the installer: moth downloads them once, on first launch.
+model weights (about 1.2 GB for XS) aren't in the installer: moth downloads them once, on first launch.
 
 ## Installers
 
@@ -34,7 +34,7 @@ On an Intel Mac, use Python with a torch you build yourself.
 
 The first launch opens a small window, which is `moth setup` with buttons:
 
-1. **moth's brain.** Click **Download (about 860 MB)** to fetch the weights from Hugging Face into
+1. **moth's brain.** Click **Download (about 1.2 GB)** to fetch the weights from Hugging Face into
    `~/.cache/moth/<repo>/`, with a progress bar. If you already have them (`model.safetensors`, `config.json`,
    `tokenizer.json` in one folder), click **Use a folder on this computer…** instead. moth remembers that folder in
    `~/.moth/app.json`. Setting `MOTH_MODEL_DIR` to such a folder does the same.

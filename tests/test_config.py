@@ -126,6 +126,59 @@ class ConfigCli(unittest.TestCase):
         self.assertEqual(os.listdir(self.dir), ["config.json"])
 
 
+class CardCli(unittest.TestCase):
+    """`moth card` (moth/card.py) and the "card" setting: saved in config.json, pushed to a running moth."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.file = Path(self.tmp.name) / "config.json"
+        env = {**os.environ, "MOTH_CONFIG_FILE": str(self.file), "MOTH_TOKEN_FILE": str(Path(self.tmp.name) / "tok")}
+        self.env = env
+        self.patch = unittest.mock.patch.dict(os.environ, env, clear=True)
+        self.patch.start()
+
+    def tearDown(self):
+        self.patch.stop()
+        self.tmp.cleanup()
+
+    def card(self, *args):
+        p = subprocess.run([sys.executable, "-m", "moth", "card", *args, "--port", "9"], cwd=ROOT, capture_output=True,
+                           text=True, timeout=20, env=self.env)
+        return p.returncode, p.stdout + p.stderr
+
+    def test_set_show_reset(self):
+        code, out = self.card()
+        self.assertEqual(code, 0)
+        self.assertIn("moth (the default card", out)
+        code, out = self.card("set", "you are a cat named bo")
+        self.assertEqual(code, 0)
+        self.assertIn("isn't running", out)                     # no moth up: used from its next start
+        self.assertEqual(json.loads(self.file.read_text())["card"], "you are a cat named bo")
+        self.assertEqual(C.card(), "you are a cat named bo")
+        self.assertIn("you are a cat named bo", self.card()[1])
+        f = Path(self.tmp.name) / "pip.json"
+        f.write_text(json.dumps({"name": "pip", "kind": "a houseplant", "traits": ["you love puns"]}))
+        code, out = self.card("set", "--file", str(f))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(C.card()["name"], "pip")
+        self.assertIn("you are pip, a houseplant. you love puns.", self.card()[1])
+        f.write_text(json.dumps({"traits": "not a list"}))
+        self.assertEqual(self.card("set", "--file", str(f))[0], 2)
+        self.assertEqual(C.card()["name"], "pip")              # a bad file changes nothing
+        self.assertEqual(self.card("reset")[0], 0)
+        self.assertIsNone(C.card())
+        self.assertEqual(self.card("set", "blank")[0], 0)
+        self.assertEqual(C.card(), "blank")
+        self.assertEqual(self.card("set")[0], 2)
+
+    def test_config_card_key(self):
+        self.assertEqual(C.parse_card("Default"), "moth")
+        self.assertIsNone(C.parse_card("x\ny"))
+        self.assertIsNone(C.parse_card({"name": 5}))
+        self.assertEqual(C.parse_card({"lines": ["you are a fox."]}), {"lines": ["you are a fox."]})
+        self.assertIn("card = moth", C.describe())
+
+
 class MainBrowser(unittest.TestCase):
     """`python -m moth`: the page is opened only on request; serve gets argv without the browser flags."""
 

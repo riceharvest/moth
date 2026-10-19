@@ -42,7 +42,7 @@ try:
 except ImportError:
     HAVE_HUB = False
 
-REPO = "darioooooo0o/moth-112m"
+REPO = "test-owner/moth-xs"   # the XS repo is unreleased (weights.UNRELEASED): a stand-in id, set via MOTH_REPO
 TOKENIZER = ROOT / "data" / "tiny-agent-112m" / "tokenizer.json"
 OLD, NEW = "0.2.9", "0.3.0"
 DEEP = "code/moth/integrations/claude_code_mod/.claude-plugin/plugin.json"   # the longest path in the repo
@@ -195,7 +195,7 @@ class E2E(unittest.TestCase):
                  MOTH_CACHE=str(self.tmp / "cache"), HF_ENDPOINT=self.hub.endpoint, HF_HUB_DISABLE_TELEMETRY="1",
                  HF_HUB_DISABLE_PROGRESS_BARS="1", HF_HUB_ETAG_TIMEOUT="5", PYTHONIOENCODING="utf-8",
                  PYTHONDONTWRITEBYTECODE="1", NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost",
-                 QT_QPA_PLATFORM="offscreen")
+                 QT_QPA_PLATFORM="offscreen", MOTH_REPO=REPO)
         e.update({k: v for k, v in extra.items() if v is not None})
         for k, v in extra.items():
             if v is None:

@@ -8,7 +8,10 @@ Three ways moth can be installed (mode()):
        (model.safetensors, config.json, tokenizer.json) are downloaded from the Hub on first run into
        ~/.cache/moth/<repo>/  ($MOTH_CACHE, else $XDG_CACHE_HOME/moth, overrides the base folder).
 
-$MOTH_REPO picks the Hub repo (default below), $MOTH_REVISION pins the first download to a branch, tag or commit.
+The default model is XS (tiny-moe). Its Hub repo isn't published yet: REPO_ID is the UNRELEASED placeholder, which
+moth never contacts (ensure() says how to point moth at a model instead); set it when the release ships.
+$MOTH_REPO picks the Hub repo, $MOTH_REVISION pins the first download to a branch, tag or commit. The old dense model
+(moth-112m, --legacy) keeps its own released repo, LEGACY_REPO_ID.
 After that the folder is used as it is (no network); `moth update` refreshes it in place, with a backup.
 Stdlib only at import time: huggingface_hub is imported when a download is actually needed.
 """
@@ -20,13 +23,19 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)   # code/ (Hub download), the project (dev checkout) or site-packages (pip)
-REPO_ID = "darioooooo0o/moth-112m"
+UNRELEASED = "unreleased/moth-xs"   # placeholder: never contacted (released() is False); the XS repo id goes here
+REPO_ID = UNRELEASED
+LEGACY_REPO_ID = "darioooooo0o/moth-112m"   # the old dense model (moth 0.3.x), still served by --legacy
 FILES = ("model.safetensors", "config.json", "tokenizer.json")
 OPTIONAL = ("moth.json",)   # a model's manifest (moth/backends/manifest.py), when the repo has one
-DEV_MODEL = os.path.join(ROOT, "runs", "sft1", "model")
-DEV_TOKENIZER = os.path.join(ROOT, "data", "tiny-agent-112m", "tokenizer.json")
+DEV_MODEL = os.path.join(ROOT, "runs", "xs", "model")            # XS weights in a dev checkout (tokenizer.json inside)
+DEV_LEGACY_MODEL = os.path.join(ROOT, "runs", "sft1", "model")   # the old model in a dev checkout (--legacy)
+DEV_TOKENIZER = os.path.join(ROOT, "data", "tiny-agent-112m", "tokenizer.json")   # its tokenizer
 REVISION_FILE = ".moth-version"   # same file and format as moth/update.py
-SIZE_HINT = "about 860 MB"
+SIZE_HINT = "about 1.2 GB"          # XS in bf16 (moth/xs/weights.py); the old model was about 860 MB
+NO_RELEASE = ("moth: there's no XS model release to download yet. Point moth at a model folder (model.safetensors + "
+              "config.json + tokenizer.json): `moth --model DIR` or `moth config model DIR`, or set MOTH_REPO to a Hub "
+              "repo. `moth --legacy` runs the old moth-112m.")
 
 
 # what a Hugging Face download of moth has next to code/ besides the weights: an interrupted `hf download` leaves
@@ -77,13 +86,18 @@ def mode() -> str:
     repo_dir = os.path.dirname(ROOT)
     if os.path.exists(os.path.join(repo_dir, "model.safetensors")) or hf_layout(repo_dir):
         return "hf"   # (also a download still missing its weights: never "pip", which would fetch them elsewhere)
-    if os.path.isfile(DEV_TOKENIZER):   # a positive marker: an editable install of the checkout stays dev
+    if os.path.isfile(DEV_TOKENIZER) or os.path.isdir(DEV_MODEL):   # positive markers: an editable install stays dev
         return "dev"
     return "pip"
 
 
 def repo() -> str:
     return os.environ.get("MOTH_REPO") or REPO_ID
+
+
+def released(repo_id: str | None) -> bool:
+    """A repo moth may contact: anything but the UNRELEASED placeholder."""
+    return bool(repo_id) and repo_id != UNRELEASED
 
 
 def pinned_revision() -> str | None:
@@ -111,6 +125,8 @@ def ensure(folder: str | None = None, repo_id: str | None = None, revision: str 
     folder = folder or cache_dir(repo_id)
     if present(folder):
         return folder
+    if not released(repo_id):
+        raise SystemExit(NO_RELEASE)
     revision = revision or pinned_revision()
     from moth import config   # stdlib only
     if config.offline():   # MOTH_OFFLINE / HF_HUB_OFFLINE: nothing goes to the network, not even the first download
@@ -200,7 +216,7 @@ def drop_orphans(folder: str, min_age: float = 300.0) -> int:
     return n
 
 
-def ensure_default(model_dir: str) -> None:
+def ensure_default(model_dir: str, legacy: bool = False) -> None:
     """serve / cli after parsing: fetch the weights only in pip mode and only when --model is the default folder.
     A Hugging Face download whose weights didn't finish (--model left at the download folder) exits with how to
     finish it, instead of failing to load or fetching a second copy elsewhere."""
@@ -209,6 +225,8 @@ def ensure_default(model_dir: str) -> None:
         repo_dir = os.path.dirname(ROOT)
         if os.path.realpath(model_dir) == os.path.realpath(repo_dir) and not complete(repo_dir):
             raise SystemExit("moth: " + incomplete_message(repo_dir))
+    elif legacy and m in ("pip", "hf") and os.path.realpath(model_dir) == os.path.realpath(cache_dir(LEGACY_REPO_ID)):
+        ensure(model_dir, LEGACY_REPO_ID)
     elif m == "pip" and os.path.realpath(model_dir) == os.path.realpath(cache_dir()):
         ensure(model_dir)
 

@@ -16,7 +16,6 @@ import pytest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 from moth import agent, cards, gist, persona, probes  # noqa: E402
-from moth.home import load_pool, sample_home  # noqa: E402
 
 OLD_STUDENT = (
     "you are moth. you live on a graphics card. your home folder is ~. talk with your friend. use tools to look at or "
@@ -40,10 +39,11 @@ def test_pure_chat_student_prompt_and_legacy_prompt():
     assert s == "you are moth, a small moth who lives on a graphics card. " + cards.STUDENT_TAIL
     for bad in ("tool", "home folder", "~", "bash", "file"):
         assert bad not in s.lower(), bad
-    # the released round-3 weights keep their tools/home prompt through serve.py
+    # the released round-3 weights (--legacy, tiny-agent backend) keep their tools/home prompt
     assert cards.student_system_v1(cards.MOTH_CARD) == OLD_STUDENT == cards.student_system_v1(None)
-    serve_src = open(os.path.join(ROOT, "moth", "serve.py")).read()
-    assert "self.system = student_system_v1(self.identity)" in serve_src
+    legacy = open(os.path.join(ROOT, "moth", "backends", "tiny_agent.py")).read()
+    xs = open(os.path.join(ROOT, "moth", "backends", "tiny_moe.py")).read()
+    assert "return student_system_v1(card)" in legacy and "return student_system(card)" in xs
 
 
 def test_student_prompt_other_cards():
@@ -122,14 +122,6 @@ def test_load_card_file_and_specs():
     assert cards.load_card("moth")["id"] == "moth" and cards.load_card("heldout:0")["id"] == "h000"
     with pytest.raises(SystemExit):
         cards.load_card("nope-not-a-card")
-
-
-def test_legacy_homes_for_the_released_model():
-    """serve.py's home for the released tools model: the moth card still gets moth's six folders."""
-    pool = load_pool(None)
-    assert sample_home(random.Random(5), pool) == sample_home(random.Random(5), pool, cards.MOTH_CARD)
-    h = sample_home(random.Random(5), pool, cards.build_pool()[1])
-    assert {p.split("/")[0] for p in h} == set(cards.GENERIC_FOLDERS)
 
 
 # --- the teacher sheet ----------------------------------------------------------------------------------------------

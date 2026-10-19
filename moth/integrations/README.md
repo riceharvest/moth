@@ -94,8 +94,8 @@ Test them all offline against a stub moth: `python3 moth/integrations/test_integ
     project folder's name as its label.
   - What you type to moth: in the chat page, the pet, `moth tail`, Pi's `/moth` or the Claude Code band.
 
-  It never gets your prompts to the agent, the agent's tool calls, or your files. Its own tools reach only its home
-  folder.
+  It never gets your prompts to the agent, the agent's tool calls, or your files. It has no tools of its own (pure
+  chat).
 - **Everything stays on your machine.** The server listens on 127.0.0.1 only, unless you start it with another
   `--host`. The adapters post to `http://127.0.0.1:4747`, unless you set `MOTH_URL`.
   - moth's code goes online for two things only, both from the Hugging Face Hub: downloading the weights (first run
@@ -104,12 +104,12 @@ Test them all offline against a stub moth: `python3 moth/integrations/test_integ
   - The training and eval scripts in `code/moth/` talk to whatever LLM server you point them at. Running moth never
     uses them.
 - **Where it's stored: `~/.moth/`.** That holds the token, `config.json`, pidfiles while moth runs, `backups/` from
-  `moth hook`, and moth's home folder `home/`: its files, its diary, and anything it wrote down from your chats.
+  `moth hook`. (moth <= 0.3 also kept a home folder `home/` there; 0.4 keeps no files.)
   - `serve.log` holds the server's output when the pet starts it: status lines and errors, no chat text.
   - The conversation itself lives only in RAM. Stopping moth wipes it, and so does the page's "new chat" button.
     moth's memory of its own last 16 reactions (token ids, so it doesn't repeat a joke) is RAM-only too. "New chat"
     keeps it; stopping moth or `moth forget` wipes it.
-  - In the dev checkout, the home is `live/home/` and the logs are `live/*.log`.
+  - In the dev checkout, the logs are `live/*.log`.
 - **The agent never receives anything back.** The adapters only post. They ignore the answer, print nothing and
   exit 0, so nothing reaches the agent's context.
   - moth's lines show only in displays you turn on: the pet, `moth tail`, the Claude Code band, and the Pi widget or
@@ -117,7 +117,7 @@ Test them all offline against a stub moth: `python3 moth/integrations/test_integ
   - What you say to moth goes to moth only.
 - **Wiping it.** Stop moth first, then:
   - `moth forget` deletes its logs.
-  - `moth forget --all` also resets its home folder, but only a folder moth made itself.
+  - `moth forget --all` also deletes the home folder an older moth (0.3) made, but only one moth made itself.
   - `moth forget --all --token` also deletes the token and settings.
   - On a moth that's still running, `moth forget` deletes no files but makes it forget the chat and its last
     reactions (`POST /api/reset {"everything": true}`).

@@ -77,19 +77,29 @@ def seed_everything(seed: int):
         pass
 
 
+class NoHome:
+    """The home the tools-era probes expected, empty: moth 0.4 is pure chat (no files, no tools)."""
+
+    def __init__(self, *a, **kw):
+        pass
+
+    def tree(self):
+        return []
+
+
 def run_probe(moth, probe, seed: int, home_root: str, sample: int = 0, home_cls=None, card: dict | None = None):
     """One chat in a fresh home. moth: a moth.serve.Moth (or anything with .a.pool_file, .home, reset(), chat()).
     card: the identity card (system prompt + home); None = whatever moth was started with (the moth card)."""
-    if home_cls is None:
-        from moth.serve import Home as home_cls
+    if home_cls is None:   # moth has no home folder any more (pure chat, 0.4): an empty one for the old probe code
+        home_cls = NoHome
     cat, name, lines, check = probe
     seed_everything(seed)
     shutil.rmtree(home_root, ignore_errors=True)
     moth.system = (student_system_v1 if LEGACY["on"] else student_system)(card if card is not None else MOTH_CARD)
     if card is not None:
-        moth.home = home_cls(home_root, seed, moth.a.pool_file, card=card)
+        moth.home = home_cls(home_root, seed, getattr(moth.a, "pool_file", None), card=card)
     else:
-        moth.home = home_cls(home_root, seed, moth.a.pool_file)
+        moth.home = home_cls(home_root, seed, getattr(moth.a, "pool_file", None))
     before = {f"{d['dir']}/{x}" for d in moth.home.tree() for x in d["files"]}
     moth.reset()
     turns, flags, seen = [], collections.Counter(), ""

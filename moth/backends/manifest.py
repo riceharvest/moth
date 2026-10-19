@@ -150,7 +150,9 @@ def parse(data: dict, folder: str | None = None, where: str = FILE) -> Manifest:
         if k == "sampling":
             kw["sampling"] = _norm_sampling(v, where, XS_SAMPLING if backend == "tiny-moe" else SAMPLING)
         elif k == "tools":
-            if v is True:
+            if not isinstance(v, bool):
+                raise ManifestError(f"{where}: tools must be true/false")
+            if v:
                 notes.append("tools: moth has no tools any more (pure chat); ignored")
         elif k == "stop":
             if not (isinstance(v, list) and all(isinstance(s, str) and s for s in v)):
