@@ -4,8 +4,8 @@ weights on the CPU, bf16 on a GPU, one KV cache for the session).
 
 It is the one stateful backend: moth.serve.Moth keeps the KV cache across turns and feeds only each new message
 (Moth._feed / _prefill_all / _turn, tiny_agent.generate.Decoder with captured device graphs on CUDA/XPU and the
-phrase ban as a logits hook), so a turn costs only its new tokens. That path stays in Moth itself, untouched; this
-class owns the loading and the capability flags. generate() is the stateless form of the same model (fresh cache,
+phrase ban as a logits hook), so a turn costs only its new tokens. Moth drives it through the methods below (the same
+ones the tiny-moe backend has). Pure chat since 0.4: <tool_call> / <think> are banned in every reply. generate() is the stateless form of the same model (fresh cache,
 whole prompt) for callers that just want a reply to a message list.
 """
 from __future__ import annotations
@@ -19,7 +19,7 @@ from moth.backends.base import Backend
 class TinyAgentBackend(Backend):
     name = "tiny-agent"
     stateful = True
-    tools = True
+    tools = False
     graphs = True
     phrase_ban = True
 
@@ -41,6 +41,42 @@ class TinyAgentBackend(Backend):
         self.kv_dtype = dtype
         # one KV cache for the whole session, reset for every re-read: the decoder's captured GPU graph is tied to it
         self.kv = KVCache(self.model, 1, serve.MAX_LEN, a.device, dtype=dtype)
+        self.stop_id = self.tok.token_to_id("<|im_end|>")
+        # pure chat now: the tool / think tokens it was trained with are banned in every reply
+        self.talk_ban = [i for i in (self.tok.token_to_id(t) for t in ("<tool_call>", "<think>")) if i is not None]
+
+    # --- what moth.serve.Moth's stateful path calls -------------------------------------------------------------
+    def system_prompt(self, card) -> str:
+        """The prompt the released round-3 weights were trained with (tools/home lines and all): the best match for
+        an A/B, even though moth no longer runs any tools (they are banned)."""
+        from moth.cards import student_system_v1
+        return student_system_v1(card)
+
+    def render(self, messages, add_generation_prompt=False) -> str:
+        from tiny_agent.chat import render
+        return render(messages, add_generation_prompt)
+
+    def next_turn(self, messages) -> str:
+        return "\n" + self.render(messages, add_generation_prompt=True)   # chatml: a newline after <|im_end|>
+
+    def reply(self, text: str) -> str:
+        from tiny_agent.chat import parse_assistant
+        return parse_assistant(text)["content"] or ""
+
+    def specials(self) -> tuple:
+        return ("<|im_start|>", "<|im_end|>", "<tool_call>", "</tool_call>", "<think>", "</think>")
+
+    def new_cache(self):
+        self.kv.reset([0])
+        return self.kv
+
+    def feed(self, cache, ids):
+        from tiny_agent.generate import append
+        return append(self.model, cache, torch.tensor([ids], device=self.a.device), [len(ids)])
+
+    def decoder(self, cache, graph=None, compile=False):
+        from tiny_agent.generate import Decoder
+        return Decoder(self.model, cache, graph=graph, compile=compile)
 
     def tokenizer(self):
         return self.tok

@@ -3,7 +3,8 @@ torch loads anything), so an older install says what to do instead of failing de
 
 A model folder is too new for this code when:
   - its moth.json names a backend this moth doesn't have, or says "needs_moth": "<version>" newer than this one;
-  - (tiny-agent) its config.json has settings tiny_agent.model.ModelConfig doesn't know: a newer architecture.
+  - (tiny-agent) its config.json has settings tiny_agent.model.ModelConfig doesn't know: a newer architecture;
+  - (tiny-moe) its config.json has settings moth.xs.config doesn't know, or turns on a feature moth's XS code can't run.
 Then the user gets upgrade_hint(): what brings newer code for the way moth was installed.
 """
 from __future__ import annotations
@@ -58,8 +59,17 @@ def problem(folder: str) -> str | None:
         need = man.get("needs_moth")
         if isinstance(need, str) and need.strip() and newer(version(), need.strip()):
             return f"it needs moth {need.strip()} or newer"
+    cfg = _json(os.path.join(folder, "config.json"))
+    if isinstance(cfg, dict) and cfg.get("arch") == "tiny-moe":
+        backend = "tiny-moe"
+    if backend == "tiny-moe" and isinstance(cfg, dict):
+        from moth.xs import config as xsconfig   # stdlib only
+        try:
+            xsconfig.from_dict(cfg)
+        except xsconfig.ConfigError as e:
+            return str(e).split(": ", 1)[-1]
+        return None
     if backend == "tiny-agent":
-        cfg = _json(os.path.join(folder, "config.json"))
         if isinstance(cfg, dict) and not cfg.get("model_type"):   # (model_type: a transformers save, not ours)
             extra = sorted(set(cfg) - TINY_AGENT_KEYS)
             if extra:

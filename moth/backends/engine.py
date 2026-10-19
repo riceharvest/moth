@@ -1,4 +1,4 @@
-"""moth's conversation engine (moth.serve.Moth: history, reactions, sessions, the home tools, the phrase memory) on a
+"""moth's conversation engine (moth.serve.Moth: history, reactions, sessions, the identity card, the phrase memory) on a
 stateless backend (transformers, openai). Moth keeps tiny-agent's KV cache across turns and feeds only new text;
 here every turn renders the whole (trimmed) chat and asks the backend for the next assistant turn. Everything above
 the model is Moth's own code, unchanged: the same rollback, budget trimming, agent cards, one turn per session.
@@ -43,12 +43,12 @@ class GenericMoth(Moth):
         self.cache = READY
         return READY
 
-    def _turn(self, logits, talk_only=False) -> str:
+    def _turn(self, logits) -> str:
         if self.backend.count(self._view()) + self.a.max_turn_tokens > self.budget:
             self._prefill_all()
         return self.backend.generate(
             self._view(), max_tokens=self.a.max_turn_tokens, temperature=self.a.temperature, top_p=self.a.top_p,
-            rep_penalty=getattr(self.a, "rep_penalty", 1.0), pen_ids=self._pen_ids(), ban_tools=talk_only,
+            rep_penalty=getattr(self.a, "rep_penalty", 1.0), pen_ids=self._pen_ids(), ban_tools=True,
             logits_hook=self._hook, stop=self.manifest.stop)
 
     def _view(self) -> list[dict]:

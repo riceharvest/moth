@@ -1,7 +1,7 @@
 """The backend interface moth.serve talks to, and helpers the general backends share. Stdlib only.
 
-A backend loads a model and turns moth's conversation (tiny_agent.chat's canonical messages: system / user /
-assistant with tool_calls / tool with results) into the model's next assistant turn:
+A backend loads a model and turns moth's conversation (canonical messages: system / user / assistant; moth has no
+tools any more, so no tool turns) into the model's next assistant turn:
 
   tokenizer()   an object with the bits of a `tokenizers.Tokenizer` moth.serve uses: encode(text,
                 add_special_tokens=False).ids, decode(ids, skip_special_tokens=False), token_to_id(s), get_vocab(),
@@ -42,6 +42,25 @@ class Backend:
     def capabilities(self) -> dict:
         return {k: getattr(self, k) for k in ("stateful", "tools", "graphs", "phrase_ban")}
 
+    # --- what moth.serve.Moth reads from every backend (the stateful ones also: new_cache / feed / decoder) -----
+    stop_id = None      # the end-of-turn token id (stateful backends)
+    talk_ban = ()       # token ids a reply never samples
+
+    def render(self, messages: list[dict], add_generation_prompt: bool = False) -> str:
+        """The chat as plain text (stateless backends render inside generate(); this is for counting / logs)."""
+        return "\n".join(f"{m['role']}: {m.get('content') or ''}" for m in chat_messages(messages))
+
+    def next_turn(self, messages: list[dict]) -> str:
+        return self.render(messages, True)
+
+    def reply(self, text: str) -> str:
+        """The generated turn as moth's reply text: cut at an end-of-turn marker, any think block and any (now
+        meaningless) tool-call markup removed."""
+        return plain_reply(text)
+
+    def specials(self) -> tuple:
+        return ()
+
 
 def chat_messages(messages: list[dict]) -> list[dict]:
     """moth's canonical messages as plain {"role", "content"} chat messages for a chat template / an OpenAI server.
@@ -64,6 +83,16 @@ def chat_messages(messages: list[dict]) -> list[dict]:
             out.append({"role": "user", "content": "".join(f"<tool_response>\n{x}\n</tool_response>"
                                                            for x in m["results"])})
     return out
+
+
+_THINK = re.compile(r"<think>.*?(</think>|$)", re.S)
+_CALL = re.compile(r"<tool_call>.*?(</tool_call>|$)", re.S)
+
+
+def plain_reply(text: str) -> str:
+    for end in ("<|im_end|>", "<|end|>", "<|endoftext|>"):
+        text = text.split(end, 1)[0]
+    return _CALL.sub("", _THINK.sub("", text)).strip()
 
 
 def cut_at_stops(text: str, stop=()) -> str:

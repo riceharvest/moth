@@ -1,7 +1,10 @@
 """Swappable model backends: what runs behind moth's pet, hooks and chat page.
 
-  tiny-agent    moth-112m and its kin: tiny_agent's own architecture, KV cache kept across turns, device graphs,
-                int8 on the CPU, the phrase ban, home tools. The default; a folder without moth.json is this.
+  tiny-moe      XS (tiny-moe: LatentMoE + CSA2 attention) on moth's own inference code (moth/xs): KV cache kept across
+                turns, int8 experts on the CPU, the phrase ban, pure chat. The default model; a folder whose config.json
+                says "arch": "tiny-moe" is this even without moth.json.
+  tiny-agent    the old moth-112m (final2) and its kin: tiny_agent's architecture, device graphs, int8 on the CPU. Any
+                other folder without moth.json; `--legacy` runs the old default for A/B.
   transformers  any causal LM transformers can load (a folder or an HF repo id) with a chat template, CPU or GPU.
                 Optional: pip install "moth-companion[transformers]".
   openai        any OpenAI-compatible /v1/chat/completions server (llama.cpp server, Ollama, vLLM, LM Studio...),
@@ -96,11 +99,16 @@ def resolve(spec: str | None, network: bool = True) -> Manifest:
 def _hub(repo: str, network: bool) -> Manifest:
     from moth import weights   # stdlib only
     folder = weights.cache_dir(repo)
-    if repo == weights.REPO_ID:   # moth-112m itself: no need to ask the Hub
+    if repo in (weights.REPO_ID, weights.LEGACY_REPO_ID):   # moth's own models: no need to ask the Hub
         local = os.path.join(folder, FILE)
-        return load(folder) if os.path.isfile(local) else Manifest(folder=folder, repo=repo)
+        if os.path.isfile(local):
+            return load(folder)
+        if repo == weights.LEGACY_REPO_ID:
+            return Manifest(folder=folder, repo=repo)
+        from moth.backends.manifest import XS_SAMPLING
+        return Manifest(backend="tiny-moe", chat_format="xs", sampling=dict(XS_SAMPLING), folder=folder, repo=repo)
     local = os.path.join(folder, FILE)
-    if not os.path.isfile(local) and network and not _offline():
+    if not os.path.isfile(local) and network and not _offline() and weights.released(repo):
         print(f"moth: {repo} isn't a folder here, so it's a Hugging Face repo id: checking it for a moth.json",
               file=sys.stderr, flush=True)
         _fetch_manifest(repo, folder)
@@ -141,8 +149,8 @@ def _fetch_manifest(repo: str, folder: str) -> None:
 
 def prepare(m: Manifest) -> None:
     """Before loading: a tiny-agent model from the Hub gets its weights downloaded (moth/weights.py, with the same
-    checks and messages as moth-112m's first run). Others: nothing (transformers uses its own HF cache)."""
-    if m.backend == "tiny-agent" and m.repo and m.folder:
+    checks and messages as moth's own first run). Others: nothing (transformers uses its own HF cache)."""
+    if m.backend in ("tiny-agent", "tiny-moe") and m.repo and m.folder:
         from moth import weights
         if os.path.realpath(m.folder) == os.path.realpath(weights.cache_dir(m.repo)):
             weights.ensure(m.folder, m.repo)
@@ -158,6 +166,9 @@ def privacy_note(m: Manifest) -> str | None:
 
 def load_backend(m: Manifest, a):
     """The backend object for m (imports torch / transformers only now)."""
+    if m.backend == "tiny-moe":
+        from moth.backends.tiny_moe import TinyMoeBackend
+        return TinyMoeBackend(a)
     if m.backend == "tiny-agent":
         from moth.backends.tiny_agent import TinyAgentBackend
         return TinyAgentBackend(a)
