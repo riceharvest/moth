@@ -1,9 +1,11 @@
 """CLI for the RL environment.
 
-  python -m moth.rl mock --episodes 3 [--policy good|selfy|assistant|parrot] [--json out.json]
-  python -m moth.rl run  --sim-url URL --judge-url URL (--policy-url URL | --moth-model PATH) --episodes 20 --out DIR
+  python -m moth.rl mock --episodes 3 [--policy good|selfy|assistant|parrot|bland] [--mock-ref] [--json out.json]
+  python -m moth.rl run  --sim-url URL --judge-url URL [--judge-kind generative|forward] [--ref-policy-url SFT_URL]
+                         (--policy-url URL | --moth-model PATH) --episodes 20 --out DIR
                          [--agent-pool ~/moth/moth/agent_pool.json]   (read-only; the eval's agent messages are skipped)
-  python -m moth.rl eval --version v3 (--mock | --policy-url URL | --moth-model PATH) [--sim-url --judge-url]
+  python -m moth.rl eval --version v4 (--mock | --policy-url URL | --moth-model PATH) --sim-url URL
+                         --eval-judge-url EVAL_URL [--judge-url REWARD_URL] [--replies 3000] [--gold gold.jsonl]
                          [--ref OTHER/results.json] --out DIR
   python -m moth.rl cost --meter DIR/meter.json --episodes 100000 --tps sim=20000:2500 --tps judge=15000:1500
                          [--box rtx59-7-24-800-ig.1 | --price 0.65]
@@ -22,8 +24,8 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from moth.rl.env import MockPolicy, MothPolicy, OpenAIPolicy, run_episodes  # noqa: E402
-from moth.rl.judge import JUDGE_MODEL, JudgeCache, LLMJudge, MockJudge  # noqa: E402
+from moth.rl.env import FnPolicy, MockPolicy, MothPolicy, OpenAIPolicy, run_episodes  # noqa: E402
+from moth.rl.judge import JUDGE_MODEL, ForwardPassJudge, JudgeCache, LLMJudge, MockJudge  # noqa: E402
 from moth.rl.llm import CostMeter, OAIClient, box_hours, read_json, write_json  # noqa: E402
 from moth.rl.registry import Registry, sample_spec, train_agent_msgs  # noqa: E402
 from moth.rl.sim import SIM_MODEL, LLMSimulator, MockSimulator  # noqa: E402
@@ -59,13 +61,38 @@ def build_moth(a):
     return MothPolicy(Moth(ns))
 
 
+def make_judge(kind: str, url: str, model: str | None, cache: JudgeCache, role: str):
+    cl = OAIClient(url, model)
+    return ForwardPassJudge(cl, cache, role) if kind == "forward" else LLMJudge(cl, cache, role)
+
+
 def components(a, mock: bool):
+    """(simulator, reward judge)."""
     cache = JudgeCache(os.path.join(a.out, "judge_cache.jsonl") if a.out else None)
     if mock:
         return MockSimulator(), MockJudge(cache)
     temp = a.sim_temperature if a.sim_temperature is not None else (0.0 if a.cmd == "eval" else 1.0)
     return (LLMSimulator(OAIClient(a.sim_url, a.sim_model), temperature=temp),
-            LLMJudge(OAIClient(a.judge_url, a.judge_model), cache))
+            make_judge(a.judge_kind, a.judge_url, a.judge_model, cache, "judge"))
+
+
+def eval_judge(a, mock: bool):
+    """The eval-only judge (headline); never the reward judge."""
+    cache = JudgeCache(os.path.join(a.out, "eval_judge_cache.jsonl") if a.out else None)
+    if mock:
+        return MockJudge(cache, name="mock-eval-judge", role="eval_judge")
+    if not a.eval_judge_url:
+        raise SystemExit("eval needs --eval-judge-url (a different model than the reward judge, e.g. GEV)")
+    return make_judge(a.eval_judge_kind, a.eval_judge_url, a.eval_judge_model, cache, "eval_judge")
+
+
+def ref_policy(a, mock: bool):
+    """The frozen SFT reference for the vs_ref reward (stateless, shared)."""
+    if mock:
+        return FnPolicy(lambda msgs: "aw, what happened?") if getattr(a, "mock_ref", False) else None
+    if getattr(a, "ref_policy_url", None):
+        return OpenAIPolicy(OAIClient(a.ref_policy_url, a.ref_policy_model), meter_role="ref")
+    return None
 
 
 def policy_factory(a):
@@ -95,7 +122,11 @@ def main(argv=None):
             p.add_argument("--sim-temperature", type=float, default=None,
                            help="default 0 for eval (pairs line up better), 1.0 for run")
             p.add_argument("--judge-url", default="http://127.0.0.1:8000/v1")
-            p.add_argument("--judge-model", default=None, help=f"served name (plan: {JUDGE_MODEL})")
+            p.add_argument("--judge-model", default=None, help=f"reward judge, served name (plan: {JUDGE_MODEL})")
+            p.add_argument("--judge-kind", choices=["generative", "forward"], default="generative",
+                           help="reward judge: generative JSON labels (Qwen) or forward-pass P(yes) (JEV)")
+            p.add_argument("--ref-policy-url", default=None, help="frozen SFT reference for the vs_ref reward")
+            p.add_argument("--ref-policy-model", default=None)
             p.add_argument("--policy-url", default=None)
             p.add_argument("--policy-model", default=None)
             p.add_argument("--moth-model", default=None)
@@ -105,7 +136,8 @@ def main(argv=None):
     m = sub.add_parser("mock")
     common(m, endpoints=False)
     m.add_argument("--episodes", type=int, default=3)
-    m.add_argument("--policy", default="good", choices=["good", "selfy", "assistant", "parrot"])
+    m.add_argument("--policy", default="good", choices=["good", "selfy", "assistant", "parrot", "bland"])
+    m.add_argument("--mock-ref", action="store_true", help="score vs_ref against a stock-line mock reference")
     m.add_argument("--split", default="train", choices=["train", "heldout"])
     m.add_argument("--json", default=None)
     r = sub.add_parser("run")
@@ -115,11 +147,17 @@ def main(argv=None):
     r.add_argument("--mock", action="store_true")
     e = sub.add_parser("eval")
     common(e)
-    e.add_argument("--version", default="v3")
+    e.add_argument("--version", default="v4")
     e.add_argument("--mock", action="store_true")
     e.add_argument("--ref", default=None)
     e.add_argument("--limit", type=int, default=None)
     e.add_argument("--label", default=None)
+    e.add_argument("--replies", type=int, default=3000, help="run passes over the frozen set until this many replies")
+    e.add_argument("--eval-judge-url", default=None, help="eval-only judge (headline), not the reward judge")
+    e.add_argument("--eval-judge-model", default=None)
+    e.add_argument("--eval-judge-kind", choices=["generative", "forward"], default="generative")
+    e.add_argument("--no-reward-judge", action="store_true", help="skip the reward-judge agreement section")
+    e.add_argument("--gold", default=None, help="frozen human/Claude-labelled JSONL: each judge's agreement")
     c = sub.add_parser("cost")
     c.add_argument("--meter", required=True)
     c.add_argument("--episodes", type=int, required=True)
@@ -143,13 +181,14 @@ def main(argv=None):
         label = a.label or a.policy_model or a.moth_model or ("mock-" + a.policy)
         a.out = a.out or os.path.join(ROOT, "evals", f"rl_{a.version}_" + re.sub(r"[^\w.-]+", "_", label).strip("_"))
         sim, judge = components(a, a.mock)
+        ej = eval_judge(a, a.mock)
         pair_ask = None
-        if a.ref and not a.mock:
-            cl = OAIClient(a.judge_url, a.judge_model)
+        if a.ref and not a.mock:   # checkpoint-vs-checkpoint pairwise: the eval judge's model
+            cl = OAIClient(a.eval_judge_url, a.eval_judge_model)
             pair_ask = lambda p: cl.chat([{"role": "user", "content": p}], temperature=0, max_tokens=300,  # noqa: E731
                                          chat_template_kwargs={"enable_thinking": False})["text"]
-        s = run_eval(a.version, policy_factory(a), sim, judge, a.out, a.ref, pair_ask, a.workers, limit=a.limit,
-                     label=label)
+        s = run_eval(a.version, policy_factory(a), sim, ej, a.out, a.ref, pair_ask, a.workers, limit=a.limit,
+                     label=label, replies=a.replies, reward_judge=None if a.no_reward_judge else judge, gold=a.gold)
         with open(os.path.join(a.out, "report.md"), encoding="utf-8") as f:
             print(f.read())
         write_json(os.path.join(a.out, "meter.json"), {"per_episode": s["cost_per_episode"]}, indent=1)
@@ -168,7 +207,7 @@ def main(argv=None):
         os.makedirs(a.out, exist_ok=True)
     sim, judge = components(a, mock)
     total = CostMeter()
-    eps = run_episodes(specs, pf, sim, judge, a.workers, total=total)
+    eps = run_episodes(specs, pf, sim, judge, a.workers, total=total, ref_policy=ref_policy(a, mock))
     for ep in eps:
         print(show(ep), flush=True)
     per = total.per_episode()

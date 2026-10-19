@@ -5,6 +5,8 @@ episodes, groups, adapters, eval runner, cost meter. CPU only, no endpoint (one 
 """
 import contextlib
 import io
+import json
+import math
 import os
 import random
 import socket
@@ -127,6 +129,8 @@ def test_committed_evals_v3_current_v1_v2_legacy_and_training_agent_messages():
                                                                                          "script"}
     assert not any("home" in s and isinstance(s["home"], dict) for s in doc["specs"])
     assert all(s["system"] == C.student_system(s["card"]) for s in doc["specs"])   # frozen with the current spec
+    d4 = registry.load_eval("v4")   # the multilingual set: every language sliced evenly, probes in English
+    assert {s["lang"] for s in d4["specs"] if s["scenario"] != "script"} == {"en", "zh", "es", "fr", "hi"}
     for v in sorted(registry.LEGACY_EVALS):   # kept untouched (hash still checks), marked legacy
         assert registry.load_eval(v)["sha256"]
     reg = registry.Registry()
@@ -309,6 +313,130 @@ def test_group_rollout_shares_the_first_message_and_advantages():
     assert env.group_advantages(g, "utterance")[0][0] is None
 
 
+# --- anti-blandness -------------------------------------------------------------------------------------------------
+def test_bland_policy_cannot_win_on_gist_alone():
+    sim, judge = mock_parts()
+    spec = spec_of("talk", seed=21)
+    def sft_ref(msgs):   # a frozen reference that picks up a word of the message
+        w = [x for x in msgs[-1]["content"].lower().replace("?", "").split() if len(x) > 3] or ["day"]
+        return f"oh, {w[-1]}? and then what?"
+    ref = env.FnPolicy(sft_ref)
+    k = {"i": 0}
+
+    def mixed(msgs):   # half the group bland, half specific
+        k["i"] += 1
+        u = msgs[-1]["content"]
+        w = [x for x in u.lower().replace("?", "").split() if len(x) > 3] or ["day"]
+        return "aw that's rough" if k["i"] % 2 else f"wait, {w[0]}? was the {w[-1]} a good one or a weird one?"
+    g = env.rollout_group(spec, mixed, 4, sim, judge, ref_policy=ref)
+    bland = [r for e in g for r in e["replies"] if r["text"] == "aw that's rough"]
+    spec_r = [r for e in g for r in e["replies"] if r["text"] != "aw that's rough"]
+    assert bland and spec_r
+    for r in bland:
+        assert r["vec"]["specific"] == -1 and r["vec"]["vs_ref"] is not None and r["vec"]["group_dup"] < 0
+    assert sum(r["vec"]["vs_ref"] for r in bland) < 0   # mostly loses to the reference (the mock is crude)
+    mean = lambda rs: sum(r["scalar"] for r in rs) / len(rs)  # noqa: E731
+    assert mean(bland) <= -2 < mean(spec_r) - 1
+    # on-gist alone does not win: a bland reply the judge calls ON still scores below a specific one
+    reps = [{"text": "aw that's rough", "user": "my boss yelled at me"},
+            {"text": "he yelled? at work? did you yell back or hide in the loo?", "user": "my boss yelled at me"}]
+    on_bland = R.score_replies(reps[:1], C.MOTH_CARD, [{"on": True, "self": False, "specific": False}], prefs=[-1])
+    on_spec = R.score_replies(reps[1:], C.MOTH_CARD, [{"on": True, "self": False, "specific": True}], prefs=[1])
+    assert on_bland[0]["scalar"] == -1.0 and on_spec[0]["scalar"] == 2.0
+    off = R.score_replies(reps[1:], C.MOTH_CARD, [{"on": False, "self": False, "specific": True}])[0]["scalar"]
+    self_best = R.score_replies(reps[1:], C.MOTH_CARD, [{"on": True, "self": True, "specific": True}], prefs=[1])
+    assert self_best[0]["scalar"] < off   # unprompted identity stays the worst move
+    # the reference reply for the shared first message is asked once for the whole group
+    assert len({e["turns"][0]["ref"] for e in g}) == 1
+
+
+def test_group_dup_and_stock_lines():
+    assert R.stock_reply("aw, that's rough!") and R.stock_reply("haha nice") and not R.stock_reply("pasta again?")
+    assert R.stock_reply("哈哈", "zh") and R.near_dup("oh no", "tell me more")   # two stock lines are the same move
+    assert not R.near_dup("the tea! was the cat sorry?", "a new desk? do you get a plant?")
+    sim, judge = mock_parts()
+    same = env.rollout_group(spec_of("talk", seed=5), lambda m: "oh! tell me more about it?", 3, sim, judge)
+    assert all(r["vec"]["group_dup"] == -1.0 for e in same for r in e["replies"])
+    solo = env.run_episode(spec_of("talk", seed=5), lambda m: "oh!", sim, judge)
+    assert all(r["vec"]["group_dup"] is None and r["vec"]["vs_ref"] is None for r in solo["replies"])
+
+
+def test_pairwise_prefs_positions_and_parse():
+    from moth.rl import judge as J
+    turns = [{"user": "i made pasta", "events": [{"say": "the long wiggly kind? did you eat it all?"}]},
+             {"user": "yes", "events": [{"say": "haha nice"}]}]
+    refs = ["haha nice", "wow, all of it? are you a pasta champion now?"]
+    prefs = MockJudge().prefer(C.MOTH_CARD, turns, refs, seed=3)
+    assert prefs == [1, -1]
+    chat, n = J.pair_chat(turns, refs, 3)
+    assert n == 2 and "[P1] X:" in chat and "Y:" in chat
+    seen = {J.flip(s, 0) for s in range(20)}
+    assert seen == {True, False}   # positions really are shuffled
+    mine_is_y = J.flip(3, 0)
+    txt = json.dumps({"pairs": [{"n": 1, "winner": "Y" if mine_is_y else "X"}, {"n": 2, "winner": "tie"}]})
+    assert J.parse_pairs(txt, 2, 3) == [1, 0]
+    with pytest.raises(ValueError):
+        J.parse_pairs('{"pairs": [{"n": 1, "winner": "maybe"}]}', 1, 3)
+    p = J.rl_label_prompt("friend: hi\n[R1] hi!", 1, C.MOTH_CARD)
+    assert '"specific"' in p and "three things" in p
+    with pytest.raises(ValueError):
+        J.parse_rl_labels('{"labels": [{"n": 1, "on": true, "self": false}]}', 1)   # specific is required
+
+
+def test_forward_pass_judge():
+    from moth.rl import judge as J
+
+    class FakeClient:   # P(yes) from the question; P(A) for pairs: A wins when A is the longer reply
+        model = "jev-fake"
+
+        def chat(self, messages, **kw):
+            p = messages[0]["content"]
+            if "Answer A or B" in p:
+                a = p.split("\nA: ")[1].split("\nB: ")[0]
+                b = p.split("\nB: ")[1].split("\nWhich")[0]
+                ya = 0.9 if len(a) > len(b) else 0.1
+                top = [{"token": "A", "logprob": math.log(ya)}, {"token": "B", "logprob": math.log(1 - ya)}]
+            else:
+                yes = 0.2 if "own identity" in p else 0.8
+                top = [{"token": " yes", "logprob": math.log(yes)}, {"token": " no", "logprob": math.log(1 - yes)}]
+            return {"text": "", "logprobs": {"content": [{"top_logprobs": top}]}, "usage": {}}
+    j = J.ForwardPassJudge(FakeClient())
+    turns = [{"user": "i made pasta", "events": [{"say": "the long wiggly kind?"}]}]
+    labs = j.label(C.MOTH_CARD, turns)
+    assert labs[0]["on"] and labs[0]["specific"] and not labs[0]["self"] and labs[0]["p"]["on"] == 0.8
+    assert j.prefer(C.MOTH_CARD, turns, ["ok"], seed=1) == [1]
+    assert j.model_id == "fwd:jev-fake"
+    assert J.token_prob({"content": [{"top_logprobs": [{"token": "maybe", "logprob": 0.0}]}]}, ("yes",), ("no",)) is None
+
+
+# --- multilingual -----------------------------------------------------------------------------------------------------
+def test_language_aware_checks():
+    assert R.c_format("我今天很开心 OK", "zh") == 0 and R.c_format("Hola, ¿qué tal?", "es") == -1
+    assert R.c_format("नमस्ते दोस्त", "hi") == 0 and R.c_format("salut, ça va ?", "fr") == 0
+    assert R.c_assistant("como ia, no puedo", "hola", "es") == -1 and R.c_assistant("作为一个人工智能，我不能", "你好", "zh") == -1
+    assert R.c_assistant("मैं आपकी कैसे मदद कर सकता हूँ", "नमस्ते", "hi") == -1
+    assert R.c_assistant("¡qué rico! ¿con queso?", "hice pasta", "es") == 0
+    assert R.c_length("我" * 30) == 0 and R.c_length("我" * 80) == -1   # CJK counted by characters
+    assert R.c_repeat("今天天气很好啊", "x", ["今天天气很好啊"]) == -1
+    sim, judge = mock_parts()
+    spec = spec_of("talk", seed=6)
+    spec["lang"] = "zh"
+    ep = env.run_episode(spec, lambda m: "哈哈 OK", sim, judge)
+    assert ep["lang"] == "zh" and all(r["vec"]["format"] == 0 for r in ep["replies"])
+    assert "Chinese" in __import__("moth.rl.sim", fromlist=["x"]).sim_language(spec) or not hasattr(C, "LANG_NAMES")
+
+
+def test_eval_specs_have_language_slices():
+    if not hasattr(C, "LANGS"):
+        pytest.skip("core without chat languages")
+    reg = tmp_reg()
+    specs = registry.build_eval_specs(reg, per_card=5)
+    langs = {s["lang"] for s in specs if s["scenario"] != "script"}
+    assert langs == set(C.LANGS) and all(s["lang"] == "en" for s in specs if s["scenario"] == "script")
+    tr = [registry.sample_spec(reg, random.Random(i)) for i in range(300)]
+    assert {s["lang"] for s in tr} == set(C.LANGS)
+
+
 # --- concurrency ----------------------------------------------------------------------------------------------------
 def test_groups_run_concurrently_and_deterministically():
     import threading
@@ -353,7 +481,8 @@ def test_no_home_scenarios_and_legacy_home_specs_skipped():
     d["sha256"] = registry._digest(d["specs"])
     llm.write_json(path, d)
     sim, judge = mock_parts()
-    s = evalrun.run_eval("h", lambda: env.MockPolicy(), sim, judge, tempfile.mkdtemp(), root=reg.root, limit=10)
+    s = evalrun.run_eval("h", lambda: env.MockPolicy(), sim, judge, tempfile.mkdtemp(), root=reg.root, limit=10,
+                         replies=0)
     assert s["skipped_home_specs"] == 1 and "home" not in s["by_scenario"] and s["n_specs"] == 9
 
 
@@ -363,7 +492,7 @@ def test_eval_sim_temperature_defaults():
     from moth.rl.__main__ import components
     for cmd, want in (("eval", 0.0), ("run", 1.0)):
         a = argparse.Namespace(cmd=cmd, out=None, sim_url="http://127.0.0.1:9/v1", sim_model="m", judge_url="x",
-                               judge_model="j", sim_temperature=None)
+                               judge_model="j", sim_temperature=None, judge_kind="generative")
         assert components(a, False)[0].temperature == want
 
 
@@ -416,26 +545,71 @@ def test_grpo_rollouts_and_turn_advantages():
 
 
 # --- eval runner ----------------------------------------------------------------------------------------------------
-def test_eval_runner_and_pairwise():
+def eval_judge():
+    return MockJudge(name="mock-eval-judge", role="eval_judge")
+
+
+def test_eval_runner_judges_cis_passes_and_pairwise():
     reg = tmp_reg()
     registry.freeze("t", reg, reg.root, per_card=1)
-    sim, judge = mock_parts()
+    sim = MockSimulator()
     out_s, out_g = tempfile.mkdtemp(), tempfile.mkdtemp()
-    s_bad = evalrun.run_eval("t", lambda: env.MockPolicy("selfy"), sim, judge, out_s, root=reg.root, limit=30)
-    s = evalrun.run_eval("t", lambda: env.MockPolicy(), sim, judge, out_g, root=reg.root, limit=30,
-                         ref=os.path.join(out_s, "results.json"))
+    s_bad = evalrun.run_eval("t", lambda: env.MockPolicy("selfy"), sim, eval_judge(), out_s, root=reg.root, limit=30,
+                             replies=0)
+    s = evalrun.run_eval("t", lambda: env.MockPolicy(), sim, eval_judge(), out_g, root=reg.root, limit=30,
+                         replies=300, reward_judge=MockJudge(), ref=os.path.join(out_s, "results.json"))
     a = s["all"]
-    for k in ("on_gist", "self", "follows_card", "assistant", "repeat", "reward"):
-        assert a[k] is not None, k
-    assert a["self"] < s_bad["all"]["self"] and a["follows_card"] >= s_bad["all"]["follows_card"]
-    assert s["pairwise"]["pairs"] == 30 and s["pairwise"]["A_wins"] > s["pairwise"]["B_wins"]
+    assert s["passes"] > 1 and a["replies"] >= 300 and s["eval_judge"] == "mock-eval-judge"
+    for k in ("on_gist", "self", "specific", "follows_card", "assistant", "repeat"):
+        assert a[k]["lo"] <= a[k]["pct"] <= a[k]["hi"] and a[k]["n"] > 0, k
+    assert a["reward"]["lo"] <= a["reward"]["mean"] <= a["reward"]["hi"]
+    assert a["self"]["pct"] < s_bad["all"]["self"]["pct"]
+    assert any("too noisy" in w for w in s["warnings"])   # < 3000 replies
+    rj = s["reward_judge_vs_eval_judge"]
+    assert rj["judge"] == "mock-judge" and rj["on"]["n"] > 0 and rj["on"]["kappa"] == 1.0   # same heuristic
+    assert {p["sample"] for p in llm.read_json(os.path.join(out_g, "pairwise.json"))} == {0}   # ref ran 1 pass
     recs = llm.read_json(os.path.join(out_g, "results.json"))
     assert {"cat", "name", "seed", "sample", "card_id", "turns"} <= set(recs[0])
-    assert "on_gist" in open(os.path.join(out_g, "report.md"), encoding="utf-8").read()
-    assert s["cost_per_episode"]["judge"]["calls"] == 1
+    assert len({r["sample"] for r in recs}) == s["passes"]
+    rep_md = open(os.path.join(out_g, "report.md"), encoding="utf-8").read()
+    assert "headline judge: **mock-eval-judge**" in rep_md and "[" in rep_md and "lang en" in rep_md
+    cj = s["cost_per_episode"]["eval_judge"]   # identical scripted chats across passes hit the cache
+    assert cj["calls"] + cj["cached"] == pytest.approx(1.0, abs=0.02) and "judge" not in s["cost_per_episode"]
+    with pytest.raises(ValueError):   # the headline judge must not be the reward judge
+        evalrun.run_eval("t", lambda: env.MockPolicy(), sim, MockJudge(), out_g, root=reg.root, limit=3,
+                         reward_judge=MockJudge(), replies=0)
 
 
-# --- endpoints, cost ------------------------------------------------------------------------------------------------
+def test_wilson_interval():
+    w = evalrun.wilson(10, 1000)
+    assert w["pct"] == 1.0 and 0.5 < w["lo"] < 1.0 < w["hi"] < 1.9
+    assert evalrun.wilson(0, 0) is None and evalrun.wilson(0, 50)["lo"] == 0.0
+
+
+def test_gold_agreement():
+    from moth.rl import judge as J
+    gold = os.path.join(tempfile.mkdtemp(), "gold.jsonl")
+    rows = [{"id": "g1", "card": "moth", "labeler": "human",
+             "turns": [{"user": "my cat knocked my tea over", "say": "oh no, the tea! was the cat sorry?"},
+                       {"user": "i got the job!!!", "say": "aw that's rough"}],
+             "labels": [{"on": True, "self": False, "specific": True}, {"on": False, "self": False, "specific": False}]},
+            {"id": "g2", "card": {"id": "x", "name": "bo", "kind": "a small cat", "refs": ["cat", "paw"]},
+             "labeler": "claude", "turns": [{"user": "how was your day", "say": "i'm just a little cat. paws!"}],
+             "labels": [{"on": False, "self": True, "specific": False}]}]
+    llm.write_text(gold, "\n".join(json.dumps(r) for r in rows) + "\n")
+    g = J.load_gold(gold)
+    a = J.agreement(MockJudge(), g)
+    assert a["chats"] == 2 and a["on"]["n"] == 3 and a["self"]["acc"] == 1.0 and a["specific"]["n"] == 3
+    assert J.kappa([True, False, True, False], [True, False, False, False]) == 0.5
+    # bake-off labelled_replies.jsonl lines: only the ones with a hand label count
+    llm.write_text(gold, json.dumps({"card": {"id": "moth"}, "lang": "es", "friend": "hice pasta", "text": "¿con queso?",
+                                     "labels": {"qwen": {"on": True}}, "human": {"on": True, "self": False}}) + "\n"
+                   + json.dumps({"card": {}, "friend": "x", "text": "y", "labels": {}}) + "\n")
+    g2 = J.load_gold(gold)
+    assert len(g2) == 1 and g2[0]["labeler"] == "human" and g2[0]["card"]["lang"] == "es"
+
+
+# --- endpoints, cost# --- endpoints, cost ------------------------------------------------------------------------------------------------
 def _free_port():
     with socket.socket() as so:
         so.bind(("127.0.0.1", 0))

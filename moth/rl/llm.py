@@ -167,5 +167,5 @@ class OAIClient:
         ct = u.get("completion_tokens") or est_tokens(text)
         if meter is not None:
             meter.add(role, pt, ct, time.time() - t0, est=est)
-        return {"text": text, "finish_reason": ch.get("finish_reason"), "usage": {"prompt_tokens": pt,
-                                                                                    "completion_tokens": ct}}
+        return {"text": text, "finish_reason": ch.get("finish_reason"), "logprobs": ch.get("logprobs"),
+                "usage": {"prompt_tokens": pt, "completion_tokens": ct}}

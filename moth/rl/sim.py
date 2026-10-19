@@ -60,13 +60,32 @@ def directive(spec: dict, i: int) -> str:
     return d
 
 
+def sim_language(spec: dict) -> str:
+    """'' for English; else: write in the chat's language (the friend side of a multilingual chat)."""
+    lang = spec.get("lang") or (spec.get("card") or {}).get("lang") or "en"
+    if lang == "en":
+        return ""
+    try:
+        from moth.cards import LANG_NAMES
+        name = LANG_NAMES.get(lang, lang)
+    except ImportError:
+        name = lang
+    return (f"Write every message in {name}, the way a native speaker types in a chat app. Coding agent messages stay "
+            "in English.")
+
+
 def sim_prompt(spec: dict, turns: list[dict], i: int) -> str:
     card = spec["card"]
     name = display_name(card)
     agent = spec["scenario"] == "agent"
-    p = USER_SIM_PROMPT.format(name=name, who=describe(card), persona=spec["persona"], scenario=spec["goal"],
-                               topic="the AI agent" if agent else spec["topic"], turns=spec["turns"], i=i,
-                               transcript=transcript(turns, name))
+    kw = dict(name=name, who=describe(card), persona=spec["persona"], scenario=spec["goal"],
+              topic="the AI agent" if agent else spec["topic"], turns=spec["turns"], i=i,
+              transcript=transcript(turns, name))
+    lang_line = sim_language(spec)
+    if "{language}" in USER_SIM_PROMPT:
+        p = USER_SIM_PROMPT.format(**kw, language=lang_line)
+    else:
+        p = USER_SIM_PROMPT.format(**kw) + ("\n" + lang_line if lang_line else "")
     mine = [t["user"] for t in turns if not t["user"].startswith(AGENT_TAG)]
     if mine:
         p += SIM_NO_REPEAT.format(prev=" / ".join(f'"{x[:100]}"' for x in mine[-8:]))

@@ -21,11 +21,14 @@ from __future__ import annotations
 class TinyAgentPolicy:
 
     def __init__(self, model, tok, device: str = "cpu", max_turn_tokens: int = 64, temperature: float = 1.0,
-                 max_len: int = 2048, seed: int | None = None):
+                 max_len: int = 2048, seed: int | None = None, stateless: bool = False):
+        """stateless=True: every call re-encodes the whole chat in a fresh cache (for the frozen reference policy,
+        whose context continues with the trained policy's replies, not its own)."""
         import torch
         self.torch = torch
         self.model, self.tok, self.device = model, tok, device
         self.max_turn_tokens, self.temperature, self.max_len = max_turn_tokens, temperature, max_len
+        self.stateless = stateless
         self.im_end = tok.token_to_id("<|im_end|>")
         self.gen = torch.Generator(device="cpu")
         if seed is not None:
@@ -48,7 +51,7 @@ class TinyAgentPolicy:
 
         from tiny_agent.chat import render
         from tiny_agent.generate import append
-        if self.cache is None:
+        if self.cache is None or self.stateless:
             self.start(None)
         if self.n_msgs == 0:
             feed = self.enc(render(messages, add_generation_prompt=True))

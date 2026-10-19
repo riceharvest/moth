@@ -101,7 +101,7 @@ def collides_heldout(card: dict) -> bool:
 def card_split(card: dict) -> str:
     if card.get("split") in ("train", "heldout"):
         return card["split"]
-    if collides_heldout(card):
+    if collides_heldout(card) or (hasattr(C, "is_heldout") and C.is_heldout(card)):
         return "heldout"
     return "heldout" if bucket("card:" + card["id"]) < HELDOUT_PCT else "train"
 
@@ -326,7 +326,8 @@ def make_spec(card: dict, scenario: str, rng: random.Random, seed: int, agent_ms
     """A fully resolved episode spec (JSON-serialisable): everything the simulator and policy need."""
     spec = {"id": sid or f"{card['id']}:{scenario}:{seed}", "seed": seed, "scenario": scenario, "card": card,
             "card_id": card["id"], "system": C.student_system(card), "topic": rng.choice(TOPICS),
-            "turns": turns or rng.choice(TURN_CHOICES), "script": None, "agent_msgs": [], "recall": None}
+            "turns": turns or rng.choice(TURN_CHOICES), "script": None, "agent_msgs": [], "recall": None,
+            "lang": card.get("lang") or "en"}
     if scenario == "agent":
         spec["persona"], spec["goal"] = rng.choice(AGENT_USER_PERSONAS), rng.choice(AGENT_SCENARIOS)
         if not agent_msgs and not _WARNED:
@@ -355,7 +356,7 @@ def script_spec(card: dict, name: str, lines: list[str], check, seed: int) -> di
     return {"id": f"{card['id']}:{name}", "seed": seed, "scenario": "script", "name": name, "card": card,
             "card_id": card["id"], "system": C.student_system(card), "script": list(lines),
             "check": list(check) if isinstance(check, tuple) else check, "turns": len(lines), "agent_msgs": [],
-            "recall": None, "persona": "", "goal": "", "topic": ""}
+            "recall": None, "persona": "", "goal": "", "topic": "", "lang": "en"}
 
 
 def sample_spec(reg: Registry, rng: random.Random, split: str = "train", mix: dict | None = None,
@@ -364,6 +365,8 @@ def sample_spec(reg: Registry, rng: random.Random, split: str = "train", mix: di
     scenario = rng.choices(list(mix), weights=list(mix.values()))[0]
     card = reg.sample_card(rng, split)
     seed = rng.randrange(1 << 31)
+    if hasattr(C, "sample_lang") and "lang" not in card:   # the chat language (core: LANGS shares)
+        card = {**card, "lang": C.sample_lang(random.Random(seed ^ 0x5EED))}
     return make_spec(card, scenario, random.Random(seed), seed, agent_msgs)
 
 
@@ -382,7 +385,7 @@ def _digest(specs: list[dict]) -> str:
     return _h(json.dumps(specs, sort_keys=True, ensure_ascii=False))
 
 
-def build_eval_specs(reg: Registry, per_card: int = 4, seed: int = 1947) -> list[dict]:
+def build_eval_specs(reg: Registry, per_card: int = 5, seed: int = 1947, multilingual: bool = True) -> list[dict]:
     """Held-out cards in the template and with each a held-out phrasing, plus moth and blank: one sim episode per
     scenario (cycled, per_card of them) and the scripted who-are-you probes for each."""
     from moth.probes import CARD_PROBES, stable_seed
@@ -398,19 +401,23 @@ def build_eval_specs(reg: Registry, per_card: int = 4, seed: int = 1947) -> list
                 break
     cards += [reg.card("moth"), reg.card("blank")]
     specs = []
+    langs = list(getattr(C, "LANGS", {})) if multilingual else []
     for j, c in enumerate(cards):
+        base = c
         for k in range(per_card):
             scen = SCENARIOS[(j + k) % len(SCENARIOS)]
+            if langs:   # per-language slices: languages cycle over the chat specs (probes stay English)
+                c = {**base, "lang": langs[(j * per_card + k) % len(langs)]}
             s = stable_seed(f"rl:{c['id']}:{scen}", k)
             specs.append(make_spec(c, scen, random.Random(s + seed), s, agent))
         for _, name, lines, check in CARD_PROBES:
-            specs.append(script_spec(c, name, lines, check, stable_seed(f"rl:{c['id']}:{name}", 0)))
+            specs.append(script_spec(base, name, lines, check, stable_seed(f"rl:{base['id']}:{name}", 0)))
     ids = [s["id"] for s in specs]
     assert len(ids) == len(set(ids)), "eval spec ids must be unique"
     return specs
 
 
-def freeze(version: str, reg: Registry | None = None, root: str = POOL_DIR, per_card: int = 4) -> str:
+def freeze(version: str, reg: Registry | None = None, root: str = POOL_DIR, per_card: int = 5) -> str:
     path = eval_path(version, root)
     if os.path.exists(path):
         raise FileExistsError(f"{path} exists: frozen eval sets are never overwritten; pick a new version")
@@ -482,7 +489,7 @@ def main(argv=None):
     a_ph.add_argument("tmpl")
     a_fr = sub.add_parser("freeze")
     a_fr.add_argument("version")
-    a_fr.add_argument("--per-card", type=int, default=4)
+    a_fr.add_argument("--per-card", type=int, default=5)
     a = ap.parse_args(argv)
     reg = Registry(a.root)
     if a.cmd == "list":

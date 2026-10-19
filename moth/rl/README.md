@@ -6,14 +6,41 @@ a reward vector plus a weighted scalar. Module map: `__init__.py`. Reward defini
 
 ```
 python -m moth.rl mock --episodes 3                         # the whole loop on CPU, no endpoint
-python -m moth.rl.registry add --line "you are a cat named bo"   # grow the card pool; freeze v3 when it has grown
-python -m moth.rl eval --version v3 --moth-model runs/x/model --sim-url URL --judge-url URL [--ref A/results.json]
+python -m moth.rl.registry add --line "you are a cat named bo"   # grow the card pool; freeze v5 when it has grown
+python -m moth.rl eval --version v4 --moth-model runs/x/model --sim-url URL --eval-judge-url EVAL_URL [--judge-url REWARD_URL] [--ref A/results.json]
 python -m pytest -q tests/test_rl_env.py
 ```
 
-Eval runs use simulator temperature 0 by default (training uses 1.0). `eval_v3` is the current frozen set. `eval_v1`
-and `eval_v2` are legacy: they were frozen under the old tools/home spec and their system prompts are stale. They are
-kept untouched for old comparisons, and their "home" specs are skipped.
+## Reward, judges, eval
+
+- **Reward per reply** (`reward.py` has the table): on_gist, self, specific, vs_ref, group_dup, assistant, repeat,
+  length, format, card, recall. On-gist alone no longer wins. A stock "aw that's rough" scores
+  1 − 1 (not specific) − 1 (loses to the frozen SFT reference) − 1 (all G rollouts say it) = −2. A specific on-gist
+  reply that beats the reference scores +2. Unprompted identity (weight 4) is still the worst move.
+- **Reference:** `--ref-policy-url` / `run_episode(ref_policy=...)` takes the frozen SFT checkpoint (stateless;
+  `TinyAgentPolicy(stateless=True)` on CPU). Its reply on the same context is asked once per context (cached across a
+  group). The judge picks per reply with shuffled positions: one extra judge call per chat.
+- **Two judge slots, never the same model:**
+  - The reward judge (training) is `--judge-kind generative` (Qwen JSON labels) or `forward` (JEV-style P(yes)
+    from one forward pass per question).
+  - The eval judge (`--eval-judge-url`, e.g. GEV, non-Qwen allowed) gives every headline number. The reward judge
+    only appears as an agreement table against it; `run_eval` refuses the same model in both slots.
+  - `--gold labels.jsonl` (hand/Claude labels, chat- or reply-level, see `judge.py`) reports each judge's accuracy
+    and kappa.
+- **Eval size:** `--replies 3000` (the default) runs passes over the frozen set, re-seeding each pass, until there are
+  that many replies; a 1% identity rate is then about 30 events. Every rate has a 95% Wilson interval, and the reward
+  mean has a normal interval. The simulator runs at temperature 0 by default (training: 1.0).
+- **Languages:** cards and specs carry `lang` (core `cards.LANGS`: en/zh/es/fr/hi).
+  - The simulator writes in it.
+  - The format check forbids capitals only in cased scripts.
+  - The assistant phrases are per language.
+  - Length counts CJK by characters.
+  - The eval report has a slice per language.
+- **Frozen sets:**
+  - `eval_v4` is current: 216 specs, each held-out card chatting once in every language; the who-are-you probes
+    stay English.
+  - `eval_v3` is English only.
+  - `eval_v1`/`v2` are legacy: frozen under the old tools/home spec, kept untouched, and their home specs are skipped.
 
 ## Plugging into tiny-agent GRPO
 
@@ -102,7 +129,7 @@ Differences from the task-GRPO path:
   - `signed_rebalance` and segment flags: a pure chatbot makes no tool calls.
   - `base_reward`.
 - **Staleness:** keep `roller.version` in the policy's extras and drop groups older than `--max_stale`, as before.
-- **Eval every N steps:** `moth.rl.evalrun.run_eval("v2", lambda: TinyAgentPolicy(model, tok), sim0, judge, out)`,
+- **Eval every N steps:** `moth.rl.evalrun.run_eval("v4", lambda: TinyAgentPolicy(model, tok), sim0, eval_judge, out, reward_judge=judge)`,
   where `sim0` is an `LLMSimulator` at temperature 0. Report `summary["heldout"]`; pairwise against the previous
   checkpoint goes through `ref=`.
 - **Cost:** `meter.per_episode()`, then `python -m moth.rl cost` with the measured tok/s and the box price.

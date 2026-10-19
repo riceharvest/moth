@@ -21,6 +21,8 @@ and "cost" (this episode's calls/tokens per role).
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import statistics
 import threading
@@ -98,8 +100,8 @@ AGENT_REACT = [(r"\b(fail|broke|error|crash|couldn'?t|out of memory)", "oh no, i
 
 class MockPolicy:
     """Deterministic replies for tests and mock runs. mode: good (answers the gist, follows the card when asked,
-    recalls), selfy (talks about its identity), assistant (assistant-speak), parrot (the same line every turn).
-    Stateful: one per thread (pass a factory)."""
+    recalls), selfy (talks about its identity), assistant (assistant-speak), parrot (the same line every turn),
+    bland (on-gist-ish stock lines: "aw that's rough", "haha nice"...). Stateful: one per thread (pass a factory)."""
 
     def __init__(self, mode: str = "good"):
         self.mode, self.card, self.k = mode, None, 0
@@ -115,6 +117,8 @@ class MockPolicy:
             return "Great question! How can I help you with that today?"
         if self.mode == "parrot":
             return "i like the blue window and the purple sock."
+        if self.mode == "bland":
+            return ["aw that's rough", "haha nice", "oh no", "tell me more", "that's so cool"][self.k % 5]
         if self.mode == "selfy":
             refs = sorted({r.rstrip("*") for r in card.get("refs") or []} - GENERIC_REFS)
             noun = (card.get("kind") or "buddy").split()[-1]
@@ -164,8 +168,13 @@ def _canonical(turns: list[dict]) -> list[dict]:
 
 
 def run_episode(spec: dict, policy, sim: Simulator, judge: Judge, meter: CostMeter | None = None,
-                weights: dict | None = None, first_user: str | None = None, score_mode: str = "mean") -> dict:
+                weights: dict | None = None, first_user: str | None = None, score_mode: str = "mean",
+                ref_policy=None, ref_cache: dict | None = None) -> dict:
+    """ref_policy: the frozen SFT reference (stateless and thread-safe, e.g. OpenAIPolicy(meter_role="ref")): after
+    every policy reply it answers the same context; the judge then compares the two (reward component vs_ref).
+    ref_cache shares reference replies between rollouts with the same context (a group's first turn)."""
     meter = meter if meter is not None else CostMeter()
+    ref_policy = as_policy(ref_policy) if ref_policy is not None else None
     policy = as_policy(policy)
     prev, _CTX.meter = getattr(_CTX, "meter", None), meter
     try:
@@ -194,11 +203,29 @@ def run_episode(spec: dict, policy, sim: Simulator, judge: Judge, meter: CostMet
             raw = out.pop("raw", None)
             if raw is not None:
                 ev["raw"] = raw
+            turn = {"user": u, "events": [ev], "extra": out}
+            if ref_policy is not None:
+                turn["ref"] = reference(ref_policy, chat + [{"role": "user", "content": u}], ref_cache)
             chat += [{"role": "user", "content": u}, {"role": "assistant", "content": text_out}]
-            turns.append({"user": u, "events": [ev], "extra": out})
+            turns.append(turn)
         return score_episode(spec, turns, judge, meter, weights, score_mode)
     finally:
         _CTX.meter = prev
+
+
+def reference(ref_policy, messages: list[dict], cache: dict | None = None) -> str:
+    k = hashlib.sha256(json.dumps(messages, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    if cache is not None and k in cache:
+        return cache[k]
+    out = ref_policy.generate(messages)
+    text = (out if isinstance(out, str) else out.get("text", "")).strip()
+    if cache is not None:
+        cache.setdefault(k, text)
+    return text
+
+
+def lang_of_spec(spec: dict) -> str:
+    return spec.get("lang") or (spec.get("card") or {}).get("lang") or "en"
 
 
 def replies_from_turns(spec: dict, turns: list[dict]) -> list[dict]:
@@ -224,8 +251,13 @@ def score_episode(spec: dict, turns: list[dict], judge: Judge, meter: CostMeter 
     meter = meter if meter is not None else CostMeter()
     rec = spec.get("recall") or {}
     replies = replies_from_turns(spec, turns)
-    labels = judge.label(spec["card"], [{"user": t["user"], "events": t["events"]} for t in turns], meter)
-    scored = R.score_replies(replies, spec["card"], labels, rec or None, weights)
+    tv = [{"user": t["user"], "events": t["events"]} for t in turns]
+    labels = judge.label(spec["card"], tv, meter)
+    prefs = None
+    if turns and all("ref" in t for t in turns):
+        prefs = judge.prefer(spec["card"], tv, [t["ref"] for t in turns], spec["seed"], meter)
+    lang = lang_of_spec(spec)
+    scored = R.score_replies(replies, spec["card"], labels, rec or None, weights, prefs, lang)
     for r, s in zip(replies, scored):
         r.update(s)
         r["assistant_index"] = r["turn"]
@@ -234,7 +266,9 @@ def score_episode(spec: dict, turns: list[dict], judge: Judge, meter: CostMeter 
     return {"spec_id": spec["id"], "seed": spec["seed"], "scenario": spec["scenario"], "card_id": spec["card_id"],
             "card": spec["card"], "system": spec["system"], "name": spec.get("name") or spec["id"],
             "check": spec.get("check"), "turns": turns, "messages": _canonical(turns), "replies": replies,
-            "labels": labels, "judge_ok": labels is not None, "reward": R.episode_score(scored, score_mode),
+            "labels": labels, "prefs": prefs, "lang": lang, "sample": spec.get("sample", 0),
+            "judge_ok": labels is not None,
+            "reward": R.episode_score(scored, score_mode),
             "components": R.component_means(scored), "cost": meter.summary()}
 
 
@@ -274,10 +308,12 @@ def first_message(spec: dict, sim: Simulator, meter: CostMeter | None = None) ->
 
 
 def run_groups(specs: list[dict], G: int, sim: Simulator, judge: Judge, policy=None, policy_factory=None,
-               workers: int = 1, meter: CostMeter | None = None, **kw) -> list[list[dict]]:
+               workers: int = 1, meter: CostMeter | None = None, diversity: bool = True, **kw) -> list[list[dict]]:
     """G rollouts for each spec, all of them `workers` at a time (across groups too). Each group's first simulated
     message is asked once, before the fan-out, and shared by its G rollouts. policy_factory() (called per rollout)
-    gives each rollout its own policy state; a shared `policy` must be thread-safe when workers > 1."""
+    gives each rollout its own policy state; a shared `policy` must be thread-safe when workers > 1.
+    diversity: score group_dup (near-duplicate replies across the G rollouts) and recompute the scalars.
+    kw: run_episode's (weights, score_mode, ref_policy); reference replies are shared through one cache."""
     if policy_factory is None:
         if policy is None:
             raise ValueError("pass policy or policy_factory")
@@ -286,6 +322,8 @@ def run_groups(specs: list[dict], G: int, sim: Simulator, judge: Judge, policy=N
         policy_factory = lambda: policy  # noqa: E731
     firsts = _map(lambda s: first_message(s, sim, meter), specs, workers)
     jobs = [(si, g) for si in range(len(specs)) for g in range(G)]
+    if kw.get("ref_policy") is not None:
+        kw.setdefault("ref_cache", {})
 
     def one(job):
         si, g = job
@@ -296,7 +334,11 @@ def run_groups(specs: list[dict], G: int, sim: Simulator, judge: Judge, policy=N
             meter.merge(m)
         return ep
     eps = _map(one, jobs, workers)
-    return [eps[si * G:(si + 1) * G] for si in range(len(specs))]
+    groups = [eps[si * G:(si + 1) * G] for si in range(len(specs))]
+    if diversity:
+        for g in groups:
+            R.apply_group_diversity(g, kw.get("weights"), kw.get("score_mode", "mean"))
+    return groups
 
 
 def rollout_group(spec: dict, policy, G: int, sim: Simulator, judge: Judge, meter: CostMeter | None = None,
