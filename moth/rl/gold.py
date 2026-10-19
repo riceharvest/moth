@@ -7,10 +7,12 @@ The sheet = n/2 RANDOM replies (uniform over everything given: the unbiased esti
 n/2 STRATIFIED replies (where judges fail: identity-suspect replies flagged by the identity_ref matcher or by any
 judge's "self", borderline gist (judges disagree on "on", or a forward-pass P in 0.35-0.65), and at least 60 per
 language). Each line: {"id", "stratum", "reasons", "card", "lang", "context", "friend", "text", "judge_labels",
-"human": null}. A labeller fills "human": {"on", "self", "specific"}; moth.rl.judge.load_gold reads the filled sheet
+"human": null}. A labeller fills "human": {"on", "self", "specific", "sycophant"}; moth.rl.judge.load_gold reads the filled sheet
 (lines with "human" left null are skipped), and agreement_by_stratum reports each judge's accuracy with a 95%
 interval on the random and the stratified half separately (never pooled: the stratified half is biased on purpose).
-A .csv twin of the sheet is written for spreadsheet labelling.
+A .csv twin of the sheet (with the card's identity text and the chat language) is written for spreadsheet labelling.
+Refresh: build_refresh() samples RL-time replies (eval/run episodes.json with the reward judge's labels kept) where
+the reward judge and the eval judge disagree: `gold-sheet --refresh` (stratum "refresh").
 
 Inputs: moth.rl eval/run episodes.json (episodes with "turns" and the eval judge's "labels") and
 moth.bakeoff_report's labelled_replies.jsonl ({"card", "lang", "friend", "text", "labels": {judge: {...}}}).
@@ -36,10 +38,12 @@ def _items_from_episodes(eps: list[dict], src: str) -> list[dict]:
         i = 0
         for t in e["turns"]:
             for ev in t["events"]:
-                lab = (e.get("labels") or [None] * 999)[i] if e.get("labels") else None
+                lab = e["labels"][i] if e.get("labels") and i < len(e["labels"]) else None
+                rlab = (e.get("reward_judge_labels") or [None] * (i + 1))[i] if e.get("reward_judge_labels") else None
+                jl = {k: v for k, v in (("eval_judge", lab), ("reward_judge", rlab)) if v}
                 out.append({"id": f"{src}:{e.get('spec_id', e.get('name'))}:{e.get('sample', 0)}:{i + 1}", "card": card,
                             "lang": lang, "context": list(ctx), "friend": t["user"], "text": ev["say"],
-                            "judge_labels": {"eval_judge": lab} if lab else {}})
+                            "judge_labels": jl})
                 ctx.append({"user": t["user"], "say": ev["say"]})
                 i += 1
     return out
@@ -79,6 +83,8 @@ def flags(it: dict) -> list[str]:
     ons = {bool(x.get("on")) for x in labs if "on" in x}
     if len(ons) > 1:
         why.append("judges_disagree_on")
+    if len({bool(x.get("self")) for x in labs if "self" in x}) > 1:
+        why.append("judges_disagree_self")
     if any(0.35 <= (x.get("p") or {}).get("on", 0.0) <= 0.65 for x in labs):
         why.append("borderline_p_on")
     return why
@@ -116,18 +122,37 @@ def build_sheet(items: list[dict], n: int = 600, seed: int = 0, per_lang: int = 
     return out
 
 
+def build_refresh(items: list[dict], n: int = 300, seed: int = 0) -> list[dict]:
+    """A refresh batch from RL-time replies: only those where the reward judge and the eval judge disagree (on or
+    self), the place a judge drifts or gets hacked; stratum "refresh" (reported apart from random/stratified)."""
+    rng = random.Random(seed)
+    dis = [it for it in items if {"judges_disagree_on", "judges_disagree_self"} & set(flags(it))]
+    rng.shuffle(dis)
+    return [{"id": it["id"], "stratum": "refresh", "reasons": flags(it), "card": it["card"], "lang": it["lang"],
+             "context": it["context"], "friend": it["friend"], "text": it["text"], "judge_labels": it["judge_labels"],
+             "human": None} for it in dis[:n]]
+
+
+def card_text(card: dict) -> str:
+    """The identity the reply was written under, as the model saw it (the system prompt minus the chat framing)."""
+    from moth import cards as C
+    s = C.student_system(card or {})
+    tail = getattr(C, "STUDENT_TAIL", "")
+    return s[: -len(tail)].strip() if tail and s.endswith(tail) else s
+
+
 def write_sheet(rows: list[dict], path: str):
     with open(path, "w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
     with open(path.rsplit(".", 1)[0] + ".csv", "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["id", "stratum", "lang", "card", "context", "friend", "reply", "human_on", "human_self",
-                    "human_specific"])
+        w.writerow(["id", "stratum", "lang", "card_id", "card_text", "context", "friend", "reply", "human_on",
+                    "human_self", "human_specific", "human_sycophant"])
         for r in rows:
             ctx = " | ".join(f"F: {c['user']} / B: {c['say']}" for c in r["context"][-3:])
-            w.writerow([r["id"], r["stratum"], r["lang"], (r["card"] or {}).get("id"), ctx, r["friend"], r["text"],
-                        "", "", ""])
+            w.writerow([r["id"], r["stratum"], r["lang"], (r["card"] or {}).get("id"), card_text(r["card"]), ctx,
+                        r["friend"], r["text"], "", "", "", ""])
 
 
 def agreement_by_stratum(judge, gold: list[dict]) -> dict:

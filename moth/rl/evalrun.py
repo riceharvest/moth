@@ -1,7 +1,7 @@
 """Eval on a frozen held-out set (pool/eval_<version>.json), scored by a SEPARATE eval judge, in two tiers.
 
 Tiers (TIERS):
-  quick   checkpoint picking during RL: ~2k replies; the moth card, all English specs and a quarter of the rest
+  quick   checkpoint picking during RL: ~2k replies; all English specs and a quarter of the rest
           (en-heavy is fine); run every N steps, with the reward-hacking monitor (moth.rl.monitor).
   full    milestones and release: >= 10k replies AND >= 2k replies in every language (passes go on until both hold;
           eval_v5 is balanced per language). Targets: MDE <= 3 points on on_gist overall, <= 5 per language.
@@ -10,15 +10,19 @@ Tiers (TIERS):
 Judges: the eval judge (eval_judge; e.g. a non-Qwen model such as GEV) labels every chat and gives every headline.
 The reward judge (the one training optimises) is never the headline: when given it labels the same chats and the
 report shows its agreement with the eval judge and its own reward on them (the monitor compares the two). run_eval
-refuses the same model in both slots. gold= adds each judge's agreement with a hand-labelled set (moth.rl.gold).
+refuses the same model FAMILY in both slots (judge.model_family of the served names). The eval judge uses its own holistic
+rubric (judge.EVAL_PROMPT), not the reward judge's LABEL_PROMPT. The headline is marked trusted only when the eval
+judge's kappa vs the gold RANDOM half is >= GOLD_KAPPA on on and self (a full-tier gate). gold= adds each judge's agreement with a hand-labelled set (moth.rl.gold).
 
-Statistics (moth.rl.stats): a chat is the unit. Every rate has a design-effect-adjusted Wilson 95% interval, its
+Statistics (moth.rl.stats): clustered by identity (or chat). Every rate has a design-effect-adjusted Wilson 95% interval, its
 deff and its MDE (smallest difference vs another eval of the same size detectable at 80% power); bootstrap=B adds a
-chat-level cluster-bootstrap interval for the headline rows.
+cluster-bootstrap interval (same clusters) for the headline rows.
 
 Headline (per reply unless noted), from the eval judge: on_gist, self (target <= 1%), specific, follows_card (per
-who-are-you probe), assistant, repeat (components == -1), reward (mean episode score). Rows: ALL, held-out cards,
-the moth card (the shipped default) and its agent reactions (the headline slice), scenario, card group, language.
+who-are-you probe), assistant, repeat (components == -1), sycophant, echo, question rate, language mismatch, on_gist
+with judge failures counted as OFF, quality (eval rubric), reward. HEADLINE = all held-out identities (balanced per
+language; moth is one of them, nothing special); then ALL (+ the blank card), scenario (agent reactions across all
+identities), card group, language. Clusters: the identity where a slice has >= 20 of them, else the chat.
 """
 from __future__ import annotations
 
@@ -43,6 +47,8 @@ TIERS = {
 TARGET_MDE = {"all": 3.0, "lang": 5.0}   # on_gist, points (full tier)
 SELF_MIN_REPLIES = 3000
 RATES = ("on_gist", "self", "specific", "follows_card", "assistant", "repeat")
+EXTRA_RATES = ("on_gist_fail_off", "sycophant", "echo", "question", "lang_mismatch")
+GOLD_KAPPA = 0.6   # eval judge vs the gold RANDOM half (on, self): below it the headline is not trusted
 
 
 def wilson(k: int, n: int) -> dict | None:
@@ -51,38 +57,67 @@ def wilson(k: int, n: int) -> dict | None:
 
 
 def card_group(card_id: str) -> str:
-    if card_id in ("moth", "blank") or card_id.startswith("moth~"):
-        return "moth" if card_id.startswith("moth") else card_id
+    if card_id == "blank":
+        return "blank"
     return "heldout_phrased" if "~" in card_id else "heldout_template"
 
 
-def _per_chat(es: list[dict], rate: str) -> tuple[list[int], list[int]]:
-    ks, ns = [], []
+def _episode_counts(e: dict, rate: str) -> tuple[int, int] | None:
+    """(successes, trials) of one episode for a rate, or None when it doesn't apply."""
+    labs = e["labels"]
+    if rate == "follows_card":
+        if (e.get("check") or [None])[0] != "card":
+            return None
+        return int(bool(to_eval_record(e)["check"])), 1
+    if rate == "on_gist_fail_off":   # judge failures counted as OFF (a judge that can't read a chat is no pass)
+        n = len(e["replies"])
+        return (sum(bool(x.get("on")) for x in labs), n) if labs else (0, n)
+    if rate in ("on_gist", "self", "specific", "sycophant"):
+        if not labs:
+            return 0, 0
+        f, default = {"on_gist": ("on", False), "self": ("self", False), "specific": ("specific", True),
+                      "sycophant": ("sycophant", False)}[rate]
+        return sum(bool(x.get(f, default)) for x in labs), len(labs)
+    if rate == "question":
+        return sum(("?" in r["text"] or "？" in r["text"]) for r in e["replies"]), len(e["replies"])
+    if rate == "lang_mismatch":
+        xs = [r["vec"]["lang"] for r in e["replies"] if r["vec"].get("lang") is not None]
+        return sum(x == -1 for x in xs), len(xs)
+    return sum(r["vec"].get(rate) == -1 for r in e["replies"]), len(e["replies"])
+
+
+MIN_CARD_CLUSTERS = 20
+
+
+def _clustered(es: list[dict], rate: str) -> tuple[list[int], list[int], str]:
+    """Per-cluster counts: clusters are identities (base card id) when the slice has >= MIN_CARD_CLUSTERS of them
+    (card variance dominates), else chats (episodes)."""
+    by_card = len({e["card_id"].split("~")[0] for e in es}) >= MIN_CARD_CLUSTERS
+    agg: dict[str, list[int]] = {}
     for e in es:
-        if rate == "follows_card":
-            if (e.get("check") or [None])[0] == "card":
-                ks.append(int(bool(to_eval_record(e)["check"])))
-                ns.append(1)
+        c = _episode_counts(e, rate)
+        if c is None:
             continue
-        if rate in ("on_gist", "self", "specific"):
-            labs = e["labels"] or []
-            f = {"on_gist": "on", "self": "self", "specific": "specific"}[rate]
-            ks.append(sum(bool(x.get(f, True if f == "specific" else False)) for x in labs))
-            ns.append(len(labs))
-        else:
-            ks.append(sum(r["vec"][rate] == -1 for r in e["replies"]))
-            ns.append(len(e["replies"]))
-    return ks, ns
+        key = e["card_id"].split("~")[0] if by_card else f"{e['spec_id']}#{e.get('sample', 0)}"
+        a = agg.setdefault(key, [0, 0])
+        a[0] += c[0]
+        a[1] += c[1]
+    return [a[0] for a in agg.values()], [a[1] for a in agg.values()], "card" if by_card else "chat"
 
 
 def block(es: list[dict], bootstrap: int = 0) -> dict:
-    out = {"episodes": len(es), "replies": sum(len(e["replies"]) for e in es)}
-    for rate in RATES:
-        ks, ns = _per_chat(es, rate)
+    out = {"episodes": len(es), "replies": sum(len(e["replies"]) for e in es),
+           "identities": len({e["card_id"].split("~")[0] for e in es})}
+    for rate in RATES + EXTRA_RATES:
+        ks, ns, unit = _clustered(es, rate)
         out[rate] = cluster_rate(ks, ns)
-        if bootstrap and out[rate]:
-            out[rate]["boot"] = cluster_bootstrap(ks, ns, bootstrap)
+        if out[rate]:
+            out[rate]["unit"] = unit
+            if bootstrap and rate in RATES:
+                out[rate]["boot"] = cluster_bootstrap(ks, ns, bootstrap)
     out["reward"] = mean_ci([e["reward"] for e in es if e["reward"] is not None])
+    qs = [lb["quality"] for e in es for lb in (e["labels"] or []) if "quality" in lb]
+    out["quality"] = mean_ci(qs) if qs else None
     out["judge_failed"] = sum(e["labels"] is None for e in es)
     return out
 
@@ -95,14 +130,12 @@ def summarize(eps: list[dict], bootstrap: int = 0) -> dict:
         by["card"][card_group(e["card_id"])].append(e)
         by["lang"][e.get("lang") or "en"].append(e)
     held = [e for e in eps if card_group(e["card_id"]).startswith("heldout")]
-    moth = by["card"].get("moth", [])
-    return {"all": block(eps, bootstrap), "heldout": block(held), "moth": block(moth, bootstrap),
-            "moth_agent": block([e for e in moth if e["scenario"] == "agent"], bootstrap),
+    return {"heldout": block(held, bootstrap), "all": block(eps),
             **{f"by_{k}": {g: block(v) for g, v in sorted(d.items())} for k, d in by.items()}}
 
 
-KEYS = ("episodes", "replies", "on_gist", "self", "specific", "follows_card", "assistant", "repeat", "reward",
-        "judge_failed")
+KEYS = ("episodes", "identities", "replies", "on_gist", "on_gist_fail_off", "self", "specific", "follows_card",
+        "sycophant", "echo", "question", "lang_mismatch", "assistant", "repeat", "quality", "reward", "judge_failed")
 
 
 def cell(v) -> str:
@@ -116,16 +149,19 @@ def cell(v) -> str:
 
 
 def rows_of(s: dict) -> list[tuple[str, dict]]:
-    return ([("**ALL**", s["all"]), ("**held-out cards**", s["heldout"]), ("**moth card (shipped)**", s["moth"]),
-             ("**moth card, agent reactions**", s["moth_agent"])]
+    return ([("**HEADLINE: held-out identities**", s["heldout"]), ("ALL (+ blank card)", s["all"])]
             + [(f"{k} {g}", v) for k, g_v in (("scenario", s["by_scenario"]), ("card", s["by_card"]),
                                               ("lang", s["by_lang"])) for g, v in g_v.items()])
 
 
 def report_md(s: dict, title: str) -> str:
-    L = [f"# {title}", "", f"headline judge: **{s.get('eval_judge', '?')}** (eval-only). Rates in % with design-effect-"
-         "adjusted 95% intervals (a chat is the unit).", "", "| group | " + " | ".join(KEYS) + " |",
-         "|---|" + "---|" * len(KEYS)]
+    gated = s.get("headline_gated")
+    L = [f"# {title}", "", f"headline judge: **{s.get('eval_judge', '?')}** (eval-only rubric). Headline = all held-out "
+         "identities, balanced per language. Rates in % with design-effect-adjusted 95% intervals; the cluster is the "
+         "identity (card) where a slice has >= 20 of them, else the chat.", "",
+         "headline trusted: " + ("YES (eval judge agrees with the gold labels)" if gated else
+                                 "**NO** (no gold set, or the eval judge disagrees with it: read as provisional)"), "",
+         "| group | " + " | ".join(KEYS) + " |", "|---|" + "---|" * len(KEYS)]
     for name, b in rows_of(s):
         L.append(f"| {name} | " + " | ".join(cell(b[k]) for k in KEYS) + " |")
     L += ["", "## MDE (points; vs another eval of this size, alpha 0.05, power 0.8) and design effect", "",
@@ -133,9 +169,10 @@ def report_md(s: dict, title: str) -> str:
     for name, b in rows_of(s):
         L.append(f"| {name} | {b['replies']} | " + " | ".join(
             f"{b[r]['mde']} ({b[r]['deff']})" if b[r] else "n/a" for r in RATES) + " |")
-    if s["all"]["on_gist"] and s["all"]["on_gist"].get("boot"):
-        L += ["", "cluster bootstrap (ALL): " + ", ".join(f"{r} {s['all'][r]['boot']}" for r in RATES
-                                                         if s["all"][r] and s["all"][r].get("boot"))]
+    h = s["heldout"]
+    if h.get("on_gist") and h["on_gist"].get("boot"):
+        L += ["", "cluster bootstrap (headline): " + ", ".join(f"{r} {h[r]['boot']}" for r in RATES
+                                                              if h[r] and h[r].get("boot"))]
     for g in s.get("gates", []):
         L += ["", f"GATE {g['name']}: {'PASS' if g['pass'] else 'FAIL'} ({g['why']})"]
     for w in s.get("warnings", []):
@@ -154,6 +191,7 @@ def judge_vs_judge(eps: list[dict], other: Judge) -> dict:
             continue
         tv = [{"user": t["user"], "events": t["events"]} for t in e["turns"]]
         labs = other.label(e["card"], tv)
+        e["reward_judge_labels"] = labs   # gold refresh: replies where the two judges disagree
         if labs is None:
             failed += 1
             continue
@@ -181,12 +219,12 @@ def resample(spec: dict, s: int) -> dict:
 
 
 def tier_specs(specs: list[dict], subset: str) -> list[dict]:
-    """quick: the moth card, every English spec and a fixed quarter of the others; all: everything."""
+    """quick: every English spec and a fixed quarter of the others; all: everything."""
     if subset == "all":
         return specs
 
     def keep(s):
-        if s["card_id"].split("~")[0] == "moth" or (s.get("lang") or "en") == "en":
+        if (s.get("lang") or "en") == "en":
             return True
         return int(hashlib.sha256(s["id"].encode()).hexdigest()[:4], 16) % 4 == 0
     return [s for s in specs if keep(s)]
@@ -256,9 +294,12 @@ def run_eval(version: str, policy_factory, sim: Simulator, eval_judge: Judge, ou
     """tier: "quick" / "full" (TIERS) sets replies, per-language minimum, spec subset and the pairwise gates;
     explicit replies / per_lang override it. refs: {"final2": results.json, "sft": results.json, ...} (ref= is one
     unnamed reference). Legacy sets (v1/v2) still contain "home" specs from the tools era: those are skipped."""
-    if reward_judge is not None and reward_judge.model_id == eval_judge.model_id:
-        raise ValueError(f"eval judge and reward judge are the same model ({eval_judge.model_id}): the headline "
-                         "must come from a judge the policy was not trained against")
+    if reward_judge is not None and reward_judge.family == eval_judge.family:
+        raise ValueError(f"eval judge {eval_judge.model_id} and reward judge {reward_judge.model_id} are the same model "
+                         f"family ({eval_judge.family}): the headline must come from a judge the policy was not "
+                         "trained against")
+    if getattr(eval_judge, "rubric", "eval") != "eval":
+        print("WARNING: the eval judge uses the reward rubric; give it rubric='eval' (its own instrument)", flush=True)
     t = TIERS.get(tier or "", {"replies": SELF_MIN_REPLIES, "per_lang": 0, "subset": "all", "min_pairs": 0})
     replies = t["replies"] if replies is None else replies
     per_lang = t["per_lang"] if per_lang is None else per_lang
@@ -292,7 +333,7 @@ def run_eval(version: str, policy_factory, sim: Simulator, eval_judge: Judge, ou
         warnings.append(f"stopped at {max_passes} passes short of the size target ({replies} replies, {per_lang} per "
                         "language)")
     if tier == "full":
-        og = s["all"]["on_gist"]
+        og = s["heldout"]["on_gist"]
         gates.append({"name": "MDE on_gist overall", "pass": bool(og and og["mde"] <= TARGET_MDE["all"]),
                       "why": f"{og and og['mde']} points (target <= {TARGET_MDE['all']})"})
         worst = max(((lg, b["on_gist"]["mde"]) for lg, b in s["by_lang"].items() if b["on_gist"]),
@@ -312,6 +353,15 @@ def run_eval(version: str, policy_factory, sim: Simulator, eval_judge: Judge, ou
         s["gold"] = {"path": gold, "chats": len(g), "eval_judge": agreement_by_stratum(eval_judge, g)}
         if reward_judge is not None:
             s["gold"]["reward_judge"] = agreement_by_stratum(reward_judge, g)
+        rnd = s["gold"]["eval_judge"].get("random") or s["gold"]["eval_judge"].get("all") or {}
+        ks = [(rnd.get(f) or {}).get("kappa") for f in ("on", "self")]
+        s["headline_gated"] = all(k is not None and k >= GOLD_KAPPA for k in ks)
+        gates.append({"name": "eval judge vs gold (random half)", "pass": s["headline_gated"],
+                      "why": f"kappa on {ks[0]}, self {ks[1]} (need >= {GOLD_KAPPA})"})
+    else:
+        s["headline_gated"] = False
+        if tier == "full":
+            gates.append({"name": "eval judge vs gold (random half)", "pass": False, "why": "no --gold given"})
     os.makedirs(out, exist_ok=True)
     write_json(os.path.join(out, "results.json"), recs)
     write_json(os.path.join(out, "episodes.json"), eps)

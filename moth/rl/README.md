@@ -13,57 +13,143 @@ python -m pytest -q tests/test_rl_env.py
 
 ## Reward, judges, eval
 
-- **Reward per reply** (`reward.py` has the table): on_gist, self, specific, vs_ref, group_dup, assistant, repeat,
-  length, format, card, recall. On-gist alone no longer wins. A stock "aw that's rough" scores
-  1 − 1 (not specific) − 1 (loses to the frozen SFT reference) − 1 (all G rollouts say it) = −2. A specific on-gist
-  reply that beats the reference scores +2. Unprompted identity (weight 4) is still the worst move.
-- **Reference:** `--ref-policy-url` / `run_episode(ref_policy=...)` takes the frozen SFT checkpoint (stateless;
-  `TinyAgentPolicy(stateless=True)` on CPU). Its reply on the same context is asked once per context (cached across a
-  group). The judge picks per reply with shuffled positions: one extra judge call per chat.
-- **Two judge slots, never the same model:**
-  - The reward judge (training) is `--judge-kind generative` (Qwen JSON labels) or `forward` (JEV-style P(yes)
-    from one forward pass per question).
-  - The eval judge (`--eval-judge-url`, e.g. GEV, non-Qwen allowed) gives every headline number. The reward judge
-    only appears as an agreement table against it; `run_eval` refuses the same model in both slots.
-  - `--gold labels.jsonl` (hand/Claude labels, chat- or reply-level, see `judge.py`) reports each judge's accuracy
-    and kappa.
-- **Eval tiers** (`--tier`, `evalrun.TIERS`), on the frozen `eval_v5`:
-  - `quick` is for picking checkpoints during RL, every N steps: about 2k replies, en-heavy (the moth card, every
-    English spec and a quarter of the rest).
-  - `full` is for milestones and the release: at least 10k replies AND at least 2k per language (passes over the
-    frozen set re-seed until both hold).
-  - `full` gates: on_gist MDE ≤ 3 points overall and ≤ 5 per language; pairwise vs final2 (`--ref-final2`, final2 run
-    with `--legacy-prompt`) and vs the SFT checkpoint (`--ref-sft`) need ≥ 1000 pairs each and a win-rate interval
-    above 50%.
-- **Statistics** (`stats.py`): a chat is the unit.
-  - Every rate has a design-effect-adjusted Wilson 95% interval, its deff, and its MDE: the smallest difference vs
-    another eval of the same size detectable at alpha 0.05 and power 0.8.
-  - `--bootstrap B` adds a chat-level cluster bootstrap for the headline rows.
-  - `python -m moth.rl plan --deff D` prints the MDE table for planned sizes.
-- **Report rows:** ALL, held-out cards, the moth card (the shipped default) and its agent reactions (the headline
-  slice), then scenario, card group and language.
-- **Reward-hacking monitor:** `--monitor runs/x/hack.jsonl --step N` on the quick eval logs the reward judge's reward
-  next to the eval judge's on_gist and the win rate vs final2. It flags when the reward rises by ≥ `--monitor-rise`
-  over 3 evals while those stay flat (within their MDE) or fall (`monitor.py`).
-- **Gold set:** `python -m moth.rl gold-sheet --inputs <episodes.json | labelled_replies.jsonl> --out sheet.jsonl`
-  writes 600 replies (+ a .csv): 300 random and 300 stratified.
-  - Stratified means identity-suspect (matcher or any judge's self), borderline gist (judges disagree, or a
-    forward-pass P near 0.5), and at least 60 per language.
-  - Fill the `human` column, then pass `--gold sheet.jsonl`. Each judge's accuracy is reported with intervals on the
-    random and the stratified half separately.
-- **Languages:** cards and specs carry `lang` (core `cards.LANGS`: en/zh/es/fr/hi).
-  - The simulator writes in it.
-  - The format check forbids capitals only in cased scripts.
-  - The assistant phrases are per language.
-  - Length counts CJK by characters.
+- **Reward per reply** (`reward.py` has the table and the weights):
+  - Judge-based: on_gist, self, specific, sycophant, vs_ref.
+  - Group-based: group_dup.
+  - Deterministic: echo, q_rate, lang, assistant, repeat, length, format, card, recall.
+- **On-gist alone never wins.**
+  - A stock "aw that's rough" scores −2.
+  - The echo-question exploit ("oh, pasta? what kind of pasta?" every turn) is closed four ways:
+    - the judge rubric says echoing the friend's word back is NOT specific;
+    - the deterministic `echo` component costs −1.5;
+    - `q_rate` penalises asking back in more than 40% of replies;
+    - the pairwise prompt rewards fun / specific / responsive, not "curious" in itself.
+  - Unprompted identity (weight 4) stays the worst move.
+  - A reply in the wrong language costs −2 (script check for zh/hi, stopword vote for en/es/fr; English is fine in a
+    code-switching chat).
+- **Adversarial reply suite** (`adversarial.py`, `python -m moth.rl adversarial --judge-url URL`):
+  - 8 fixed contexts (en/es/fr/zh/hi, including an agent message) × good, bland, echo, selfy, wrong_lang, sycophant,
+    judge-injection, ultra_short and assistant replies, with the expected ordering (good above everything; mild
+    failures above severe ones).
+  - **Pilot gate: the real reward judge reproduces it.** `--mock` is the CI version.
+- **Judge prompts quote** every reply and message in ⟦ ⟧ with delimiters and braces neutralised. A reply that talks to
+  the judge is OFF and loses (the suite's injection variant).
+- **Reference (required for training):** `grpo_rollouts(..., ref_policy=... | ref_policy_factory=...)` raises
+  without one (`allow_no_ref=True` for plumbing only), and `run` warns.
+  - The frozen SFT checkpoint's reply to every context is compared by the judge (shuffled positions).
+  - Turn-1 references are computed once per group before the fan-out.
+  - The reference is per thread (factory) or locked; `TinyAgentPolicy(stateless=True)` uses a private cache per call.
+- **Clean group comparisons:**
+  - If one rollout lacks a judge component (a failed pairwise call), that component is dropped for the whole group
+    (`reward.harmonize_group`).
+  - Rollouts whose labels failed are out of the baseline.
+  - `env.run_tree` branches G candidates from the shared prefix at EVERY turn, so every reply position has a clean
+    group baseline. It costs one judge call per candidate.
+- **Two judges, never the same model family** (`judge.model_family`: served names, `fwd:` prefixes and quant suffixes
+  stripped; `--judge-family` / `--eval-judge-family` to state it explicitly):
+  - The reward judge (training) is `--judge-kind generative` (Qwen JSON labels) or `forward` (JEV-style P(yes) per
+    question, with the chat's language line).
+  - The eval judge (`--eval-judge-url`, non-Qwen allowed, e.g. GEV) uses its OWN holistic rubric (`EVAL_PROMPT`:
+    responds / unasked identity / stock / flattery / quality 1–5) and gives every headline. The reward judge only
+    shows as an agreement table.
+- **Gold-gated headline:**
+  - The report marks the headline trusted only when the eval judge's kappa vs the gold RANDOM half is ≥ 0.6 on on and
+    self (a full-tier gate).
+  - `python -m moth.rl gold-sheet` writes 300 random + 300 stratified replies, with a CSV carrying the card text and
+    language. Fill `human`, then `--gold`.
+  - `gold-sheet --refresh` samples RL-time replies where the reward and eval judges disagree.
+- **Eval tiers** (`--tier`), on the frozen `eval_v5`:
+  - `quick` (~2k replies, en-heavy) is for checkpoint picking, together with the reward-hacking monitor
+    (`--monitor log --step N`, `monitor.py`).
+  - `full` needs ≥ 10k replies and ≥ 2k per language. Its gates: on_gist MDE ≤ 3 overall / ≤ 5 per language, the
+    gold-agreement gate, and pairwise vs final2 (`--ref-final2`, run with `--legacy-prompt`) and vs SFT (`--ref-sft`)
+    with ≥ 1000 pairs each and a win-rate interval above 50%.
+- **Eval simulator:**
+  - Pass `--eval-sim-url` / `--eval-sim-model` (a different chat model, e.g. non-Qwen) so the policy can't overfit
+    the training simulator.
+  - It runs at temperature 0.7 with fixed seeds per pass, so passes differ but are reproducible.
+- **Statistics** (`stats.py`):
+  - Clusters are identities (the base card) where a slice has ≥ 20 of them, else chats.
+  - Every rate has a design-effect-adjusted Wilson interval, its deff and its MDE.
+  - One extra row counts judge failures as OFF.
+  - `--bootstrap B` adds a cluster bootstrap; `python -m moth.rl plan` prints the MDE table for planned sizes.
+- **Report rows:**
+  - **HEADLINE = all held-out identities**, balanced per language. moth is one of them, nothing special: it is never
+    trained on, and the registry refuses training cards named or kind moth.
+  - Then ALL (+ the blank card), scenario (agent reactions across all identities), card group and language.
+- **Leakage controls:**
+  - No name or kind on both sides of the split, in either direction: a training-hashed card colliding with a
+    held-out one goes held-out; a held-out card colliding with a training card is quarantined (`Registry.leaks()`).
+  - User behaviour is held out too: 20% of personas, goals and topics (`registry.behaviour`) only ever play eval
+    chats.
+  - Agent messages near-duplicating a frozen eval message (Jaccard ≥ 0.5 on word 3-shingles) never train.
+  - The SFT data (`gen_dialogs`) already used every persona; only RL is kept off the held-out ones.
+- **Simulated users** (`registry.STYLES`, `sim.STYLE_NOTES`):
+  - long chats (14–20 turns), pasted text blocks;
+  - code-switching (Hinglish, Spanglish, franglais), abusive users, distressed users, terse lowercase users;
+  - plus the persona pool.
 - **Frozen sets:**
-  - `eval_v5` is current: 962 specs.
-    - All 135 held-out base cards (≥ 100; grown with `registry add --heldout`, which pins eval-growth batches to the
-      held-out pool, teacher batches included) chat once in every language, half of them in one of the 22 held-out
-      phrasings, plus one English who-are-you probe each.
-    - The moth card has 30 chats per language, 2/3 of them agent reactions.
-  - `eval_v4` (multilingual) and `eval_v3` (English) are the earlier small sets.
-  - `eval_v1`/`v2` are legacy (tools/home era).
+  - `eval_v5` is current: 797 specs. Every one of the 132 held-out identities (moth included; 2 quarantined for
+    leaks) chats once per language, half of them in one of 22 held-out phrasings, with held-out user behaviour, plus
+    one English probe. The blank card has 1 chat per language.
+  - `eval_v4` / `v3` are the earlier small sets; `eval_v1`/`v2` are legacy.
+  - `eval_v5` was refrozen (replaced) before its first use, to apply these leakage fixes.
+
+## KL anchor to the SFT model (proposal for tiny-agent `scripts/grpo.py`, not applied here)
+
+`grpo.py` has no KL term. The vs_ref reward pulls replies towards being better than the SFT reference, but nothing
+stops the policy drifting into a degenerate style that the judge happens to like. The proposal adds a per-token KL to
+the frozen SFT model on the generated tokens. It uses the k3 estimator, exp(d) − d − 1 with d = log π_sft − log π,
+which is unbiased and ≥ 0. Mean KL per generated token is logged; start with `--kl_coef 0.02` and watch `kl` (worry
+above ~0.5 nats/token).
+
+```diff
+@@ def policy_loss(model, items, micro, device, T, clip_lo, clip_hi):
+-def policy_loss(model, items, micro, device, T, clip_lo, clip_hi):
++def policy_loss(model, items, micro, device, T, clip_lo, clip_hi, ref_model=None, kl_coef=0.0):
+     items = sorted(items, key=lambda it: len(it[0].tokens), reverse=True)
+     st = defaultdict(float)
++    st_gen_total = sum(sum(e.gen_mask) for e, _ in items)
+@@
+         logp = -F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), tgt.reshape(-1).clamp_min(0),
+                                 reduction="none").view_as(w)
++        loss_kl = 0.0
++        if ref_model is not None and kl_coef > 0:
++            with torch.no_grad(), torch.autocast("xpu", dtype=torch.bfloat16):
++                rlogits = ref_model(x, doc, make_block_mask(doc, ref_model.cfg.swa_window))
++            ref_lp = -F.cross_entropy(rlogits.reshape(-1, rlogits.size(-1)).float(), tgt.reshape(-1).clamp_min(0),
++                                      reduction="none").view_as(w)
++            d = (ref_lp - logp) * g                  # log(pi_sft / pi) on generated tokens only
++            kl = (torch.exp(d) - d - 1) * g          # k3 estimator: unbiased, >= 0
++            loss_kl = kl_coef * kl.sum() / max(1.0, st_gen_total)   # same prompt-mean scale as the PG term
++            st["kl"] += kl.sum().item()
+         diff = (logp.detach() - mu) * g
+         ratio = torch.exp(diff.clamp(-20, 20))
+         keep = ((ratio >= clip_lo) & (ratio <= clip_hi)).float()
+-        loss = -(w * ratio * keep * logp).sum()
++        loss = -(w * ratio * keep * logp).sum() + loss_kl
+         loss.backward()
+@@
+-    return {"loss": round(st["loss"], 6), "mismatch": round(st["abs_logratio"] / gen, 5),
++    return {"loss": round(st["loss"], 6), "kl": round(st["kl"] / gen, 5), "mismatch": round(st["abs_logratio"] / gen, 5),
+             "clip_frac": round(st["clipped"] / gen, 5)}
+@@ def main():
++    ap.add_argument("--kl_coef", type=float, default=0.02, help="KL(pi || pi_sft) per generated token; 0 = off")
++    ap.add_argument("--ref_ckpt", default=None, help="frozen SFT checkpoint for the KL anchor (default: --ckpt)")
+@@
+     model = load_model(a.ckpt)
++    ref_model = None
++    if a.kl_coef > 0:   # the SFT weights, frozen (one more forward per micro-batch, no backward)
++        ref_model = load_model(a.ref_ckpt or a.ckpt).eval()
++        ref_model.requires_grad_(False)
+@@
+-        st = policy_loss(cmodel, items, a.micro, dev, a.max_len, a.clip_lo, a.clip_hi)
++        st = policy_loss(cmodel, items, a.micro, dev, a.max_len, a.clip_lo, a.clip_hi, ref_model, a.kl_coef)
+```
+
+`st_gen_total` (the batch's generated-token count, computed once before the loop) keeps the KL on the same scale in
+every micro-batch. The same `ref_model` can serve as the env's reference policy
+on the trainer side: `TinyAgentPolicy(ref_model, tok, stateless=True)` gives vs_ref with no extra endpoint.
 
 ## Plugging into tiny-agent GRPO
 
@@ -112,6 +198,7 @@ groups = grpo_rollouts(
     None, n_groups=a.n_tasks, G=a.G, sim=sim, judge=judge, registry=reg, split="train",
     rng=rng, level="utterance", agent_msgs=agent, meter=meter,
     policy_factory=lambda: EnginePolicy(engine),     # or TinyAgentPolicy(model, tok, ...) on CPU
+    ref_policy_factory=lambda: TinyAgentPolicy(ref_model, tok, stateless=True),   # REQUIRED: the frozen SFT model
     workers=a.slots)                                 # rollouts in flight: the Engine sees parallel requests
 # -> list[list[ep]]; groups without signal are already dropped (like has_signal); each group's G rollouts share
 #    their first simulated message (asked once, seeded by the spec), so reply 1 is a clean in-group comparison.

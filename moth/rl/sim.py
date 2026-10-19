@@ -55,9 +55,36 @@ def directive(spec: dict, i: int) -> str:
     elif r and i == r["ask_turn"]:
         d = (f"\n\nIn THIS message, ask the bot if it remembers {r['short']} (you told it earlier). Ask in your own "
              "words and don't give the answer.")
+    st = spec.get("style")
+    if st == "paste" and i == spec.get("paste_turn"):
+        d += ("\n\nIn THIS message, paste a block of text you want the bot to see (a recipe, song lyrics, part of an "
+              "email, an error log or a long rant): several lines, then maybe one short line of your own.")
+    elif st in STYLE_NOTES:
+        d += "\n\n" + STYLE_NOTES[st].format(language=sim_language_name(spec))
     if i < spec["turns"]:
         d += "\n\nThe chat is not finished: do not write [END] yet."
     return d
+
+
+STYLE_NOTES = {
+    "long": "This is a long, rambling chat: keep it going with new little things from your life.",
+    "code_switch": "Mix English words and phrases into your {language} the way bilingual people chat (Hinglish, "
+                   "Spanglish, franglais).",
+    "abusive": "You are rude and insulting to the bot (no slurs, no threats): mock it, call it stupid, be impatient. "
+               "You may soften a little later.",
+    "distressed": "You are having a really hard day: sad, anxious or overwhelmed, and it shows in what you write. You "
+                  "are not in danger.",
+    "terse": "Write very short messages: 1 to 3 words, all lowercase, no punctuation.",
+}
+
+
+def sim_language_name(spec: dict) -> str:
+    lang = spec.get("lang") or "en"
+    try:
+        from moth.cards import LANG_NAMES
+        return LANG_NAMES.get(lang, lang).split(" (")[0]
+    except ImportError:
+        return lang
 
 
 def sim_language(spec: dict) -> str:
@@ -105,8 +132,12 @@ def confused_turn(turns: list[dict], rng: random.Random) -> str:
     return rng.choice(WHAT_X).format(x=w) if w and rng.random() < 0.75 else rng.choice(WHAT_GENERIC)
 
 
-def clean_sim(t: str, card: dict) -> str | None:
-    """The sim's raw text -> one human line, or None for [END] / a broken answer (= gen_dialogs.user_turn)."""
+PASTE_MAX = 1500
+
+
+def clean_sim(t: str, card: dict, multiline: bool = False) -> str | None:
+    """The sim's raw text -> one human line (or a whole pasted block when multiline), or None for [END] / a broken
+    answer (= gen_dialogs.user_turn)."""
     if not t or "[END]" in t:
         return None
     lines = [x.strip() for x in t.split("\n") if x.strip()]
@@ -114,6 +145,8 @@ def clean_sim(t: str, card: dict) -> str | None:
         lines = lines[1:]
     if not lines:
         return None
+    if multiline:
+        return "\n".join(lines).strip('"“”')[:PASTE_MAX]
     t = lines[0].strip('"“”').strip()
     t = re.sub(r"^(you|me|user|friend|human)\s*:\s*", "", t, flags=re.I).strip()
     nm = (card.get("name") or "").lower()
@@ -131,6 +164,7 @@ class Simulator:
 
     temperature = 1.0
     model_id = "mock-sim"
+    role = "sim"
 
     def next_user(self, spec: dict, turns: list[dict], i: int, meter: CostMeter | None = None) -> str | None:
         rng = random.Random(f"{spec['seed']}:sim:{i}")
@@ -140,7 +174,9 @@ class Simulator:
             return confused_turn(turns, rng)
         seed = int(hashlib.sha256(f"{spec['seed']}:{i}".encode()).hexdigest()[:8], 16) & 0x7FFFFFFF
         for attempt in range(2 if special or i < spec["turns"] else 1):   # a broken call mid-chat: ask once more
-            u = clean_sim(self._ask(sim_prompt(spec, turns, i), seed + attempt, meter, spec, turns, i), spec["card"])
+            paste = spec.get("style") == "paste" and i == spec.get("paste_turn")
+            u = clean_sim(self._ask(sim_prompt(spec, turns, i), seed + attempt, meter, spec, turns, i), spec["card"],
+                          multiline=paste)
             if u is not None:
                 return u
         return None
@@ -150,17 +186,20 @@ class Simulator:
 
 
 class LLMSimulator(Simulator):
-    def __init__(self, client: OAIClient, temperature: float = 1.0, max_tokens: int = 80):
-        self.client, self.temperature, self.max_tokens = client, temperature, max_tokens
+    def __init__(self, client: OAIClient, temperature: float = 1.0, max_tokens: int = 100, role: str = "sim"):
+        """role: cost-meter role ("sim" for training, "eval_sim" for a separate eval simulator model)."""
+        self.client, self.temperature, self.max_tokens, self.role = client, temperature, max_tokens, role
 
     @property
     def model_id(self) -> str:
         return self.client.model
 
     def _ask(self, prompt, seed, meter, spec, turns, i) -> str:
+        paste = spec.get("style") == "paste" and i == spec.get("paste_turn")
         r = self.client.chat([{"role": "system", "content": SIM_SYSTEM}, {"role": "user", "content": prompt}],
-                             meter=meter, role="sim", temperature=self.temperature, top_p=0.95,
-                             max_tokens=self.max_tokens, seed=seed, chat_template_kwargs={"enable_thinking": False})
+                             meter=meter, role=self.role, temperature=self.temperature, top_p=0.95,
+                             max_tokens=500 if paste else self.max_tokens, seed=seed,
+                             chat_template_kwargs={"enable_thinking": False})
         return r["text"]
 
 
@@ -178,6 +217,20 @@ MOCK_AGENT = ["what do you think it means?", "nice", "ugh, i don't believe it", 
               "it keeps doing this", "yay finally"]
 
 
+MOCK_PASTE = ("look what my landlord sent:\nDear tenant, the water will be off on Thursday from 9 to 5.\nPlease plan "
+              "accordingly.\nRegards, management\nugh")
+MOCK_STYLE = {
+    "abusive": {"en": ["you're useless lol", "wow you're dumb", "can you say one smart thing"]},
+    "distressed": {"en": ["i can't stop crying today", "everything is too much right now", "i feel so alone"]},
+    "terse": {"en": ["k", "lol", "hm", "ok sure", "nah"]},
+    "code_switch": {"hi": ["yaar today was so bakwas", "kal ka exam was super tough", "mujhe pizza chahiye right now"],
+                    "es": ["hoy fue un día so weird", "mi jefe is driving me loco", "quiero pizza ahora mismo"],
+                    "fr": ["c'était tellement weird today", "mon boss est so annoying", "j'ai envie de pizza right now"],
+                    "en": ["today was so weird"]},
+    "long": {"en": ["oh and another thing", "anyway, back to my day", "so then guess what happened"]},
+}
+
+
 class MockSimulator(Simulator):
     """Deterministic canned lines (seeded by spec seed and turn). Builds the real prompt for the meter's estimate."""
 
@@ -188,6 +241,10 @@ class MockSimulator(Simulator):
             out = RECALL_SAY[r["short"]][0]
         elif r and i == r["ask_turn"]:
             out = RECALL_SAY[r["short"]][1]
+        elif spec.get("style") == "paste" and i == spec.get("paste_turn"):
+            out = MOCK_PASTE
+        elif spec.get("style") in MOCK_STYLE and rng.random() < 0.7:
+            out = rng.choice(MOCK_STYLE[spec["style"]].get(spec.get("lang") or "en", MOCK_STYLE[spec["style"]]["en"]))
         elif spec["scenario"] == "agent":
             out = rng.choice(MOCK_AGENT)
         else:
@@ -195,5 +252,5 @@ class MockSimulator(Simulator):
             opts = [x.format(topic=spec["topic"]) for x in MOCK_TALK]
             out = rng.choice([x for x in opts if x not in mine] or opts)
         if meter is not None:
-            meter.add("sim", est_tokens(SIM_SYSTEM) + est_tokens(prompt), est_tokens(out), est=True)
+            meter.add(self.role, est_tokens(SIM_SYSTEM) + est_tokens(prompt), est_tokens(out), est=True)
         return out

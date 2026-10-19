@@ -19,16 +19,19 @@ from __future__ import annotations
 
 
 class TinyAgentPolicy:
+    thread_safe = False   # stateless=True instances set it in __init__
 
     def __init__(self, model, tok, device: str = "cpu", max_turn_tokens: int = 64, temperature: float = 1.0,
                  max_len: int = 2048, seed: int | None = None, stateless: bool = False):
-        """stateless=True: every call re-encodes the whole chat in a fresh cache (for the frozen reference policy,
-        whose context continues with the trained policy's replies, not its own)."""
+        """stateless=True: every call re-encodes the whole chat in a private fresh cache (for the frozen reference
+        policy, whose context continues with the trained policy's replies, not its own); thread-safe then, apart from
+        the shared sampling generator (seeded runs: one instance per thread)."""
         import torch
         self.torch = torch
         self.model, self.tok, self.device = model, tok, device
         self.max_turn_tokens, self.temperature, self.max_len = max_turn_tokens, temperature, max_len
         self.stateless = stateless
+        self.thread_safe = stateless
         self.im_end = tok.token_to_id("<|im_end|>")
         self.gen = torch.Generator(device="cpu")
         if seed is not None:
@@ -51,14 +54,20 @@ class TinyAgentPolicy:
 
         from tiny_agent.chat import render
         from tiny_agent.generate import append
-        if self.cache is None or self.stateless:
-            self.start(None)
-        if self.n_msgs == 0:
+        if self.stateless:   # a private cache per call: safe to share between threads (the reference policy)
+            from tiny_agent.generate import KVCache
+            cache = KVCache(self.model, 1, self.max_len, self.device, dtype=torch.float32)
+            n_msgs, ended = 0, True
+        else:
+            if self.cache is None:
+                self.start(None)
+            cache, n_msgs, ended = self.cache, self.n_msgs, self.ended
+        if n_msgs == 0:
             feed = self.enc(render(messages, add_generation_prompt=True))
         else:   # skip messages[n_msgs - 1]... : the assistant reply it produced itself is already in the cache
-            new = [m for m in messages[self.n_msgs:] if m["role"] != "assistant"]
-            feed = ([] if self.ended else [self.im_end]) + self.enc("\n" + render(new, add_generation_prompt=True))
-        logits = append(self.model, self.cache, torch.tensor([feed], device=self.device), [len(feed)])
+            new = [m for m in messages[n_msgs:] if m["role"] != "assistant"]
+            feed = ([] if ended else [self.im_end]) + self.enc("\n" + render(new, add_generation_prompt=True))
+        logits = append(self.model, cache, torch.tensor([feed], device=self.device), [len(feed)])
         gen, logp = [], []
         for _ in range(self.max_turn_tokens):
             lg = logits.float() / max(self.temperature, 1e-6)
@@ -68,9 +77,10 @@ class TinyAgentPolicy:
             logp.append(float(F.log_softmax(lg, -1)[0, t]))
             if t == self.im_end:
                 break
-            logits = append(self.model, self.cache, torch.tensor([[t]], device=self.device), [1])
-        self.ended = bool(gen) and gen[-1] == self.im_end
-        self.n_msgs = len(messages) + 1   # + the reply about to be appended by the env
+            logits = append(self.model, cache, torch.tensor([[t]], device=self.device), [1])
+        if not self.stateless:
+            self.ended = bool(gen) and gen[-1] == self.im_end
+            self.n_msgs = len(messages) + 1   # + the reply about to be appended by the env
         text = self.tok.decode([t for t in gen if t != self.im_end], skip_special_tokens=False)
         return {"text": text, "raw": text, "feed_ids": feed, "gen_ids": gen, "logp": logp}
 

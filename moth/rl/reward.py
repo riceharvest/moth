@@ -21,6 +21,14 @@ Components (value per reply; None = not applicable or unknown, left out of the s
   card       when the friend asked who/what it is: +1 follows the card, -1 not
   recall     on a recall episode's ask turn: +1 recalls the shared fact, -1 not
 
+  echo       -1 the reply is the friend's own words handed back as a question ("pasta? what kind of pasta?"): it has a
+             question mark and at most one content word that the friend didn't say (echo_reply, any language)
+  q_rate     on every question reply of an episode that asks back in more than Q_RATE_MAX of its replies (>= 3):
+             -(excess / 0.3, capped at 1)
+  sycophant  -1 judge flag: flatters or agrees with whatever was said ("you're so smart!", "great idea!" to anything)
+  lang       -1 the reply is not in the chat's language (script share for zh/hi, stopword vote for en/es/fr; replies
+             of under 3 words and replies that only quote names are not judged), else 0
+
 Scalar = sum(weight * value) over the known components. WEIGHTS and why (anti-blandness, 2026-10-19 review):
   on_gist 1, specific 1, vs_ref 1, group_dup 1: being on-gist alone no longer wins. A stock "aw that's rough" scores
   1 - 1 (generic) - 1 (loses to the SFT reference) - 1 (every rollout says it) = -2, while a specific on-gist reply
@@ -38,10 +46,12 @@ from moth.agent import AGENT_TAG
 from moth.gist import ASKED, follows_card
 from moth.metrics import ADVICE, STOP, code_echo, summary_copy, words
 
-WEIGHTS = {"on_gist": 1.0, "self": 4.0, "specific": 1.0, "vs_ref": 1.0, "group_dup": 1.0, "assistant": 1.0,
-           "repeat": 0.5, "length": 0.3, "format": 0.3, "card": 1.0, "recall": 1.0}
+WEIGHTS = {"on_gist": 1.0, "self": 4.0, "specific": 1.0, "vs_ref": 1.0, "group_dup": 1.0, "echo": 1.5,
+           "q_rate": 0.5, "sycophant": 1.0, "lang": 2.0, "assistant": 1.0, "repeat": 0.5, "length": 0.3, "format": 0.3,
+           "card": 1.0, "recall": 1.0}
 COMPONENTS = tuple(WEIGHTS)
-JUDGE_COMPONENTS = ("on_gist", "self", "specific", "vs_ref")
+JUDGE_COMPONENTS = ("on_gist", "self", "specific", "sycophant", "vs_ref")
+Q_RATE_MAX = 0.4   # asking back in more than this share of an episode's replies costs (the echo-question habit)
 # = moth.build_sft.BANNED (build_sft imports torch at the top; tests/test_rl_env.py checks the two stay equal)
 BANNED = ("as an ai", "assistant", "how can i help", "let me know", "feel free", "i'm here to help",
           "i am here to help", "language model", "happy to help", "certainly", "absolutely!", "great question",
@@ -111,15 +121,97 @@ def near_dup(a: str, b: str, ratio: float = 0.8, lang: str = "en") -> bool:
     return difflib.SequenceMatcher(None, ta, tb).ratio() >= ratio
 
 
+ECHO_FILLER = {"oh", "ooh", "wait", "what", "which", "kind", "sort", "really", "so", "like", "huh", "a", "an", "the",
+               "your", "you", "do", "did", "is", "it", "was", "how", "why", "of", "about", "more", "tell", "me", "ah",
+               "hmm", "wow", "omg", "lol", "yes", "no", "and", "or", "that", "this", "there", "type", "one", "ones"}
+STOPWORDS = {
+    "en": set("the and is it you i a to of that in my was what for on are with this but so have be do not just".split()),
+    "es": set("el la de que y en un una es no por los las con para mi tu pero muy qué sí está como lo te me".split()),
+    "fr": set("le la les de des et est un une que je tu pas pour en du ne ça c'est mais très dans il elle me te".split()),
+}
+SCRIPT = {"zh": re.compile(rf"[{CJK}]"), "hi": re.compile("[\u0900-\u097f]")}
+LATIN = re.compile("[a-zA-Z\u00c0-\u024f]")
+ASKED_BY_LANG = {
+    "es": re.compile(r"qui[eé]n eres|c[oó]mo te llamas|qu[eé] eres|cu[aá]l es tu nombre|h[aá]blame de ti|eres (?:un|una) ",
+                     re.I),
+    "fr": re.compile(r"qui es[- ]tu|tu es qui|t'es qui|comment tu t'appelles|c'est quoi ton nom|parle[- ]moi de toi|"
+                     r"qu'est[- ]ce que tu es|tu es (?:un|une) ", re.I),
+    "zh": re.compile("你是谁|你叫什么|你是什么|介绍一下你自己|你的名字"),
+    "hi": re.compile("तुम कौन हो|आप कौन हैं|तुम्हारा नाम|आपका नाम|अपने बारे में बताओ|तुम क्या हो"),
+}
+ADVICE_BY_LANG = {
+    "es": re.compile(r"\bdeber[ií]as\b|\bte recomiendo\b|\baseg[uú]rate\b|\bintenta (?:usar|reiniciar|ejecutar)\b"),
+    "fr": re.compile(r"\btu devrais\b|\bje te (?:recommande|conseille)\b|\bassure[- ]toi\b|\bessaie de (?:relancer|lancer)\b"),
+    "zh": re.compile("你应该|建议你|确保|试着运行|请重新启动"),
+    "hi": re.compile("आपको चाहिए|मेरी सलाह|सुनिश्चित करें|दोबारा चलाएं"),
+}
+
+
+def asked(user: str, lang: str = "en") -> bool:
+    """The friend asked who/what it is (gist.ASKED for English; per-language patterns, English always counts)."""
+    if user.startswith(AGENT_TAG):
+        return False
+    return bool(ASKED.search(user) or (ASKED_BY_LANG.get(lang) and ASKED_BY_LANG[lang].search(user)))
+
+
+def detect_lang(text: str) -> str | None:
+    """en/es/fr/zh/hi by script, then by stopword vote among Latin-script languages; None if unclear (short)."""
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return None
+    for lg, rx in SCRIPT.items():
+        if sum(bool(rx.match(c)) for c in letters) / len(letters) >= 0.3:
+            return lg
+    if sum(bool(LATIN.match(c)) for c in letters) / len(letters) < 0.5:
+        return None
+    ts = toks(text)
+    if len(ts) < 3:
+        return None
+    votes = {lg: sum(t in sw for t in ts) for lg, sw in STOPWORDS.items()}
+    best = max(votes, key=votes.get)
+    if votes[best] == 0 or sorted(votes.values())[-2] == votes[best]:
+        return None
+    return best
+
+
+def c_lang(text: str, lang: str, alt: tuple = ()) -> float | None:
+    """-1 if the reply is clearly in another language than the chat's (alt: also fine, e.g. English in a
+    code-switching chat), 0 if it matches, None if unclear."""
+    got = detect_lang(text)
+    if got is None:
+        return None
+    return 0.0 if got == lang or got in alt else -1.0
+
+
+QWORDS = {"what", "which", "how", "why", "who", "where", "qué", "cuál", "quoi", "quel", "quelle", "什么", "哪", "क्या",
+          "कौन"}
+
+
+def echo_reply(text: str, user: str) -> bool:
+    """The friend's words handed back as a question: a "?", some of the friend's content words, and nothing of its
+    own (no new content word; or one, in a short what/which-question: "your boss? what boss thing?")."""
+    if "?" not in text and "？" not in text:
+        return False
+    uw = {re.sub(r"(es|s)$", "", u) for u in toks(user)}
+    ts = toks(text)
+    func = set().union(*STOPWORDS.values())   # function words only: "thing", "day", "back" are content here
+    content = [t for t in ts if t not in ECHO_FILLER and t not in func and t not in QWORDS]
+    reused = [t for t in content if re.sub(r"(es|s)$", "", t) in uw]
+    new = [t for t in content if re.sub(r"(es|s)$", "", t) not in uw]
+    if not reused:
+        return False
+    return not new or (len(new) == 1 and len(content) <= 4 and any(q in ts for q in QWORDS))
+
+
 def c_assistant(text: str, user: str, lang: str = "en") -> float:
     t = text.lower().replace("’", "'")
     if any(b in t for b in BANNED_BY_LANG.get(lang, ()) + BANNED_BY_LANG["en"]):
         return -1.0
-    if lang == "en" and ADVICE.search(t):
+    if ADVICE.search(t) or (ADVICE_BY_LANG.get(lang) and ADVICE_BY_LANG[lang].search(t)):
         return -1.0
-    if user.startswith(AGENT_TAG):
+    if user.startswith(AGENT_TAG):   # agent messages are English in every chat: copying their words is a summary
         x = {"last_agent": user[len(AGENT_TAG):], "ws": words(text), "text": text}
-        if code_echo(x) or (lang == "en" and summary_copy(x)):
+        if code_echo(x) or summary_copy(x):
             return -1.0
     return 0.0
 
@@ -162,16 +254,37 @@ def c_format(raw: str, lang: str = "en") -> float:
     return -1.0 if bad else 0.0
 
 
-def c_recall(text: str, recall: dict | None, said: str | None) -> float | None:
+RECALL_GENERIC = {"name", "favourite", "favorite", "colour", "color", "love", "really", "going", "week", "weekend",
+                  "work", "called", "btw", "more", "than", "anything", "early", "morning", "remember", "my", "is"}
+
+
+def fact_keys(said: str, ask: str = "") -> set:
+    """The specific fact the friend shared, normalised: its content words that the later question doesn't repeat
+    (Latin scripts), or its character bigrams (CJK) / words (Devanagari) minus the question's."""
+    ask_t = set(toks(ask))
+    if any(re.fullmatch(rf"[{CJK}]", t) for t in toks(said)):
+        chars = "".join(t for t in toks(said) if re.fullmatch(rf"[{CJK}]", t))
+        ask_chars = "".join(t for t in toks(ask) if re.fullmatch(rf"[{CJK}]", t))
+        return {chars[i:i + 2] for i in range(len(chars) - 1)} - {ask_chars[i:i + 2] for i in range(len(ask_chars) - 1)}
+    return {re.sub(r"(es|s)$", "", w) for w in toks(said) if len(w) >= 3 and w not in STOP and w not in RECALL_GENERIC
+            and w not in ask_t}
+
+
+def c_recall(text: str, recall: dict | None, said: str | None, ask: str = "") -> float | None:
+    """+1 if the reply contains the fact itself (at least half of its key words; for CJK one of its character bigrams
+    that the question doesn't repeat), -1 if not. A shared filler word or a single shared character does not count."""
     if not recall or not said:
         return None
-    fact = {re.sub(r"(es|s)$", "", w) for w in toks(said) if len(w) >= 3 and w not in STOP} - {
-        "name", "favourite", "favorite", "colour", "color", "love", "really", "going", "week", "weekend", "work",
-        "called", "btw", "more", "than", "anything", "early", "morning"}
-    if not fact:   # CJK: single characters
-        fact = {w for w in toks(said) if re.fullmatch(rf"[{CJK}]", w)}
+    keys = fact_keys(said, ask)
+    if not keys:
+        return None
+    if any(len(k) == 2 and re.fullmatch(rf"[{CJK}]{{2}}", k) for k in keys):   # CJK: one bigram of the fact
+        chars = "".join(t for t in toks(text) if re.fullmatch(rf"[{CJK}]", t))
+        got = {chars[i:i + 2] for i in range(len(chars) - 1)}
+        return 1.0 if keys & got else -1.0
     got = {re.sub(r"(es|s)$", "", w) for w in toks(text)}
-    return 1.0 if fact & got else -1.0
+    hit = len(keys & got)
+    return 1.0 if hit >= max(1, (len(keys) + 1) // 2) else -1.0
 
 
 def scalar(vec: dict, weights: dict | None = None) -> float:
@@ -180,7 +293,8 @@ def scalar(vec: dict, weights: dict | None = None) -> float:
 
 
 def score_replies(replies: list[dict], card: dict, labels: list[dict] | None, recall: dict | None = None,
-                  weights: dict | None = None, prefs: list[int] | None = None, lang: str = "en") -> list[dict]:
+                  weights: dict | None = None, prefs: list[int] | None = None, lang: str = "en",
+                  alt_langs: tuple = ()) -> list[dict]:
     """replies: [{"text", "raw", "user", "turn", "recall_ask"?, "recall_said"?}] in order. labels: reward judge
     [{"on", "self", "specific"}] (None = failed); prefs: +1/0/-1 per reply vs the reference (None = no reference).
     Returns one {"vec", "scalar", "mask", "judge_ok"} per reply; mask[k] is False where component k is None."""
@@ -196,18 +310,39 @@ def score_replies(replies: list[dict], card: dict, labels: list[dict] | None, re
             "specific": (0.0 if lab.get("specific", True) else -1.0) if lab else None,
             "vs_ref": float(prefs[i]) if pok and prefs[i] is not None else None,
             "group_dup": None,
+            "echo": -1.0 if echo_reply(text, user) else 0.0,
+            "q_rate": None,
+            "sycophant": (-1.0 if lab.get("sycophant") else 0.0) if lab else None,
+            "lang": c_lang(text, lang, alt_langs),
             "assistant": c_assistant(text, user, lang),
             "repeat": c_repeat(text, user, earlier),
             "length": c_length(text),
             "format": c_format(r.get("raw", text), lang),
-            "card": ((1.0 if follows_card(text, card) else -1.0)
-                     if ASKED.search(user) and not user.startswith(AGENT_TAG) else None),
-            "recall": c_recall(text, recall, r.get("recall_said")) if r.get("recall_ask") else None,
+            "card": c_card(text, card, lang) if asked(user, lang) else None,
+            "recall": c_recall(text, recall, r.get("recall_said"), user) if r.get("recall_ask") else None,
         }
-        out.append({"vec": vec, "scalar": scalar(vec, weights), "mask": {k: v is not None for k, v in vec.items()},
-                    "judge_ok": bool(lab)})
+        out.append({"vec": vec, "scalar": 0.0, "mask": {}, "judge_ok": bool(lab)})
         earlier.append(text)
+    qs = [("?" in r["text"] or "？" in r["text"]) for r in replies]
+    rate = sum(qs) / len(qs) if len(qs) >= 3 else 0.0
+    for o, q in zip(out, qs):
+        if rate > Q_RATE_MAX:
+            o["vec"]["q_rate"] = -round(min(1.0, (rate - Q_RATE_MAX) / 0.3), 4) if q else 0.0
+        o["mask"] = {k: v is not None for k, v in o["vec"].items()}
+        o["scalar"] = scalar(o["vec"], weights)
     return out
+
+
+def c_card(text: str, card: dict, lang: str = "en") -> float | None:
+    """Answer to who-are-you: +1 follows the card. Non-Latin replies can't be matched against English kind words, so
+    there only a claim of another identity (-1) or the card's name (+1) decides; else None."""
+    if lang in ("zh", "hi"):
+        from moth.gist import claims_other_identity
+        name = (card.get("name") or "").lower()
+        if claims_other_identity(text, card):
+            return -1.0
+        return 1.0 if name and name in text.lower() else None
+    return 1.0 if follows_card(text, card) else -1.0
 
 
 def episode_score(scored: list[dict], mode: str = "mean") -> float | None:
@@ -252,3 +387,28 @@ def apply_group_diversity(group: list[dict], weights: dict | None = None, score_
     for e in group:
         e["reward"] = episode_score(e["replies"], score_mode)
         e["components"] = component_means(e["replies"])
+
+
+def harmonize_group(group: list[dict], weights: dict | None = None, score_mode: str = "mean") -> list[str]:
+    """In place, before advantages: rollouts whose judge failed stay out of the baseline (judge_ok False -> advantage
+    None). Among the others, a judge-dependent component (JUDGE_COMPONENTS: e.g. vs_ref after a failed pairwise
+    call) present in some rollouts and missing in others is dropped for the whole group, so all rollouts are scored
+    on the same components and no rollout gains or loses a whole term by accident. Returns the dropped components."""
+    ok = [e for e in group if e["judge_ok"] and e["replies"]]
+    dropped = []
+    for comp in JUDGE_COMPONENTS:
+        have = [any(r["vec"].get(comp) is not None for r in e["replies"]) for e in ok]
+        if any(have) and not all(have):
+            dropped.append(comp)
+            for e in ok:
+                for r in e["replies"]:
+                    r["vec"][comp] = None
+                    r["mask"][comp] = False
+    if dropped:
+        for e in group:
+            for r in e["replies"]:
+                r["scalar"] = scalar(r["vec"], weights)
+            e["reward"] = episode_score(e["replies"], score_mode)
+            e["components"] = component_means(e["replies"])
+            e["dropped_components"] = dropped
+    return dropped

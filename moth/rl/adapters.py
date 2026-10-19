@@ -157,18 +157,25 @@ def make_verifiers_env(core: MothMultiTurnEnv, n: int, seed: int = 0, max_turns:
 def grpo_rollouts(policy, n_groups: int, G: int, sim: Simulator, judge: Judge, registry: Registry | None = None,
                   split: str = "train", rng: random.Random | None = None, level: str = "utterance",
                   agent_msgs: list[str] | None = None, mix: dict | None = None, meter: CostMeter | None = None,
-                  drop_flat: bool = True, workers: int = 1, policy_factory=None, **kw) -> list[list[dict]]:
+                  drop_flat: bool = True, workers: int = 1, policy_factory=None, ref_policy=None,
+                  ref_policy_factory=None, allow_no_ref: bool = False, **kw) -> list[list[dict]]:
     """n_groups groups of G scored episodes with reply["advantage"] filled (group_advantages).
 
     Specs are sampled first (deterministic for rng), then all n_groups * G rollouts run `workers` at a time
     (env.run_groups: each group's first sim message is asked once and shared). policy_factory() gives every rollout
     its own policy state (needed for stateful policies when workers > 1); else `policy` is shared.
-    drop_flat skips groups whose advantages are all zero/None (no signal), like tiny-agent's has_signal()."""
+    drop_flat skips groups whose advantages are all zero/None (no signal), like tiny-agent's has_signal().
+    A frozen SFT reference (ref_policy, or ref_policy_factory() per thread) is REQUIRED: without vs_ref the reward
+    loses its main anti-blandness term; pass allow_no_ref=True only for plumbing tests."""
+    if ref_policy is None and ref_policy_factory is None and not allow_no_ref:
+        raise ValueError("grpo_rollouts needs the frozen SFT reference (ref_policy= or ref_policy_factory=): vs_ref is "
+                         "the anti-blandness term; allow_no_ref=True to run without it anyway")
     reg = registry or Registry()
     rng = rng or random.Random(0)
     specs = [sample_spec(reg, rng, split, mix, agent_msgs) for _ in range(n_groups)]
     groups = []
-    for g in run_groups(specs, G, sim, judge, policy, policy_factory, workers, meter, **kw):
+    for g in run_groups(specs, G, sim, judge, policy, policy_factory, workers, meter, ref_policy=ref_policy,
+                        ref_policy_factory=ref_policy_factory, **kw):
         adv = group_advantages(g, level)
         if drop_flat and not any(a for row in adv for a in row if a is not None):
             continue

@@ -30,11 +30,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 from moth.agent import AGENT_TAG
 from moth.cards import GENERIC_REFS, MOTH_CARD
-from moth.gist import ASKED, follows_card
+from moth.gist import follows_card
 from moth.metrics import STOP, words
 from moth.rl import reward as R
 from moth.rl.judge import Judge
 from moth.rl.llm import CostMeter, OAIClient
+from moth.rl.reward import asked
 from moth.rl.sim import Simulator
 
 # --- policies ---------------------------------------------------------------------------------------------------
@@ -48,6 +49,8 @@ def current_meter() -> CostMeter | None:
 
 
 class FnPolicy:
+    thread_safe = True   # a plain function; give it no shared mutable state
+
     def __init__(self, fn):
         self.fn = fn
 
@@ -62,6 +65,7 @@ def as_policy(p):
 class OpenAIPolicy:
     """A checkpoint served behind an OpenAI-compatible endpoint (vLLM / SGLang): plain text turns, no tools.
     Stateless and thread-safe: share one between threads."""
+    thread_safe = True
 
     def __init__(self, client: OAIClient, temperature: float = 0.7, top_p: float = 0.95, max_tokens: int = 120,
                  meter_role: str = "policy"):
@@ -134,7 +138,7 @@ class MockPolicy:
                 if re.search(pat, u, re.I | re.M):
                     return line
             return "the agent did a thing. are you happy with it?"
-        if ASKED.search(u):
+        if asked(u, (self.card or {}).get("lang") or "en"):
             name, kind = card.get("name"), card.get("kind")
             return f"i'm {name or 'just me'}{', ' + kind if kind else ''}. what about you?"
         if re.search(r"\bremember|again\b|\bwhat'?s my\b|\bwhere am i\b", u, re.I):
@@ -142,12 +146,15 @@ class MockPolicy:
             m = re.search(r"\b(?:is|called|love|to the|as an?|is called)\s+([a-z]+)", told)
             return f"you told me! {m.group(1)}." if m else "hmm, i forgot. tell me again?"
         ws = [w for w in words(u) if len(w) >= 4 and w not in STOP]
-        if ws:
+        if ws:   # reacts with something of its own (no echo-questions; asks back about one reply in four)
             w = ws[self.k % len(ws)]
-            opts = [f"oh, {w}? tell me more about the {w}.", f"{w} sounds big. was it a good {w}?",
-                    f"i don't know much about {w}. is it soft?", f"wow, {w}. how did that go?"]
+            opts = [f"{w}... i once thought that was a kind of soup. i was wrong, probably.",
+                    f"a whole {w} thing today. i'd need a nap and a biscuit after that.",
+                    f"the {w} part would make me grumpy too. you did well to survive it.",
+                    f"i bet the {w} had no idea who it was dealing with. did it behave in the end?"]
             return opts[self.k % len(opts)]
-        return ["oh! what happened?", "hm. and then?", "yay. tell me more?", "huh. really?"][self.k % 4]
+        return ["oh! that sounds like a lot.", "hm. i'd have hidden under a blanket.", "yay, a good one for once.",
+                "huh. i did not see that coming."][self.k % 4]
 
 
 # --- one episode ------------------------------------------------------------------------------------------------
@@ -263,7 +270,8 @@ def score_episode(spec: dict, turns: list[dict], judge: Judge, meter: CostMeter 
     if turns and all("ref" in t for t in turns):
         prefs = judge.prefer(spec["card"], tv, [t["ref"] for t in turns], spec["seed"], meter)
     lang = lang_of_spec(spec)
-    scored = R.score_replies(replies, spec["card"], labels, rec or None, weights, prefs, lang)
+    alt = ("en",) if spec.get("style") == "code_switch" else ()
+    scored = R.score_replies(replies, spec["card"], labels, rec or None, weights, prefs, lang, alt)
     for r, s in zip(replies, scored):
         r.update(s)
         r["assistant_index"] = r["turn"]
@@ -288,17 +296,20 @@ def _map(fn, items: list, workers: int) -> list:
 
 
 def run_episodes(specs: list[dict], policy_factory, sim: Simulator, judge: Judge, workers: int = 1,
-                 total: CostMeter | None = None, **kw) -> list[dict]:
+                 total: CostMeter | None = None, ref_policy=None, ref_policy_factory=None, **kw) -> list[dict]:
     """Many episodes, `workers` at a time. policy_factory() -> a policy; called once per worker thread (a stateful
     policy, e.g. MothPolicy or MockPolicy, must not be shared between threads); return one shared object from it
     for a stateless one (OpenAIPolicy)."""
     local = threading.local()
+    get_ref = ref_getter(ref_policy, ref_policy_factory, workers)
+    cache: dict = {}
 
     def one(spec):
         if not hasattr(local, "p"):
             local.p = policy_factory()
         m = CostMeter()
-        ep = run_episode(spec, local.p, sim, judge, m, **kw)
+        r = get_ref()
+        ep = run_episode(spec, local.p, sim, judge, m, ref_policy=r, ref_cache=cache if r is not None else None, **kw)
         if total is not None:
             total.merge(m)
         return ep
@@ -306,6 +317,44 @@ def run_episodes(specs: list[dict], policy_factory, sim: Simulator, judge: Judge
 
 
 # --- groups (GRPO) ----------------------------------------------------------------------------------------------
+class LockedPolicy:
+    """Serialises generate() of a policy that isn't thread-safe (a shared reference policy without a factory)."""
+    thread_safe = True
+
+    def __init__(self, policy):
+        self.policy, self.lock = as_policy(policy), threading.Lock()
+
+    def generate(self, messages):
+        with self.lock:
+            return self.policy.generate(messages)
+
+
+def ref_getter(ref_policy=None, ref_policy_factory=None, workers: int = 1):
+    """() -> the reference policy for the calling thread: one per thread from the factory, else the shared one
+    (wrapped in a lock when it isn't thread-safe and several threads run). None without a reference."""
+    if ref_policy_factory is not None:
+        local = threading.local()
+
+        def get():
+            if not hasattr(local, "r"):
+                local.r = as_policy(ref_policy_factory())
+            return local.r
+        return get
+    if ref_policy is None:
+        return lambda: None
+    shared = as_policy(ref_policy)
+    if workers > 1 and not getattr(shared, "thread_safe", False):
+        shared = LockedPolicy(shared)
+    return lambda: shared
+
+
+def first_context(spec: dict, first_user: str | None) -> list[dict] | None:
+    """The messages the first reply answers (shared by a group's rollouts), or None if it isn't fixed."""
+    kind, text = _plan(spec)[0]
+    u = f"{AGENT_TAG}\n{text}" if kind == "agent" else text if kind == "script" else first_user
+    return None if u is None else [{"role": "system", "content": spec["system"]}, {"role": "user", "content": u}]
+
+
 def first_message(spec: dict, sim: Simulator, meter: CostMeter | None = None) -> str | None:
     """The shared opening human message of a group (deterministic: the sim call is seeded by the spec)."""
     if spec.get("script") or spec["scenario"] == "agent":
@@ -314,12 +363,15 @@ def first_message(spec: dict, sim: Simulator, meter: CostMeter | None = None) ->
 
 
 def run_groups(specs: list[dict], G: int, sim: Simulator, judge: Judge, policy=None, policy_factory=None,
-               workers: int = 1, meter: CostMeter | None = None, diversity: bool = True, **kw) -> list[list[dict]]:
-    """G rollouts for each spec, all of them `workers` at a time (across groups too). Each group's first simulated
-    message is asked once, before the fan-out, and shared by its G rollouts. policy_factory() (called per rollout)
-    gives each rollout its own policy state; a shared `policy` must be thread-safe when workers > 1.
-    diversity: score group_dup (near-duplicate replies across the G rollouts) and recompute the scalars.
-    kw: run_episode's (weights, score_mode, ref_policy); reference replies are shared through one cache."""
+               workers: int = 1, meter: CostMeter | None = None, diversity: bool = True, ref_policy=None,
+               ref_policy_factory=None, **kw) -> list[list[dict]]:
+    """G rollouts for each spec, all of them `workers` at a time (across groups too). Before the fan-out, each group's
+    first simulated message AND the reference reply to that first context are computed once, so all G rollouts
+    share both. policy_factory() (called per rollout) gives each rollout its own policy state; a shared `policy` must
+    be thread-safe when workers > 1. The reference: ref_policy_factory() per thread, or a shared ref_policy (locked
+    unless thread_safe). After scoring: group_dup (diversity) and reward.harmonize_group (a judge component missing
+    in some rollouts is dropped for the whole group), then the scalars are recomputed.
+    kw: run_episode's (weights, score_mode)."""
     if policy_factory is None:
         if policy is None:
             raise ValueError("pass policy or policy_factory")
@@ -328,22 +380,28 @@ def run_groups(specs: list[dict], G: int, sim: Simulator, judge: Judge, policy=N
         policy_factory = lambda: policy  # noqa: E731
     firsts = _map(lambda s: first_message(s, sim, meter), specs, workers)
     jobs = [(si, g) for si in range(len(specs)) for g in range(G)]
-    if kw.get("ref_policy") is not None:
-        kw.setdefault("ref_cache", {})
+    get_ref = ref_getter(ref_policy, ref_policy_factory, workers)
+    ref_cache: dict = kw.pop("ref_cache", None) or {}
+    if ref_policy is not None or ref_policy_factory is not None:
+        ctxs = [first_context(s, f) for s, f in zip(specs, firsts)]
+        _map(lambda c: c and reference(get_ref(), c, ref_cache), ctxs, workers)
 
     def one(job):
         si, g = job
         m = CostMeter()
-        ep = run_episode(specs[si], policy_factory(), sim, judge, m, first_user=firsts[si], **kw)
+        r = get_ref()
+        ep = run_episode(specs[si], policy_factory(), sim, judge, m, first_user=firsts[si], ref_policy=r,
+                         ref_cache=ref_cache if r is not None else None, **kw)
         ep["group_index"] = g
         if meter is not None:
             meter.merge(m)
         return ep
     eps = _map(one, jobs, workers)
     groups = [eps[si * G:(si + 1) * G] for si in range(len(specs))]
-    if diversity:
-        for g in groups:
+    for g in groups:
+        if diversity:
             R.apply_group_diversity(g, kw.get("weights"), kw.get("score_mode", "mean"))
+        R.harmonize_group(g, kw.get("weights"), kw.get("score_mode", "mean"))
     return groups
 
 
@@ -351,6 +409,68 @@ def rollout_group(spec: dict, policy, G: int, sim: Simulator, judge: Judge, mete
                   workers: int = 1, policy_factory=None, **kw) -> list[dict]:
     """G episodes of one spec (run_groups for a single spec)."""
     return run_groups([spec], G, sim, judge, policy, policy_factory, workers, meter, **kw)[0]
+
+
+def run_tree(spec: dict, policy_factory, G: int, sim: Simulator, judge: Judge, meter: CostMeter | None = None,
+              workers: int = 1, ref_policy=None, ref_policy_factory=None, weights: dict | None = None,
+              seed: int | None = None) -> dict:
+    """Tree rollout: at EVERY turn, G candidate replies to the same shared prefix, so every reply position gets a
+    clean in-group baseline (a plain group only shares turn 1). Each candidate comes from a fresh policy
+    (policy_factory()) given the whole prefix; each is scored on prefix + itself (one judge call per candidate, plus a
+    pairwise call with a reference); the chat goes on with one candidate picked at random (seeded), and the simulator
+    answers that one. Returns {"turns": the trunk, "positions": [[candidate record, ...] (G) per turn]}; candidate
+    records have "replies" (one), "advantage" filled by group_advantages, and "extra" (the policy's tokens)."""
+    import random as _random
+    rng = _random.Random(spec["seed"] if seed is None else seed)
+    meter = meter if meter is not None else CostMeter()
+    get_ref = ref_getter(ref_policy, ref_policy_factory, workers)
+    chat = [{"role": "system", "content": spec["system"]}]
+    trunk, positions = [], []
+    i = 0
+    prev, _CTX.meter = getattr(_CTX, "meter", None), meter
+    try:
+        for kind, text in _plan(spec):
+            if kind == "agent":
+                u = f"{AGENT_TAG}\n{text}"
+            else:
+                i += 1
+                u = text if kind == "script" else sim.next_user(spec, trunk, i, meter)
+                if u is None:
+                    break
+            ctx = chat + [{"role": "user", "content": u}]
+            ref = get_ref()
+            ref_text = reference(ref, ctx, None) if ref is not None else None
+
+            def cand(g, ctx=ctx, u=u, ref_text=ref_text):
+                p = as_policy(policy_factory())
+                if hasattr(p, "start"):
+                    p.start(spec)
+                out = p.generate(ctx)
+                out = {"text": out} if isinstance(out, str) else dict(out)
+                t_out = (out.pop("text", "") or "").strip()
+                ev = {"say": t_out}
+                if out.get("raw") is not None:
+                    ev["raw"] = out.pop("raw")
+                turn = {"user": u, "events": [ev], "extra": out}
+                if ref_text is not None:
+                    turn["ref"] = ref_text
+                m = CostMeter()
+                ep = score_episode(spec, trunk + [turn], judge, m, weights)
+                meter.merge(m)
+                last = ep["replies"][-1]
+                return {"replies": [last], "judge_ok": ep["judge_ok"], "reward": last["scalar"], "extra": out,
+                        "turn": turn, "lang": ep["lang"], "components": {}}
+            cands = _map(cand, list(range(G)), workers)
+            R.apply_group_diversity(cands, weights)
+            R.harmonize_group(cands, weights)
+            group_advantages(cands, "utterance")
+            positions.append(cands)
+            pick = cands[rng.randrange(G)]["turn"]
+            trunk.append(pick)
+            chat = ctx + [{"role": "assistant", "content": pick["events"][0]["say"]}]
+    finally:
+        _CTX.meter = prev
+    return {"spec_id": spec["id"], "turns": trunk, "positions": positions}
 
 
 def group_advantages(group: list[dict], level: str = "utterance", normalize: bool = True) -> list[list[float | None]]:

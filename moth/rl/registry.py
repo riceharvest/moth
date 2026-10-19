@@ -49,7 +49,13 @@ HELDOUT_PCT = 10
 SCENARIOS = ("talk", "agent", "recall")   # a pure chatbot: no home/tools scenario (eval_v1/v2 still have one)
 SCENARIO_MIX = {"talk": 0.6, "agent": 0.28, "recall": 0.12}
 LEGACY_EVALS = {"v1", "v2"}   # frozen before the no-tools spec: stale system prompts and "home" specs
-TURN_CHOICES = [3, 4, 5, 6, 6, 8]
+TURN_CHOICES = [3, 4, 5, 6, 6, 8, 10]
+LONG_TURNS = (14, 20)   # style "long"
+# how the simulated friend behaves beyond its persona (sim.STYLE_NOTES): shares of chat specs
+STYLES = {None: 0.58, "long": 0.10, "paste": 0.06, "code_switch": 0.08, "abusive": 0.05, "distressed": 0.07,
+          "terse": 0.06}
+CODE_SWITCH_LANGS = {"hi", "es", "fr"}   # Hinglish, Spanglish, franglais (an English chat stays plain)
+BEHAVIOUR_HELDOUT_PCT = 20   # personas / scenarios / topics held out for the eval simulator
 RECALL_FACTS = [("your name (make one up)", "your name"), ("your pet's name and what animal it is (make it up)",
                 "your pet"), ("your favourite food", "your favourite food"), ("your favourite colour",
                 "your favourite colour"), ("where you're going this weekend", "your weekend plan"),
@@ -98,12 +104,42 @@ def collides_heldout(card: dict) -> bool:
     return any(_has(p, text) for p in HELD_PHRASES) or bool(names & HELD_NAMES)
 
 
+TRAIN_KIND_CORES = {kind_core(k) for k, *_ in C.KINDS}
+TRAIN_NAMES = ({n for _, ns, _ in C.KINDS for n in ns} | set(C.HUMAN_NAMES)) - HELD_NAMES
+
+
+def is_moth(card: dict) -> bool:
+    """moth is never trained on (user decision): name or kind moth, or a line that says it is a moth."""
+    text = " ".join([card.get("kind") or ""] + list(card.get("lines") or [])).lower()
+    return (card.get("name") or "").lower() == "moth" or kind_core(card.get("kind") or "a x") == "moth" or bool(
+        re.search(r"\b(?:a|an)\s+(?:[a-z']+\s+){0,2}?moth\b", text))
+
+
+def id_keys(card: dict) -> set[str]:
+    """What a card's identity is made of, for leakage checks: its name and its kind (adjectives stripped)."""
+    ks = set()
+    if (card.get("name") or "").strip():
+        ks.add("name:" + card["name"].strip().lower())
+    if card.get("kind"):
+        ks.add("kind:" + kind_core(card["kind"]))
+    if is_moth(card):
+        ks.add("kind:moth")
+    return ks
+
+
 def card_split(card: dict) -> str:
+    if is_moth(card):
+        return "heldout"
     if card.get("split") in ("train", "heldout"):
         return card["split"]
     if collides_heldout(card) or (hasattr(C, "is_heldout") and C.is_heldout(card)):
         return "heldout"
-    return "heldout" if bucket("card:" + card["id"]) < HELDOUT_PCT else "train"
+    core = kind_core(card["kind"]) if card.get("kind") else None
+    if (core and core in TRAIN_KIND_CORES) or (card.get("name") or "").lower() in TRAIN_NAMES:
+        return "train"   # a training kind or name: it stays on the training side
+    # hash by identity, so every card of a new kind (or with a new name) lands on the same side, for good
+    key = "kind:" + core if core else ("name:" + card["name"].lower()) if card.get("name") else "card:" + card["id"]
+    return "heldout" if bucket(key) < HELDOUT_PCT else "train"
 
 
 def phrasing_split(p: dict) -> str:
@@ -193,17 +229,24 @@ class Registry:
 
     # --- loading -----------------------------------------------------------------------------------------------
     def reload(self):
-        builtin = ([{**C.MOTH_CARD, "split": "train", "source": "builtin"},
+        builtin = ([{**C.MOTH_CARD, "split": "heldout", "source": "builtin_heldout"},   # moth: never trained on
                     {**C.BLANK_CARD, "split": "train", "source": "builtin"}]
                    + [{**c, "split": "train", "source": "builtin_pool"} for c in C.build_pool()]
                    + [{**c, "split": "heldout", "source": "builtin_heldout"} for c in C.heldout_cards()])
-        seen = {c["id"] for c in builtin}
+        uniq = {}
+        for c in builtin:   # a card in two built-in lists (e.g. moth once the core lists it as held-out): held-out wins
+            if c["id"] not in uniq or c["split"] == "heldout":
+                uniq[c["id"]] = c
+        builtin = list(uniq.values())
+        seen = set(uniq)
         added = []
         for c in _read_ndjson(self.cards_path):
             if c["id"] not in seen:
                 seen.add(c["id"])
                 added.append(_current(c))   # appended: split by hash only
-        self._cards = [{**c, "split": card_split(c)} for c in builtin + added]
+        cards = [{**c, "split": card_split(c)} for c in builtin + added]
+        self._resolve_leaks(cards, {c["id"] for c in added})
+        self._cards = cards
         phr = ([{"id": phrasing_id(t), "tmpl": t, "split": "train", "source": "builtin"} for t in C.PHRASINGS]
                + [{"id": phrasing_id(t), "tmpl": t, "split": "heldout", "source": "builtin"}
                   for t in C.HELDOUT_PHRASINGS])
@@ -216,6 +259,31 @@ class Registry:
                 phr.append({k: v for k, v in p.items() if not (k == "split" and v != "heldout")})
         self._phr = [{**p, "split": phrasing_split(p)} for p in phr]
         self._by_id = {c["id"]: c for c in self._cards}
+
+    def _resolve_leaks(self, cards: list[dict], appended: set[str]):
+        """No identity on both sides of the split, in either direction:
+        * an appended card that would train but shares a name or kind with a held-out card goes held-out;
+        * a held-out card that shares a name or kind with a training card (e.g. a held-out cactus vs the pool's
+          cactus cards, a held-out hedgehog named spike vs the pool's cactus named spike) is QUARANTINED: in neither
+          split (never trained, never evaluated; leaks() lists them with the reason)."""
+        held = set().union(*(id_keys(c) for c in cards if c["split"] == "heldout"))
+        for c in cards:
+            if c["split"] == "train" and c["id"] in appended and id_keys(c) & held:
+                c["split"] = "heldout"
+        train = {}
+        for c in cards:
+            if c["split"] == "train":
+                for k in id_keys(c):
+                    train.setdefault(k, c["id"])
+        for c in cards:
+            if c["split"] == "heldout":
+                hit = sorted(k for k in id_keys(c) if k in train)
+                if hit:
+                    c["split"] = "quarantined"
+                    c["leak"] = [f"{k} also in training card {train[k]}" for k in hit]
+
+    def leaks(self) -> list[dict]:
+        return [c for c in self._cards if c["split"] == "quarantined"]
 
     def cards(self, split: str | None = None) -> list[dict]:
         return [c for c in self._cards if split is None or c["split"] == split]
@@ -233,6 +301,11 @@ class Registry:
             f.write(json.dumps(obj, ensure_ascii=False, sort_keys=True) + "\n")
 
     def add_card(self, card: dict, source: str = "manual", heldout: bool = False) -> dict | None:
+        if is_moth(card) and not heldout:
+            raise ValueError("moth is never trained on: add it with heldout=True (or not at all)")
+        return self._add_card(card, source, heldout)
+
+    def _add_card(self, card: dict, source: str = "manual", heldout: bool = False) -> dict | None:
         """Append one card (None if its id is already known). Raises ValueError for an eval friend's name.
         heldout=True pins it to the held-out pool (growing the eval; refused if a training card has its name); a
         card named like a held-out one is pinned held-out too, so a name never crosses the split."""
@@ -279,25 +352,17 @@ class Registry:
     def sample_card(self, rng: random.Random, split: str = "train", p_free: float = P_FREE) -> dict:
         """A card for one episode: train -> moth ~8% / blank ~10% / a train card, ~40% phrased free-form with a
         train phrasing. heldout -> a held-out card, ~40% phrased with any phrasing (the pair counts as held-out)."""
-        if split == "train":
-            x = rng.random()
-            if x < C.SHARES["moth"]:
-                card = self.card("moth")
-            elif x < C.SHARES["moth"] + C.SHARES["blank"]:
+        if split == "train":   # moth is held-out: never sampled for training
+            if rng.random() < C.SHARES["blank"]:
                 return dict(self.card("blank"))
-            else:
-                card = rng.choice([c for c in self.cards("train") if c["id"] not in ("moth", "blank")])
+            card = rng.choice([c for c in self.cards("train") if c["id"] != "blank"])
         else:
             card = rng.choice(self.cards("heldout"))
-        if (card.get("lines") is None or card["id"] == "moth") and rng.random() < p_free:
-            src = {**card, "kind": card.get("kind") or ("a moth" if card["id"] == "moth" else None)}
-            opts = [x for x in (self.phrase({**src, "split": card["split"]}, p) for p in self.phrasings(
+        if card.get("lines") is None and rng.random() < p_free:
+            opts = [x for x in (self.phrase({**card, "split": card["split"]}, p) for p in self.phrasings(
                     "train" if split == "train" else None)) if x]
             if opts:
-                c = rng.choice(opts)
-                if card["id"] == "moth":
-                    c["refs"] = C.MOTH_REFS
-                return c
+                return rng.choice(opts)
         return dict(card)
 
 
@@ -329,15 +394,41 @@ MOCK_AGENT_MSGS = [   # tiny built-in stand-ins for the training pool (mock runs
 _WARNED: list = []
 
 
+def behaviour(kind: str, split: str = "train") -> list[str]:
+    """The user-behaviour pools, split by a stable hash so the eval simulator plays personas, goals and topics the
+    training simulator never played: kind in persona / scenario / topic / agent_persona / agent_scenario."""
+    pool = {"persona": USER_PERSONAS, "scenario": TALK_SCENARIOS, "topic": TOPICS,
+            "agent_persona": AGENT_USER_PERSONAS, "agent_scenario": AGENT_SCENARIOS}[kind]
+    held = [x for x in pool if bucket(f"{kind}:{x}") < BEHAVIOUR_HELDOUT_PCT]
+    if not held:   # small pools: hold out the lowest bucket
+        held = [min(pool, key=lambda x: bucket(f"{kind}:{x}"))]
+    if split == "heldout":
+        return held
+    return [x for x in pool if x not in held]
+
+
+def pick_style(rng: random.Random, lang: str, scenario: str) -> str | None:
+    styles = [s for s in STYLES if not (s == "code_switch" and lang not in CODE_SWITCH_LANGS)
+              and not (scenario == "agent" and s in ("long", "paste"))]
+    return rng.choices(styles, weights=[STYLES[s] for s in styles])[0]
+
+
 def make_spec(card: dict, scenario: str, rng: random.Random, seed: int, agent_msgs: list[str] | None = None,
-              sid: str | None = None, turns: int | None = None) -> dict:
-    """A fully resolved episode spec (JSON-serialisable): everything the simulator and policy need."""
+              sid: str | None = None, turns: int | None = None, split: str = "train") -> dict:
+    """A fully resolved episode spec (JSON-serialisable): everything the simulator and policy need. split picks the
+    user-behaviour pools (behaviour()): held-out personas/goals/topics for eval specs."""
+    lang = card.get("lang") or "en"
     spec = {"id": sid or f"{card['id']}:{scenario}:{seed}", "seed": seed, "scenario": scenario, "card": card,
-            "card_id": card["id"], "system": C.student_system(card), "topic": rng.choice(TOPICS),
+            "card_id": card["id"], "system": C.student_system(card), "topic": rng.choice(behaviour("topic", split)),
             "turns": turns or rng.choice(TURN_CHOICES), "script": None, "agent_msgs": [], "recall": None,
-            "lang": card.get("lang") or "en"}
+            "lang": lang, "style": pick_style(rng, lang, scenario), "behaviour_split": split}
+    if spec["style"] == "long" and not turns:
+        spec["turns"] = rng.randint(*LONG_TURNS)
+    if spec["style"] == "paste":
+        spec["paste_turn"] = rng.randint(1, max(1, min(3, spec["turns"])))
     if scenario == "agent":
-        spec["persona"], spec["goal"] = rng.choice(AGENT_USER_PERSONAS), rng.choice(AGENT_SCENARIOS)
+        spec["persona"] = rng.choice(behaviour("agent_persona", split))
+        spec["goal"] = rng.choice(behaviour("agent_scenario", split))
         if not agent_msgs and not _WARNED:
             _WARNED.append(1)
             print("moth.rl: no agent messages given: agent episodes use the 8 built-in stand-ins (MOCK_AGENT_MSGS); "
@@ -348,8 +439,8 @@ def make_spec(card: dict, scenario: str, rng: random.Random, seed: int, agent_ms
         spec["follow"] = [rng.choice([0, 1, 1, 2]) for _ in spec["agent_msgs"]]   # sim turns after each agent msg
         spec["turns"] = len(spec["agent_msgs"]) + sum(spec["follow"])
     else:
-        spec["persona"] = rng.choice(USER_PERSONAS)
-        spec["goal"] = rng.choice(TALK_SCENARIOS)
+        spec["persona"] = rng.choice(behaviour("persona", split))
+        spec["goal"] = rng.choice(behaviour("scenario", split))
     if scenario == "recall":
         fact, short = rng.choice(RECALL_FACTS)
         share = rng.choice([1, 2])
@@ -378,10 +469,28 @@ def sample_spec(reg: Registry, rng: random.Random, split: str = "train", mix: di
     return make_spec(card, scenario, random.Random(seed), seed, agent_msgs)
 
 
-def train_agent_msgs(path: str | None) -> list[str]:
-    """Training agent messages from a pool file, minus the frozen eval ones (they must stay out of training)."""
-    held = eval_agent_texts()
-    return [t for t in load_agent_msgs(path) if t not in held]
+def shingles(text: str, n: int = 3) -> set:
+    ws = re.findall(r"[a-z0-9_]+", clean_agent_message(text).lower())
+    return {tuple(ws[i:i + n]) for i in range(max(1, len(ws) - n + 1))}
+
+
+def jaccard(a: set, b: set) -> float:
+    return len(a & b) / len(a | b) if a or b else 0.0
+
+
+NEAR_DUP = 0.5
+
+
+def train_agent_msgs(path: str | None, threshold: float = NEAR_DUP) -> list[str]:
+    """Training agent messages from a pool file, minus every near-duplicate of a frozen eval message (Jaccard of word
+    3-shingles >= threshold after cleaning: reworded / re-run copies of a held-out message stay out too)."""
+    held = [shingles(t) for t in eval_agent_texts()]
+    out = []
+    for t in load_agent_msgs(path):
+        s = shingles(t)
+        if not any(jaccard(s, h) >= threshold for h in held):
+            out.append(t)
+    return out
 
 
 # --- frozen eval sets -----------------------------------------------------------------------------------------
@@ -393,19 +502,18 @@ def _digest(specs: list[dict]) -> str:
     return _h(json.dumps(specs, sort_keys=True, ensure_ascii=False))
 
 
-MOTH_CHATS_PER_LANG = 30     # the shipped default card: its own big slice (agent reactions = the headline slice)
-BLANK_CHATS_PER_LANG = 2
+BLANK_CHATS_PER_LANG = 1
 
 
 def build_eval_specs(reg: Registry, per_card: int | None = None, seed: int = 1947, multilingual: bool = True
                      ) -> list[dict]:
-    """The frozen eval design (v5+): breadth over depth, because card variance dominates.
-    * every held-out base card: one chat per language (LANGS), scenarios cycling talk/agent/recall, the card in its
-      own form for even languages and in a held-out phrasing for odd ones (when one fits); plus ONE English
-      who-are-you probe (card_who / card_name / card_about rotating over cards);
-    * the moth card (the shipped default): MOTH_CHATS_PER_LANG chats per language, 2/3 of them agent reactions,
-      plus the three English probes; the blank card: BLANK_CHATS_PER_LANG per language plus one probe.
-    per_card is ignored (v3/v4 used an earlier design; frozen files are snapshots and are never rebuilt)."""
+    """The frozen eval design (v5+): breadth over depth, because card variance dominates. Every held-out identity
+    (moth is one of them, nothing special) gets one chat per language (LANGS), scenarios cycling talk/agent/recall,
+    in its own form for even languages and in a held-out phrasing for odd ones (when one fits), plus ONE English
+    who-are-you probe (card_who / card_name / card_about rotating). The users are played with the held-out personas,
+    goals and topics (behaviour("...", "heldout")). The blank card (a training card: no identity) gets one chat per
+    language as a small reported slice. per_card is ignored (v3/v4 used an earlier design; frozen files are
+    snapshots and are never rebuilt)."""
     from moth.probes import CARD_PROBES, stable_seed
     agent = load_agent_msgs(EVAL_AGENT_MSGS) or MOCK_AGENT_MSGS
     held_ph = reg.phrasings("heldout")
@@ -415,7 +523,7 @@ def build_eval_specs(reg: Registry, per_card: int | None = None, seed: int = 194
     def chat(c, scen, lang, k):
         c = {**c, "lang": lang}
         s = stable_seed(f"rl:{c['id']}:{scen}:{lang}", k)
-        specs.append(make_spec(c, scen, random.Random(s + seed), s, agent))
+        specs.append(make_spec(c, scen, random.Random(s + seed), s, agent, split="heldout"))
 
     def probe(c, which):
         _, name, lines, check = CARD_PROBES[which % len(CARD_PROBES)]
@@ -431,15 +539,10 @@ def build_eval_specs(reg: Registry, per_card: int | None = None, seed: int = 194
             form = phrased if (li % 2 == 1 and phrased) else c
             chat(form, SCENARIOS[(i + li) % len(SCENARIOS)], lang, 0)
         probe(c, i)
-    moth, blank = reg.card("moth"), reg.card("blank")
-    for lang in langs:
-        for k in range(MOTH_CHATS_PER_LANG):
-            chat(moth, "agent" if k % 3 != 2 else ("talk", "recall")[(k // 3) % 2], lang, k)
+    blank = reg.card("blank")
+    for li, lang in enumerate(langs):
         for k in range(BLANK_CHATS_PER_LANG):
-            chat(blank, SCENARIOS[k % len(SCENARIOS)], lang, k)
-    for w in range(len(CARD_PROBES)):
-        probe(moth, w)
-    probe(blank, 0)
+            chat(blank, SCENARIOS[(li + k) % len(SCENARIOS)], lang, k)
     ids = [s["id"] for s in specs]
     assert len(ids) == len(set(ids)), "eval spec ids must be unique"
     return specs

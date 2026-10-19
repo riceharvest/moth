@@ -31,6 +31,7 @@ from moth.rl.registry import Registry, sample_spec, train_agent_msgs  # noqa: E4
 from moth.rl.sim import SIM_MODEL, LLMSimulator, MockSimulator  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+EVAL_SIM_TEMP = 0.7   # eval: fixed seeds per pass, but passes differ (temperature 0 made them repeat)
 
 
 def show(ep: dict) -> str:
@@ -61,9 +62,11 @@ def build_moth(a):
     return MothPolicy(Moth(ns), legacy_prompt=getattr(a, "legacy_prompt", False))
 
 
-def make_judge(kind: str, url: str, model: str | None, cache: JudgeCache, role: str):
+def make_judge(kind: str, url: str, model: str | None, cache: JudgeCache, role: str, rubric: str = "reward",
+               family: str | None = None):
     cl = OAIClient(url, model)
-    return ForwardPassJudge(cl, cache, role) if kind == "forward" else LLMJudge(cl, cache, role)
+    cls = ForwardPassJudge if kind == "forward" else LLMJudge
+    return cls(cl, cache, role, rubric, family)
 
 
 def components(a, mock: bool):
@@ -71,19 +74,26 @@ def components(a, mock: bool):
     cache = JudgeCache(os.path.join(a.out, "judge_cache.jsonl") if a.out else None)
     if mock:
         return MockSimulator(), MockJudge(cache)
-    temp = a.sim_temperature if a.sim_temperature is not None else (0.0 if a.cmd == "eval" else 1.0)
-    return (LLMSimulator(OAIClient(a.sim_url, a.sim_model), temperature=temp),
-            make_judge(a.judge_kind, a.judge_url, a.judge_model, cache, "judge"))
+    temp = a.sim_temperature if a.sim_temperature is not None else (EVAL_SIM_TEMP if a.cmd == "eval" else 1.0)
+    if a.cmd == "eval" and getattr(a, "eval_sim_url", None):   # the eval simulator: a different model on purpose
+        sim = LLMSimulator(OAIClient(a.eval_sim_url, a.eval_sim_model), temperature=temp, role="eval_sim")
+    else:
+        if a.cmd == "eval":
+            print("WARNING: eval uses the training simulator; pass --eval-sim-url (a different chat model) so the "
+                  "policy can't overfit the training sim", file=sys.stderr, flush=True)
+        sim = LLMSimulator(OAIClient(a.sim_url, a.sim_model), temperature=temp)
+    return sim, make_judge(a.judge_kind, a.judge_url, a.judge_model, cache, "judge", family=a.judge_family)
 
 
 def eval_judge(a, mock: bool):
     """The eval-only judge (headline); never the reward judge."""
     cache = JudgeCache(os.path.join(a.out, "eval_judge_cache.jsonl") if a.out else None)
     if mock:
-        return MockJudge(cache, name="mock-eval-judge", role="eval_judge")
+        return MockJudge(cache, name="mock-eval-judge", role="eval_judge", rubric="eval")
     if not a.eval_judge_url:
         raise SystemExit("eval needs --eval-judge-url (a different model than the reward judge, e.g. GEV)")
-    return make_judge(a.eval_judge_kind, a.eval_judge_url, a.eval_judge_model, cache, "eval_judge")
+    return make_judge(a.eval_judge_kind, a.eval_judge_url, a.eval_judge_model, cache, "eval_judge", rubric="eval",
+                      family=a.eval_judge_family)
 
 
 def ref_policy(a, mock: bool):
@@ -120,11 +130,13 @@ def main(argv=None):
             p.add_argument("--sim-url", default="http://127.0.0.1:8001/v1")
             p.add_argument("--sim-model", default=None, help=f"served name (plan: {SIM_MODEL}); default /v1/models")
             p.add_argument("--sim-temperature", type=float, default=None,
-                           help="default 0 for eval (pairs line up better), 1.0 for run")
+                           help="default 0.7 for eval (seeded per pass), 1.0 for run")
             p.add_argument("--judge-url", default="http://127.0.0.1:8000/v1")
             p.add_argument("--judge-model", default=None, help=f"reward judge, served name (plan: {JUDGE_MODEL})")
             p.add_argument("--judge-kind", choices=["generative", "forward"], default="generative",
                            help="reward judge: generative JSON labels (Qwen) or forward-pass P(yes) (JEV)")
+            p.add_argument("--judge-family", default=None, help="underlying model of the reward judge (default: from "
+                           "its served name)")
             p.add_argument("--ref-policy-url", default=None, help="frozen SFT reference for the vs_ref reward")
             p.add_argument("--ref-policy-model", default=None)
             p.add_argument("--policy-url", default=None)
@@ -165,6 +177,9 @@ def main(argv=None):
     e.add_argument("--eval-judge-url", default=None, help="eval-only judge (headline), not the reward judge")
     e.add_argument("--eval-judge-model", default=None)
     e.add_argument("--eval-judge-kind", choices=["generative", "forward"], default="generative")
+    e.add_argument("--eval-judge-family", default=None)
+    e.add_argument("--eval-sim-url", default=None, help="eval simulator: a different chat model than the training sim")
+    e.add_argument("--eval-sim-model", default=None)
     e.add_argument("--no-reward-judge", action="store_true", help="skip the reward-judge agreement section")
     e.add_argument("--gold", default=None, help="frozen human/Claude-labelled JSONL: each judge's agreement")
     gs = sub.add_parser("gold-sheet", help="600-reply labelling sheet: half random, half stratified")
@@ -172,6 +187,13 @@ def main(argv=None):
     gs.add_argument("--out", required=True)
     gs.add_argument("--n", type=int, default=600)
     gs.add_argument("--seed", type=int, default=0)
+    gs.add_argument("--refresh", action="store_true", help="only replies where the reward and eval judges disagree")
+    ad = sub.add_parser("adversarial", help="adversarial reply suite (the pilot gate with a real reward judge)")
+    ad.add_argument("--mock", action="store_true")
+    ad.add_argument("--judge-url", default="http://127.0.0.1:8000/v1")
+    ad.add_argument("--judge-model", default=None)
+    ad.add_argument("--judge-kind", choices=["generative", "forward"], default="generative")
+    ad.add_argument("--out", default=None)
     pl = sub.add_parser("plan", help="MDE table for planned eval sizes")
     pl.add_argument("--deff", type=float, default=1.5, help="design effect (eval reports measure it)")
     pl.add_argument("--replies", type=int, nargs="+", default=[2000, 10000])
@@ -194,13 +216,24 @@ def main(argv=None):
         return
 
     if a.cmd == "gold-sheet":
-        from moth.rl.gold import build_sheet, load_items, write_sheet
-        rows = build_sheet(load_items(a.inputs), a.n, a.seed)
+        from moth.rl.gold import build_refresh, build_sheet, load_items, write_sheet
+        items = load_items(a.inputs)
+        rows = build_refresh(items, a.n, a.seed) if a.refresh else build_sheet(items, a.n, a.seed)
         write_sheet(rows, a.out)
         import collections as _c
         print(f"{a.out}: {len(rows)} replies", dict(_c.Counter(r["stratum"] for r in rows)),
               dict(_c.Counter(r["lang"] for r in rows)))
         return
+
+    if a.cmd == "adversarial":
+        from moth.rl.adversarial import report, run_suite
+        j = MockJudge() if a.mock else make_judge(a.judge_kind, a.judge_url, a.judge_model, JudgeCache(), "judge")
+        res = run_suite(j)
+        print(report(res))
+        if a.out:
+            os.makedirs(a.out, exist_ok=True)
+            write_json(os.path.join(a.out, "adversarial.json"), res, indent=1)
+        return res
 
     if a.cmd == "plan":
         from moth.rl.stats import plan
@@ -248,7 +281,11 @@ def main(argv=None):
         os.makedirs(a.out, exist_ok=True)
     sim, judge = components(a, mock)
     total = CostMeter()
-    eps = run_episodes(specs, pf, sim, judge, a.workers, total=total, ref_policy=ref_policy(a, mock))
+    ref = ref_policy(a, mock)
+    if ref is None and not mock:
+        print("WARNING: no --ref-policy-url: no vs_ref (the anti-blandness term) in these rewards", file=sys.stderr,
+              flush=True)
+    eps = run_episodes(specs, pf, sim, judge, a.workers, total=total, ref_policy=ref)
     for ep in eps:
         print(show(ep), flush=True)
     per = total.per_episode()
