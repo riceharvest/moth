@@ -353,11 +353,19 @@ down moth costs no more than the plain post. There is no `/moth` here: use `moth
 
 ### dsh: not built (options)
 
-- **A client slot in our cordis plugin.** `dsh/moth.mjs` could poll `/api/says` after `turn/end` and hand moth's
-  line to whatever display surface dsh exposes to plugins, the same way as Pi's widget.
+Checked against the installed `@deepseek-ai/dsh` 0.2.0-rc.2: its shipped profiles are `web`, `headless`, `sdk`,
+`sdk-minimal` and `acp`, and none has a terminal UI a plugin could draw in. The host-side cordis plugin that posts
+moth's turns (`dsh/moth.mjs`) has no display surface of its own.
+
+- **`web`:** the page is a React client built from slots (`dsh-client-ui-slots`). A moth line there would be a
+  web-client plugin: a browser half (plain JS handed `React` and `host`, `dsh-cordis-client-runner`) installed as a
+  Client module through the Plugin Manager, or a dynamic package the page has to approve each time it loads. Not
+  built: it needs the web client running against a model to check that the line renders and stays out of the turn.
+- **`headless` / `sdk` / `acp`:** the output belongs to the caller (the editor, for ACP), so there is nowhere to put
+  a line that isn't part of the session.
 - **`@linxin666/dsh-pet`.** If that pet plugin is installed, its announce call could carry moth's line.
 
-Neither was checked against dsh sources (dsh isn't installed here). Until then, use `moth tail` next to dsh.
+Until then, use `moth tail` or the desktop pet next to dsh.
 
 ---
 
@@ -506,6 +514,11 @@ Add this to `~/.dsh/profiles/<profile>/cordis.patch.yml`, a YAML list, next to a
 ```
 
 Or pass it for one run: `dsh --patch /path/to/patch.yml ...`, where the patch file holds the same list.
+
+`python -m moth hook dsh` does this for you (`$DSH_HOME` instead of `~/.dsh` when set). A fresh profile's file is a
+few comments and an empty flow list, `[]`, and a block line can't follow a flow list (dsh then refuses to boot), so
+moth's line replaces an empty `[]`, joins a non-empty `[...]` as its last item, and `unhook` leaves `[]` rather than
+an empty file, which dsh also rejects.
 
 - `session/event` is the "post-commit, fire-and-forget append feed" of every session-log event. From it the adapter:
   - remembers the text blocks of the newest `assistant/message` in the turn, skipping `interrupted: true`;
