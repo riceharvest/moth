@@ -440,7 +440,7 @@ def _fake_teacher(G, sent):
         elif "FINAL message an AI agent" in last:
             text = "Done. I updated the settings page and everything works now. Want me to also add a test?"
         else:
-            text = f"oh, the {words[k % 12]}? was it {words[(k // 7) % 12]} {k}?"
+            text = f"oh, the {words[k % 12]}? was it {words[(k // 7) % 12]} {k + 10**6}?"   # (never "1947")
         msg = types.SimpleNamespace(content=text, tool_calls=None)
         return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg, finish_reason="stop")])
     return chat
