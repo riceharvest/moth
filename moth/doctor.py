@@ -471,7 +471,7 @@ def check_setting(r: Report):
                  "default": "default"}[source]
         r.add("✓", "show_in_harness", f"{'on' if value else 'off'} ({where}): moth's replies "
                                       f"{'also show' if value else 'show only in the pet / moth tail, not'} inside "
-                                      f"Pi / OpenCode" + ("" if value else f"  ({prog()} config show_in_harness on)"))
+                                      f"Pi / OpenCode / Codex" + ("" if value else f"  ({prog()} config show_in_harness on)"))
     except Exception as e:
         r.add("✗", "show_in_harness", f"couldn't read the setting: {e}", f"{prog()} config")
 

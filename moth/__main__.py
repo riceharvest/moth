@@ -92,7 +92,7 @@ USAGE = """usage: python -m moth [serve options] [--open]
                                         autostart, the pet); asks first, safe to run again
        python -m moth config [show_in_harness on|off | pet_skin <id|folder|moth> | update_check on|off]
                                         print or change moth's settings (~/.moth/config.json); show_in_harness
-                                        shows moth's replies inside Pi / OpenCode (default off), pet_skin is
+                                        shows moth's replies inside Pi / OpenCode / Codex (default off), pet_skin is
                                         the desktop pet's look (a Petdex pet id, default moth), update_check
                                         is the pet's daily "new moth out" bubble (default on)
        python -m moth config [hide_in_fullscreen on|off | chirp on|off | muted_sources codex,pi|none |

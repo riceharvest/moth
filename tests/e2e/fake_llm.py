@@ -87,7 +87,7 @@ def _pieces(text: str):
     return [w + (" " if i < len(words) - 1 else "") for i, w in enumerate(words)]
 
 
-def make_handler(reply: str, log_path: str | None):
+def make_handler(reply: str, log_path: str | None, bodies_path: str | None = None):
     lock = threading.Lock()
 
     class H(BaseHTTPRequestHandler):
@@ -97,6 +97,9 @@ def make_handler(reply: str, log_path: str | None):
             pass
 
         def _log(self, body: bytes):
+            if bodies_path and body:   # every request body in full: what the model was really sent
+                with lock, open(bodies_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"path": self.path, "body": body.decode("utf-8", "replace")}) + "\n")
             if not log_path:
                 return
             rec = {"t": time.time(), "method": self.command, "path": self.path,
@@ -182,8 +185,9 @@ def main():
     ap.add_argument("--reply", default=REPLY)
     ap.add_argument("--info")
     ap.add_argument("--log")
+    ap.add_argument("--bodies", help="FILE: one JSON line per request with its whole body")
     a = ap.parse_args()
-    srv = Server(("127.0.0.1", a.port), make_handler(a.reply, a.log))
+    srv = Server(("127.0.0.1", a.port), make_handler(a.reply, a.log, a.bodies))
     if a.info:
         with open(a.info + ".tmp", "w") as f:
             json.dump({"port": srv.server_port, "pid": os.getpid()}, f)

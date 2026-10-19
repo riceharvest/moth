@@ -473,8 +473,8 @@ class LogStub:
     "restarts"; a poll with an old epoch gets the whole new log. A reaction to an agent turn lands `react` seconds
     after the post (moth thinking); chat answers after `delay`."""
 
-    def __init__(self, delay=0.0, react=0.2):
-        self.log, self.paths, self.epoch, stub = [], [], "e1", self
+    def __init__(self, delay=0.0, react=0.2, status="queued"):
+        self.log, self.paths, self.epoch, self.status, stub = [], [], "e1", status, self
 
         class H(BaseHTTPRequestHandler):
             def _json(self, obj, code=200):
@@ -515,7 +515,7 @@ class LogStub:
                     stub.log.append({"agent": text})
                     re_ = {k: body[k] for k in ("source", "session") if body.get(k)}
                     threading.Timer(react, stub.log.append, [{"say": f"ooh, {text}", "re": re_}]).start()
-                    return self._json({"events": []})
+                    return self._json({"ok": True, "status": stub.status})
                 stub.log.append({"you": text})
                 time.sleep(delay)
                 evs = [{"tool": "bash", "args": {"command": "ls"}, "result": "notes"}, {"say": f"hi back: {text}"}]
@@ -958,6 +958,111 @@ console.log(JSON.stringify({ toasts }));
 """
         r = self.node(driver, HERE / "opencode" / "moth.js", self.moth.url, env=self.ON)
         self.assertEqual(sorted(r["toasts"]), ["ooh, one", "ooh, two"])
+    # --- Codex: the Stop hook's {"systemMessage"} (drawn by the Codex TUI only, never sent to the model) ---------
+    def codex(self, session="cx-1", text="codex done", env=None, notify=False):
+        """Run the Codex adapter once; (stdout, seconds). Its display cursors live next to a per-test token copy."""
+        tok = os.path.join(self.tmp, "token")
+        if not os.path.exists(tok):
+            shutil.copy(os.environ["MOTH_TOKEN_FILE"], tok)
+        payload = {"hook_event_name": "Stop", "session_id": session, "cwd": "/srv/api", "last_assistant_message": text}
+        cmd = [sys.executable, str(HERE / "codex.py")]
+        if notify:
+            cmd.append(json.dumps({"type": "agent-turn-complete", "thread-id": session, "cwd": "/srv/api",
+                                   "last-assistant-message": text}))
+        t = time.monotonic()
+        p = subprocess.run(cmd, input="" if notify else json.dumps(payload), capture_output=True, text=True,
+                           encoding="utf-8", timeout=10, env={**os.environ, "MOTH_URL": self.moth.url,
+                                                              "MOTH_TOKEN_FILE": tok, "MOTH_CONFIG_FILE": self.cfg,
+                                                              **(env or {})})
+        self.assertEqual((p.returncode, p.stderr), (0, ""))
+        return p.stdout, time.monotonic() - t
+
+    def test_codex_off_by_default_posts_but_prints_nothing(self):
+        out, _ = self.codex()
+        self.assertEqual(out, "")
+        self.assertEqual(self.says_polls(), [])
+        self.assertEqual([p for m, p in self.moth.paths if m == "POST"], ["/api/agent"])
+
+    def test_codex_queued_reaction_shows_this_session_only(self):
+        """moth queues the turn (--react-every 0): the hook waits for this session's reaction and prints it as the
+        systemMessage; another session's newer line is never shown; terminal escapes are stripped."""
+        Path(self.cfg).write_text('{"show_in_harness": "on"}')
+        self.moth.log.append({"say": "old line", "re": {"source": "codex", "session": "cx-1"}})   # before: not shown
+        threading.Timer(0.1, self.moth.log.append, [{"say": "not yours", "re": {"source": "codex", "session": "x"}}]).start()
+        out, took = self.codex(text="fixed \x1b[31mthe\x1b[0m parser")
+        self.assertEqual(json.loads(out), {"systemMessage": "moth: ooh, fixed the parser"})
+        self.assertLess(took, GIVE_UP)
+        self.assertTrue(all("source=codex&session=cx-1&" in p for p in self.says_polls()), self.says_polls())
+
+    def test_codex_late_reaction_shows_at_the_next_turn(self):
+        """moth's default pacing: the post is batched and moth reacts a few seconds later. The hook doesn't wait
+        for it; the next turn of the same session shows it (once), a new session starts from its own baseline."""
+        self.moth.close()
+        self.moth = LogStub(react=0.3, status="batched")
+        out, took = self.codex(env=self.ON, text="first")
+        self.assertEqual(out, "")
+        self.assertLess(took, GIVE_UP)
+        time.sleep(0.6)   # moth reacted to "first" meanwhile
+        out, _ = self.codex(env=self.ON, text="second")
+        self.assertEqual(json.loads(out)["systemMessage"], "moth: ooh, first")
+        out, _ = self.codex(env=self.ON, session="cx-2", text="other")   # its own cursor: nothing of cx-1's
+        self.assertEqual(out, "")
+        time.sleep(0.6)
+        out, _ = self.codex(env=self.ON, text="third")   # "second"'s reaction, not "first" again
+        self.assertEqual(json.loads(out)["systemMessage"], "moth: ooh, second")
+
+    def test_codex_restarted_moth_shows_no_stale_line(self):
+        self.moth.close()
+        self.moth = LogStub(react=0.2, status="batched")
+        self.codex(env=self.ON, text="one")
+        time.sleep(0.4)
+        self.moth.epoch = "e2"   # moth restarted: its log starts over, our cursor is from the old one
+        out, _ = self.codex(env=self.ON, text="two")
+        self.assertEqual(out, "")
+
+    def test_codex_display_on_moth_slow_down_or_notify(self):
+        """On, a slow or down moth costs no more than the plain post; the notify path never prints."""
+        slow = Stub(delay=SLOW)   # answers GETs with 501 at once, posts only after SLOW
+        try:
+            old, self.moth.url = self.moth.url, slow.url
+            out, took = self.codex(env=self.ON)
+            self.assertEqual((out, slow.texts), ("", ["codex done"]))
+            self.assertLess(took, GIVE_UP)
+            self.moth.url = closed_url()
+            out, took = self.codex(env=self.ON)
+            self.assertEqual(out, "")
+            self.assertLess(took, GIVE_UP)
+            self.moth.url = old
+        finally:
+            slow.close()
+        out, _ = self.codex(env=self.ON, notify=True)
+        self.assertEqual(out, "")
+        self.assertEqual(self.says_polls(), [])
+
+    def test_codex_setting_spellings_match_python(self):
+        sys.path.insert(0, str(HERE.parents[1]))
+        from moth import config
+        spec = importlib.util.spec_from_file_location("moth_codex_adapter", HERE / "codex.py")
+        cx = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cx)
+        old = os.environ.get("MOTH_CONFIG_FILE")
+        try:
+            os.environ["MOTH_CONFIG_FILE"] = self.cfg
+            for env, file in [("", None), ("", '{"show_in_harness": true}'), ("", '{"show_in_harness": "On"}'),
+                              ("", '{"show_in_harness": "nah"}'), ("", '{"show_in_harness": 1}'), ("", "not json"),
+                              ("", "[]"), ("0", '{"show_in_harness": true}'), ("yes", '{"show_in_harness": false}'),
+                              ("maybe", '{"show_in_harness": true}'), (" true ", None), ("no", None)]:
+                os.environ["MOTH_SHOW_IN_HARNESS"] = env
+                if file is None:
+                    Path(self.cfg).unlink(missing_ok=True)
+                else:
+                    Path(self.cfg).write_text(file)
+                with self.subTest(env=env, file=file):
+                    self.assertEqual(cx.show_in_harness(), config.show_in_harness())
+        finally:
+            os.environ.pop("MOTH_SHOW_IN_HARNESS", None)
+            os.environ["MOTH_CONFIG_FILE"] = old
+
 
 def load_serve():
     """The real serve.py, with torch and the model code faked out (no model is loaded)."""

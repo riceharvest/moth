@@ -6,8 +6,8 @@ adapters and `python -m moth config` read it without torch.
   python -m moth config pet_skin <petdex id | folder | moth>
 
 Settings:
-  show_in_harness  (default off)  show moth's replies INSIDE the coding harness: the Pi widget above the editor and
-                   the OpenCode toast. Off, the adapters still send each agent reply to moth (the desktop pet and
+  show_in_harness  (default off)  show moth's replies INSIDE the coding harness: the Pi widget above the editor,
+                   the OpenCode toast and a "moth: ..." line under the turn in the Codex TUI. Off, the adapters still send each agent reply to moth (the desktop pet and
                    `moth tail` react as usual); they just don't draw anything in the harness. The adapters read the
                    file at every turn, so a change applies from the next turn, no restart.
                    MOTH_SHOW_IN_HARNESS=1/0 in the harness's environment beats the file (fixed for that process).
@@ -28,7 +28,7 @@ Settings:
                    says how to run it), an HF repo id, or openai:<base_url>#<model> for a local llama.cpp / Ollama /
                    vLLM server. Used from moth's next start; `--model` beats it. moth/docs/MODEL_BACKENDS.md.
 
-Values: on/off, 1/0, true/false, yes/no (any case), or a JSON true/false in the file. The Pi and OpenCode adapters
+Values: on/off, 1/0, true/false, yes/no (any case), or a JSON true/false in the file. The Pi, OpenCode and Codex adapters
 use the same rule (their `enabled()`). pet_skin takes any text ("default" resets it to moth).
 """
 from __future__ import annotations
@@ -48,7 +48,7 @@ LAST_UPDATE_CHECK = "last_update_check"   # the pet's bookkeeping (unix time), n
 SOURCES = ("claude-code", "codex", "hermes", "pi", "opencode", "dsh")   # the harnesses' "source" (moth/tail.py NAMES)
 
 USAGE = """usage: python -m moth config                          print the current settings
-       python -m moth config show_in_harness on|off   show moth's replies inside Pi / OpenCode (default off)
+       python -m moth config show_in_harness on|off   show moth's replies inside Pi / OpenCode / Codex (default off)
        python -m moth config pet_skin <id|folder|moth> the desktop pet's look: an installed Petdex pet (default moth)
        python -m moth config update_check on|off      the pet's daily "new moth out" bubble (default on)
        python -m moth config hide_in_fullscreen on|off  the pet hides while another app is fullscreen (default on)

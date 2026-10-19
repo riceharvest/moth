@@ -8,7 +8,7 @@
                checks they're complete (`moth update` or `hf download` finish a partial one).
   3 memory     moth needs about 1 GB; the pet won't wake it with less than ~3 GB free.
   4 hooks      the coding agents found here and whether moth is hooked in; one question per harness, installed
-               by moth/hooks.py (backs up and merges configs). Then show_in_harness (Pi / OpenCode, default off).
+               by moth/hooks.py (backs up and merges configs). Then show_in_harness (Pi / OpenCode / Codex, default off).
   5 autostart  start the pet at login (moth/autostart.py).
   6 the pet    start it now, detached, and wait until moth answers on /api/health. Logs: ~/.moth/pet.log and the
                server's log (~/.moth/serve.log).
@@ -414,21 +414,21 @@ class Setup:
                 elif not self.dry and p.actions:
                     ok = hooks.status(p.harness)["state"] == "installed"
                     (self.did if ok else self.left).append(f"{p.harness} hook" + ("" if ok else " (see the note)"))
-        self.show_in_harness([s["name"] for s in shown], {"pi", "opencode"} & set(chosen))
+        self.show_in_harness([s["name"] for s in shown], {"pi", "opencode", "codex"} & set(chosen))
 
     def show_in_harness(self, names: list[str], new: set):
-        """Asked when a Pi / OpenCode hook goes in this run and the setting was never set; otherwise one line."""
-        if not {"pi", "opencode"} & set(names):
+        """Asked when a Pi / OpenCode / Codex hook goes in this run and the setting was never set; otherwise one line."""
+        if not {"pi", "opencode", "codex"} & set(names):
             return
         value, source = config.lookup("show_in_harness")
         if source != "default" or not new:
             where = {"env": config.ENV["show_in_harness"], "file": "config"}.get(source, "default")
             self.line("✓" if source != "default" else "·",
                       f"show_in_harness: {'on' if value else 'off'} ({where}): moth's replies "
-                      f"{'also' if value else 'not'} shown inside pi / opencode  ({prog()} config show_in_harness "
+                      f"{'also' if value else 'not'} shown inside pi / opencode / codex  ({prog()} config show_in_harness "
                       f"{'off' if value else 'on'})")
             return
-        want = self.ask("show moth's replies inside pi / opencode too (show_in_harness)?", False)
+        want = self.ask("show moth's replies inside pi / opencode / codex too (show_in_harness)?", False)
         if self.dry or not want:
             return   # off is the default: nothing written (asked again next time, like any step left out)
         try:

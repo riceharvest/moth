@@ -246,7 +246,8 @@ and lets you talk to it there. `python -m moth.pet` is the desktop pet that says
 (optional: `pip install PySide6`) and wakes the server itself when none is running. moth reacts at most once every 2 minutes, unless the agent apologises, hits an
 error, or writes a wall of text. It holds its reaction while you're chatting with it.
 
-The Pi widget and the OpenCode toast are off until you run `python -m moth config show_in_harness on` (from `code/`;
+The Pi widget, the OpenCode toast and Codex's "moth: ..." line are off until you run
+`python -m moth config show_in_harness on` (from `code/`;
 `off` turns them off again, from the next turn, no restart). Off, those adapters still tell moth about each turn.
 The Claude Code band and the Hermes Desktop pet are separate opt-ins: they show only when you load or enable them.
 
